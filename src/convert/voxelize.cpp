@@ -126,12 +126,21 @@ bool triBoxOverlap(const glm::vec3 &boxCenter, const glm::vec3 &boxHalf, const g
   return planeBoxOverlap(normal, v0, boxHalf);
 }
 
+// glTF baseColorTexture is sRGB-encoded (baseColorFactor is linear — only
+// the texture needs decoding). The OptiX texture-sampling path gets this via
+// CUDA's hardware sRGB conversion (see optix_renderer.cpp); this CPU-side
+// bake has no such hardware, so it needs the standard sRGB EOTF explicitly.
+// Skipping it would systematically darken/mis-tint every voxel color baked
+// from a texture.
+float srgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
+
 glm::vec3 sampleColorNearest(const TextureAsset &tex, glm::vec2 uv) {
   auto wrap = [](float x) { return x - std::floor(x); };
   const int px = std::clamp(static_cast<int>(wrap(uv.x) * tex.width), 0, tex.width - 1);
   const int py = std::clamp(static_cast<int>((1.0f - wrap(uv.y)) * tex.height), 0, tex.height - 1);
   const size_t idx = (static_cast<size_t>(py) * tex.width + px) * 4;
-  return glm::vec3(tex.pixelsRGBA[idx] / 255.0f, tex.pixelsRGBA[idx + 1] / 255.0f, tex.pixelsRGBA[idx + 2] / 255.0f);
+  return glm::vec3(srgbToLinear(tex.pixelsRGBA[idx] / 255.0f), srgbToLinear(tex.pixelsRGBA[idx + 1] / 255.0f),
+                    srgbToLinear(tex.pixelsRGBA[idx + 2] / 255.0f));
 }
 
 glm::vec3 triangleColor(const MeshAsset &mesh, size_t triangleBase) {

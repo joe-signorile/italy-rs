@@ -411,6 +411,12 @@ struct OptixRenderer::Impl {
       texDesc.filterMode = cudaFilterModeLinear;
       texDesc.readMode = cudaReadModeNormalizedFloat;
       texDesc.normalizedCoords = 1;
+      // glTF baseColorTexture is sRGB-encoded (baseColorFactor is linear,
+      // only the texture needs decoding) — without this the path tracer's
+      // linear-space lighting math treats gamma-encoded bytes as if they
+      // were already linear, systematically darkening midtones. CUDA does
+      // the sRGB->linear conversion in texture hardware, so this is free.
+      texDesc.sRGB = 1;
       CUDA_CHECK(cudaCreateTextureObject(&baseColorTexObj, &resDesc, &texDesc, nullptr));
       obj.material.baseColorTex = baseColorTexObj;
     }

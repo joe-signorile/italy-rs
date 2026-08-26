@@ -163,7 +163,15 @@ extern "C" __global__ void __raygen__rg() {
     for (;;) {
       trace(params.handle, origin, direction, 1e-3f, 1e16f, prd);
 
-      result += prd.emitted;
+      // prd.attenuation here is the throughput accumulated *before* this
+      // hit (the light material doesn't touch attenuation itself) — needed
+      // because, unlike a simpler tracer that only ever sees emission on the
+      // primary ray, MATERIAL_LIGHT's MIS weighting means `emitted` can be
+      // nonzero after any number of specular bounces or a BSDF-sampled
+      // diffuse ray landing on the light. Without this multiply, e.g. the
+      // mirror sphere's reflection of the light ignored the mirror's own
+      // tint and came out at the light's full unattenuated brightness.
+      result += prd.emitted * prd.attenuation;
       result += prd.radiance * prd.attenuation;
 
       if (prd.done)
@@ -373,7 +381,14 @@ extern "C" __global__ void __closesthit__radiance() {
         const float pdfLight = (dist * dist) / (lnDl * area);
         const float pdfBsdf = nDl / M_PIf;
         const float weight = powerHeuristic(pdfLight, pdfBsdf);
-        radiance = (albedo / M_PIf) * light.emission * nDl * weight / fmaxf(pdfLight, 1e-6f);
+        // No albedo factor here: the raygen loop computes
+        // result += prd.radiance * prd.attenuation, and `attenuation` is
+        // updated to include *this* bounce's albedo a few lines below,
+        // before that payload is written out. Multiplying albedo in here
+        // too would double it — this bit us for the entire lifetime of
+        // phases 2-4 (every diffuse/textured/voxel NEE sample was too dark
+        // by an extra factor of albedo) until caught in review.
+        radiance = (light.emission / M_PIf) * nDl * weight / fmaxf(pdfLight, 1e-6f);
       }
     }
 

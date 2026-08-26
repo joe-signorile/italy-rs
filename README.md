@@ -102,6 +102,22 @@ correctness headlessly/from a script rather than watching the window.
 
 ## Status
 
+**Bug-fix pass after phase 4** caught two rendering-correctness bugs that had
+been silently present since phase 2 (affecting every material/phase built on
+top): NEE contributions were double-multiplying the surface's own albedo
+(the raygen loop already applies it via the updated `attenuation`, so baking
+it into `radiance` too darkened every diffuse/textured/voxel direct-lighting
+sample), and light seen indirectly (via a mirror/glass bounce, or a
+diffuse BSDF-sampled ray landing on the light) was added at full brightness
+with no attenuation from the bounces that led to it. Also fixed: glTF
+`baseColorTexture` is sRGB-encoded and was being read as if already linear,
+systematically washing out colors — confirmed by re-rendering the same
+device-bottom.glb before/after (vivid, correctly saturated red body and
+distinct button colors after the fix, versus a washed-out pale render
+before). All three fixes are in `pathtracer.cu`/`optix_renderer.cpp`/
+`voxelize.cpp`; re-verified visually across the fixed test scene, the
+textured mesh, and the voxelized mesh.
+
 Phase 2 done: OptiX 9.1 path tracer (NEE + power-heuristic MIS + Russian
 roulette, iterative not recursive) rendering a hardcoded scene — diffuse,
 mirror, and dielectric-glass spheres plus a quad area light, triangle ground
