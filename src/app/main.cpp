@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <GLFW/glfw3.h>
@@ -16,6 +17,7 @@
 #include <stb_image_write.h>
 
 #include "core/orbit_camera.h"
+#include "io/gltf_loader.h"
 #include "render/optix_renderer.h"
 
 namespace {
@@ -59,7 +61,24 @@ void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *wind
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  // Phase 3: optional GLB path on the command line loads and renders that
+  // mesh (as textured triangles) instead of the phase-2 fixed test scene.
+  // A file-picker UI comes with phase 9; a CLI arg is the smallest thing
+  // that lets ingestion be exercised/verified now.
+  italy::MeshAsset meshAsset;
+  bool haveMesh = false;
+  if (argc > 1) {
+    std::string err;
+    if (italy::loadGlb(argv[1], meshAsset, err)) {
+      haveMesh = true;
+      std::fprintf(stderr, "italy: loaded %s (%zu triangles%s)\n", argv[1], meshAsset.positions.size() / 3,
+                   meshAsset.hasBaseColorTexture ? ", textured" : "");
+    } else {
+      std::fprintf(stderr, "italy: failed to load %s: %s\n", argv[1], err.c_str());
+    }
+  }
+
   if (!glfwInit()) {
     std::fprintf(stderr, "glfwInit failed\n");
     return 1;
@@ -85,13 +104,15 @@ int main() {
   ImGui_ImplOpenGL3_Init("#version 410");
 
   italy::OrbitCamera camera;
-  italy::OrbitCamera prevCamera = camera;
   MouseState mouse;
 
   // Fixed render resolution for phase 2 bring-up — dynamic viewport resize
   // (reallocating the accum buffer/PBO/texture) lands with the UI controls
   // phase.
-  italy::OptixRenderer renderer(960, 540);
+  italy::OptixRenderer renderer(960, 540, haveMesh ? &meshAsset : nullptr);
+  if (haveMesh)
+    camera.frame(renderer.sceneBoundsCenter(), renderer.sceneBoundsRadius());
+  italy::OrbitCamera prevCamera = camera;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -126,7 +147,11 @@ int main() {
     ImGui::NewFrame();
 
     ImGui::Begin("italy");
-    ImGui::Text("Phase 2: OptiX path-traced viewport.");
+    if (haveMesh)
+      ImGui::Text("Loaded: %s (%zu tris%s)", argv[1], meshAsset.positions.size() / 3,
+                   meshAsset.hasBaseColorTexture ? ", textured" : "");
+    else
+      ImGui::Text("No GLB given on the command line — showing the built-in test scene.");
     ImGui::Separator();
     const glm::vec3 pos = camera.position();
     ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);

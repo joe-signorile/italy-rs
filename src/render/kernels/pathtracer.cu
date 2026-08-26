@@ -236,8 +236,29 @@ extern "C" __global__ void __closesthit__radiance() {
   HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
 
   const float3 rayDir = optixGetWorldRayDirection();
-  const float3 N = computeShadingNormal(rayDir);
   const float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
+
+  // GLB-mesh triangles carry their own per-vertex normals/UVs (better shading
+  // than the flat face normal computeShadingNormal() gives the fixed
+  // bring-up scene's spheres/plane) and an optional base-color texture.
+  float3 N;
+  float3 albedo = rt->albedo;
+  if (rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
+    const unsigned int prim = optixGetPrimitiveIndex();
+    const float2 bary = optixGetTriangleBarycentrics();
+    const float w0 = 1.0f - bary.x - bary.y, w1 = bary.x, w2 = bary.y;
+    N = normalize(w0 * rt->normals[prim * 3 + 0] + w1 * rt->normals[prim * 3 + 1] + w2 * rt->normals[prim * 3 + 2]);
+    N = faceforward(N, -rayDir, N);
+    if (rt->baseColorTex) {
+      const float2 uv0 = rt->uvs[prim * 3 + 0], uv1 = rt->uvs[prim * 3 + 1], uv2 = rt->uvs[prim * 3 + 2];
+      const float u = w0 * uv0.x + w1 * uv1.x + w2 * uv2.x;
+      const float v = w0 * uv0.y + w1 * uv1.y + w2 * uv2.y;
+      const float4 texel = tex2D<float4>(rt->baseColorTex, u, v);
+      albedo = make_float3(texel.x, texel.y, texel.z) * rt->albedo; // rt->albedo doubles as baseColorFactor here
+    }
+  } else {
+    N = computeShadingNormal(rayDir);
+  }
 
   unsigned int seed = optixGetPayload_3();
   int depth = static_cast<int>(optixGetPayload_4());
@@ -266,7 +287,7 @@ extern "C" __global__ void __closesthit__radiance() {
       emitted = rt->emission * weight;
     }
     done = 1;
-  } else if (rt->materialType == MATERIAL_DIFFUSE) {
+  } else if (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
     // Next-event estimation toward the quad light.
     const QuadLight &light = params.light;
     const float z1 = sutil::rnd(seed);
@@ -284,7 +305,7 @@ extern "C" __global__ void __closesthit__radiance() {
         const float pdfLight = (dist * dist) / (lnDl * area);
         const float pdfBsdf = nDl / M_PIf;
         const float weight = powerHeuristic(pdfLight, pdfBsdf);
-        radiance = (rt->albedo / M_PIf) * light.emission * nDl * weight / fmaxf(pdfLight, 1e-6f);
+        radiance = (albedo / M_PIf) * light.emission * nDl * weight / fmaxf(pdfLight, 1e-6f);
       }
     }
 
@@ -294,7 +315,7 @@ extern "C" __global__ void __closesthit__radiance() {
     Onb onb(N);
     nextDirection = onb.toWorld(local);
     nextPdf = fmaxf(local.z, 1e-4f) / M_PIf;
-    attenuation = attenuation * rt->albedo;
+    attenuation = attenuation * albedo;
   } else if (rt->materialType == MATERIAL_MIRROR) {
     nextDirection = reflect(rayDir, N);
     attenuation = attenuation * rt->albedo;

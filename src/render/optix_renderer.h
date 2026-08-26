@@ -12,12 +12,18 @@
 // the Metal backend actually starts.
 
 #include "core/orbit_camera.h"
+#include "io/mesh_asset.h"
 
 namespace italy {
 
 class OptixRenderer {
 public:
-  OptixRenderer(int width, int height);
+  // mesh == nullptr: renders the fixed diffuse/mirror/glass/light bring-up
+  // scene from phase 2. mesh != nullptr: renders that loaded GLB mesh
+  // (as MATERIAL_TEXTURED_DIFFUSE triangles) lit by a synthetic quad light
+  // sized to its bounding box — there's no scene-graph/multi-object or HDRI
+  // lighting yet, so a loaded asset still needs *something* to be lit by.
+  OptixRenderer(int width, int height, const MeshAsset *mesh = nullptr);
   ~OptixRenderer();
 
   OptixRenderer(const OptixRenderer &) = delete;
@@ -35,6 +41,9 @@ public:
   int height() const { return height_; }
   unsigned int subframeIndex() const { return subframeIndex_; }
 
+  glm::vec3 sceneBoundsCenter() const { return sceneBoundsCenter_; }
+  float sceneBoundsRadius() const { return sceneBoundsRadius_; }
+
 private:
   struct Impl;
   Impl *impl_;
@@ -42,6 +51,8 @@ private:
   int height_;
   unsigned int glTexture_ = 0;
   unsigned int subframeIndex_ = 0;
+  glm::vec3 sceneBoundsCenter_{0.0f};
+  float sceneBoundsRadius_ = 3.0f;
 };
 
 } // namespace italy

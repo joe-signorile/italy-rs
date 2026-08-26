@@ -37,6 +37,18 @@ FetchContent_MakeAvailable(stb)
 add_library(stb INTERFACE)
 target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
 
+FetchContent_Declare(tinygltf
+  GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+  GIT_TAG v2.9.3
+  GIT_SHALLOW TRUE)
+set(TINYGLTF_HEADER_ONLY ON CACHE BOOL "" FORCE)
+set(TINYGLTF_INSTALL OFF CACHE BOOL "" FORCE)
+set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(tinygltf)
+# tinygltf's own CMakeLists (TINYGLTF_HEADER_ONLY) already defines the
+# `tinygltf` INTERFACE target, bundling its own stb_image/json.hpp copies —
+# nothing more to declare here.
+
 add_library(imgui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -97,7 +109,8 @@ add_executable(italy
   src/app/main.cpp
   src/core/orbit_camera.cpp
   src/render/optix_renderer.cpp
+  src/io/gltf_loader.cpp
 )
 add_dependencies(italy italy_optixir)
 target_include_directories(italy PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
-target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb)
+target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)

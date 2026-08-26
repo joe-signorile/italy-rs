@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+
 #include <glm/glm.hpp>
 
 namespace italy {
@@ -12,6 +15,14 @@ public:
   void orbit(float dxPixels, float dyPixels);
   void pan(float dxPixels, float dyPixels);
   void zoom(float scrollDelta);
+
+  // Point the camera at a loaded asset's bounding sphere — used right after
+  // loading a GLB, since its scale/position are arbitrary. Keeps the current
+  // yaw/pitch so re-framing doesn't spin the view around.
+  void frame(const glm::vec3 &center, float boundingRadius) {
+    target_ = center;
+    distance_ = std::max(boundingRadius / std::tan(fovYRadians * 0.5f) * 1.4f, kMinDistance);
+  }
 
   glm::mat4 viewMatrix() const;
   glm::vec3 position() const;

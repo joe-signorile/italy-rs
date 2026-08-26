@@ -48,9 +48,18 @@ cmake --build build
 ./build/italy
 ```
 
-GLFW, Dear ImGui, glm, and stb are pulled via CMake `FetchContent` at
-configure time — no system packages needed for those. `tinygltf` is added
-the same way once GLB loading lands (phase 3).
+GLFW, Dear ImGui, glm, stb, and tinygltf are pulled via CMake `FetchContent`
+at configure time — no system packages needed for those.
+
+To render a GLB instead of the built-in test scene:
+
+```
+./build/italy path/to/asset.glb
+```
+
+A small bundled test asset lives at `assets/test.glb`. Single mesh/primitive
+only for now (no scene graph, no node transforms) — good enough for "one
+textured object," which is the phase-3 ask.
 
 ### Hybrid-GPU laptops (Intel iGPU + NVIDIA dGPU)
 
@@ -82,6 +91,14 @@ resets on camera move. Verified by rendering to a PNG and inspecting it:
 correct shadows, mirror reflections, glass refraction, and an emergent
 caustic-bright patch on the ground under the glass sphere.
 
-Not yet done: GLB loading, voxel/SDF resampling, HDRI lighting, SPPM
-caustics, AgX tonemapping, UI controls, denoiser. See the plan doc for the
-full phase list.
+Phase 3 done: GLB loading (tinygltf) — positions/normals/UVs/base-color
+texture, camera auto-framed to the loaded mesh's bounding sphere, rendered as
+`MATERIAL_TEXTURED_DIFFUSE` triangles lit by a synthetic quad light sized to
+the mesh (no HDRI yet). Verified against two real assets: a small untextured
+primitive (correct smooth-normal shading, falls back to the material's flat
+`baseColorFactor` when there's no texture) and a 272k-triangle textured
+device model (correct UV-mapped texture — grille holes, buttons, panel seams
+all land in the right places).
+
+Not yet done: voxel/SDF resampling, HDRI lighting, SPPM caustics, AgX
+tonemapping, UI controls, denoiser. See the plan doc for the full phase list.

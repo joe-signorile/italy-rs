@@ -11,6 +11,10 @@ enum MaterialType : unsigned int {
   MATERIAL_MIRROR = 1,
   MATERIAL_GLASS = 2,
   MATERIAL_LIGHT = 3,
+  // Diffuse BRDF (same NEE/MIS/bounce logic as MATERIAL_DIFFUSE) but the
+  // albedo comes from a texture sampled with the hit triangle's interpolated
+  // UV instead of a constant — used for phase-3 GLB-loaded meshes.
+  MATERIAL_TEXTURED_DIFFUSE = 4,
 };
 
 // A single rectangular area light — enough for phase 2's bring-up scene.
@@ -53,4 +57,11 @@ struct HitGroupData {
   float3 albedo;
   float3 emission;
   float ior; // only used when materialType == MATERIAL_GLASS
+
+  // Only used when materialType == MATERIAL_TEXTURED_DIFFUSE: per-triangle
+  // flattened (3 entries per triangle, indexed by primitiveIndex*3+corner —
+  // matches the CPU-side MeshAsset layout, no index buffer needed on device).
+  float3 *normals = nullptr;
+  float2 *uvs = nullptr;
+  cudaTextureObject_t baseColorTex = 0; // 0 => no texture, use albedo as a flat color
 };

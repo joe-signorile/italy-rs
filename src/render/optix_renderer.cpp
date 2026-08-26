@@ -8,6 +8,7 @@
 #include <cuda_gl_interop.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -91,10 +92,27 @@ struct OptixRenderer::Impl {
   cudaGraphicsResource *cudaPbo = nullptr;
 
   QuadLight light{};
+  glm::vec3 boundsCenter{0.0f};
+  float boundsRadius = 3.0f;
+
+  // Device buffers backing a MATERIAL_TEXTURED_DIFFUSE object's per-vertex
+  // attributes and optional base-color texture — freed in destroy().
+  CUdeviceptr meshNormals = 0;
+  CUdeviceptr meshUvs = 0;
+  cudaArray_t baseColorArray = nullptr;
+  cudaTextureObject_t baseColorTexObj = 0;
 
   ~Impl() { destroy(); }
 
   void destroy() {
+    if (baseColorTexObj)
+      cudaDestroyTextureObject(baseColorTexObj);
+    if (baseColorArray)
+      cudaFreeArray(baseColorArray);
+    if (meshNormals)
+      cudaFree(reinterpret_cast<void *>(meshNormals));
+    if (meshUvs)
+      cudaFree(reinterpret_cast<void *>(meshUvs));
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
@@ -308,10 +326,95 @@ struct OptixRenderer::Impl {
     return obj;
   }
 
-  // Fixed bring-up scene: a ground plane, one quad light, and one sphere per
-  // material type the plan calls for (diffuse/mirror/glass). GLB-loaded
-  // scenes replace this in phase 3.
-  void buildScene() {
+  // Adds a rectangular emissive object at the given corner/edges, both as
+  // real (camera-visible) geometry and as the analytic params.light used for
+  // NEE — shared by the fixed bring-up scene and the GLB-mesh scene, which
+  // both need *something* to light the object (no HDRI/environment lighting
+  // until phase 6).
+  void addLightQuad(float3 corner, float3 v1, float3 v2, float3 emission) {
+    light.corner = corner;
+    light.v1 = v1;
+    light.v2 = v2;
+    light.normal = normalize(cross(v1, v2));
+    light.emission = emission;
+
+    HitGroupData lightMat{};
+    lightMat.materialType = MATERIAL_LIGHT;
+    lightMat.emission = emission;
+    objects.push_back(buildTriangleObject(
+        {corner, corner + v1, corner + v1 + v2, corner, corner + v1 + v2, corner + v2}, lightMat));
+  }
+
+  SceneObject buildMeshObject(const MeshAsset &mesh) {
+    SceneObject obj;
+    obj.isTriangle = true;
+    obj.material.materialType = MATERIAL_TEXTURED_DIFFUSE;
+    obj.material.albedo = toFloat3(mesh.baseColorFactor);
+
+    std::vector<float3> positions(mesh.positions.size());
+    for (size_t i = 0; i < mesh.positions.size(); ++i)
+      positions[i] = toFloat3(mesh.positions[i]);
+
+    const size_t normalBytes = mesh.normals.size() * sizeof(float3);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&meshNormals), normalBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(meshNormals), mesh.normals.data(), normalBytes,
+                           cudaMemcpyHostToDevice));
+    obj.material.normals = reinterpret_cast<float3 *>(meshNormals);
+
+    if (!mesh.uvs.empty()) {
+      const size_t uvBytes = mesh.uvs.size() * sizeof(float2);
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&meshUvs), uvBytes));
+      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(meshUvs), mesh.uvs.data(), uvBytes, cudaMemcpyHostToDevice));
+      obj.material.uvs = reinterpret_cast<float2 *>(meshUvs);
+    }
+
+    if (mesh.hasBaseColorTexture) {
+      const cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
+      CUDA_CHECK(cudaMallocArray(&baseColorArray, &desc, mesh.baseColorTexture.width, mesh.baseColorTexture.height));
+      CUDA_CHECK(cudaMemcpy2DToArray(baseColorArray, 0, 0, mesh.baseColorTexture.pixelsRGBA.data(),
+                                      mesh.baseColorTexture.width * 4, mesh.baseColorTexture.width * 4,
+                                      mesh.baseColorTexture.height, cudaMemcpyHostToDevice));
+      cudaResourceDesc resDesc{};
+      resDesc.resType = cudaResourceTypeArray;
+      resDesc.res.array.array = baseColorArray;
+      cudaTextureDesc texDesc{};
+      texDesc.addressMode[0] = cudaAddressModeWrap;
+      texDesc.addressMode[1] = cudaAddressModeWrap;
+      texDesc.filterMode = cudaFilterModeLinear;
+      texDesc.readMode = cudaReadModeNormalizedFloat;
+      texDesc.normalizedCoords = 1;
+      CUDA_CHECK(cudaCreateTextureObject(&baseColorTexObj, &resDesc, &texDesc, nullptr));
+      obj.material.baseColorTex = baseColorTexObj;
+    }
+
+    CUdeviceptr vertexBuffer = uploadTriangles(positions);
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+    input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+    input.triangleArray.vertexStrideInBytes = sizeof(float3);
+    input.triangleArray.numVertices = static_cast<unsigned int>(positions.size());
+    input.triangleArray.vertexBuffers = &vertexBuffer;
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.triangleArray.flags = flags;
+    input.triangleArray.numSbtRecords = 1;
+
+    OptixAccelBuildOptions accelOptions{};
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+    OptixAccelBufferSizes sizes{};
+    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
+    CUdeviceptr tempBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
+    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
+                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    cudaFree(reinterpret_cast<void *>(vertexBuffer));
+    return obj;
+  }
+
+  void buildFixedTestScene() {
     HitGroupData groundMat{};
     groundMat.materialType = MATERIAL_DIFFUSE;
     groundMat.albedo = make_float3(0.72f, 0.72f, 0.7f);
@@ -326,27 +429,8 @@ struct OptixRenderer::Impl {
         },
         groundMat));
 
-    light.corner = make_float3(-0.6f, 2.9f, -0.6f);
-    light.v1 = make_float3(1.2f, 0, 0);
-    light.v2 = make_float3(0, 0, 1.2f);
-    // cross(v1, v2) with these edge vectors already points -Y (down into the
-    // scene) — verified by hand: (1.2,0,0) x (0,0,1.2) = (0,-1.44,0).
-    light.normal = normalize(cross(light.v1, light.v2));
-    light.emission = make_float3(15.0f, 15.0f, 13.0f);
-
-    HitGroupData lightMat{};
-    lightMat.materialType = MATERIAL_LIGHT;
-    lightMat.emission = light.emission;
-    objects.push_back(buildTriangleObject(
-        {
-            light.corner,
-            light.corner + light.v1,
-            light.corner + light.v1 + light.v2,
-            light.corner,
-            light.corner + light.v1 + light.v2,
-            light.corner + light.v2,
-        },
-        lightMat));
+    addLightQuad(make_float3(-0.6f, 2.9f, -0.6f), make_float3(1.2f, 0, 0), make_float3(0, 0, 1.2f),
+                 make_float3(15.0f, 15.0f, 13.0f));
 
     HitGroupData diffuseMat{};
     diffuseMat.materialType = MATERIAL_DIFFUSE;
@@ -364,7 +448,35 @@ struct OptixRenderer::Impl {
     glassMat.ior = 1.5f;
     objects.push_back(buildSphereObject(make_float3(1.4f, -0.4f, -0.6f), 0.6f, glassMat));
 
-    // Instance acceleration structure over the fixed objects above.
+    boundsCenter = glm::vec3(0.0f, 0.2f, 0.0f);
+    boundsRadius = 3.0f;
+  }
+
+  void buildMeshScene(const MeshAsset &mesh) {
+    objects.push_back(buildMeshObject(mesh));
+
+    boundsCenter = mesh.boundsCenter();
+    boundsRadius = std::max(mesh.boundsRadius(), 1e-3f);
+
+    // Light sized/positioned relative to the mesh so it's a sensible key
+    // light regardless of the asset's own scale.
+    const float3 c = toFloat3(boundsCenter);
+    const float r = boundsRadius;
+    addLightQuad(make_float3(c.x - r, c.y + r * 2.2f, c.z - r), make_float3(r * 2.0f, 0, 0),
+                 make_float3(0, 0, r * 2.0f), make_float3(20.0f, 20.0f, 18.0f));
+  }
+
+  void buildScene(const MeshAsset *mesh) {
+    if (mesh)
+      buildMeshScene(*mesh);
+    else
+      buildFixedTestScene();
+
+    buildIAS();
+  }
+
+  void buildIAS() {
+    // Instance acceleration structure over the objects built above.
     std::vector<OptixInstance> instances(objects.size());
     static const float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     for (size_t i = 0; i < objects.size(); ++i) {
@@ -455,14 +567,18 @@ struct OptixRenderer::Impl {
   }
 };
 
-OptixRenderer::OptixRenderer(int width, int height) : impl_(new Impl()), width_(width), height_(height) {
+OptixRenderer::OptixRenderer(int width, int height, const MeshAsset *mesh)
+    : impl_(new Impl()), width_(width), height_(height) {
   impl_->initContext();
   impl_->buildModule();
   impl_->buildProgramGroups();
   impl_->buildPipeline();
-  impl_->buildScene();
+  impl_->buildScene(mesh);
   impl_->buildSbt();
   impl_->initGLInterop(width, height);
+
+  sceneBoundsCenter_ = impl_->boundsCenter;
+  sceneBoundsRadius_ = impl_->boundsRadius;
 
   glGenTextures(1, &glTexture_);
   glBindTexture(GL_TEXTURE_2D, glTexture_);
