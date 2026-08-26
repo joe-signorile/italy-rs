@@ -1,15 +1,22 @@
-// Phase 1: window + Dear ImGui shell + orbit camera input. No rendering yet
-// (that starts in phase 2 once the OptiX SDK is available) — this just
-// proves the windowing/UI/camera plumbing works.
+// Phase 2: window + Dear ImGui shell + orbit camera + OptiX path-traced
+// viewport. The renderer accumulates progressively while the camera is
+// still and resets whenever it moves.
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
 #include "core/orbit_camera.h"
+#include "render/optix_renderer.h"
 
 namespace {
 
@@ -19,6 +26,36 @@ struct MouseState {
   double lastX = 0.0;
   double lastY = 0.0;
 };
+
+bool cameraChanged(const italy::OrbitCamera &a, const italy::OrbitCamera &b) {
+  const glm::vec3 da = a.position() - b.position();
+  const glm::vec3 dt = a.target() - b.target();
+  return glm::dot(da, da) > 1e-10f || glm::dot(dt, dt) > 1e-10f;
+}
+
+// Debug/verification aid: set ITALY_DUMP_FRAME=path.png and (optionally)
+// ITALY_DUMP_AFTER_SUBFRAME=N to write out the accumulated render and exit —
+// lets a render-correctness check happen without eyeballing a live window.
+void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *window) {
+  const char *path = std::getenv("ITALY_DUMP_FRAME");
+  if (!path)
+    return;
+  const int w = renderer.width();
+  const int h = renderer.height();
+  std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
+  glBindTexture(GL_TEXTURE_2D, renderer.glTextureId());
+  glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+  glBindTexture(GL_TEXTURE_2D, 0);
+  // Texture was uploaded with V flipped for ImGui (uv0=(0,1),uv1=(1,0)); flip
+  // rows back here so the PNG reads right-side-up.
+  std::vector<unsigned char> flipped(pixels.size());
+  for (int row = 0; row < h; ++row)
+    std::memcpy(&flipped[static_cast<size_t>(row) * w * 4], &pixels[static_cast<size_t>(h - 1 - row) * w * 4],
+                static_cast<size_t>(w) * 4);
+  stbi_write_png(path, w, h, 4, flipped.data(), w * 4);
+  std::fprintf(stderr, "italy: wrote debug frame to %s\n", path);
+  glfwSetWindowShouldClose(window, GLFW_TRUE);
+}
 
 } // namespace
 
@@ -48,7 +85,13 @@ int main() {
   ImGui_ImplOpenGL3_Init("#version 410");
 
   italy::OrbitCamera camera;
+  italy::OrbitCamera prevCamera = camera;
   MouseState mouse;
+
+  // Fixed render resolution for phase 2 bring-up — dynamic viewport resize
+  // (reallocating the accum buffer/PBO/texture) lands with the UI controls
+  // phase.
+  italy::OptixRenderer renderer(960, 540);
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -69,16 +112,33 @@ int main() {
       camera.zoom(io.MouseWheel);
     }
 
+    if (cameraChanged(camera, prevCamera)) {
+      renderer.resetAccumulation();
+      prevCamera = camera;
+    }
+    renderer.render(camera);
+
+    if (std::getenv("ITALY_DUMP_FRAME") && renderer.subframeIndex() >= 128)
+      dumpFrameIfRequested(renderer, window);
+
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
     ImGui::Begin("italy");
-    ImGui::Text("Phase 1 shell: window + ImGui + orbit camera.");
+    ImGui::Text("Phase 2: OptiX path-traced viewport.");
     ImGui::Separator();
     const glm::vec3 pos = camera.position();
     ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
+    ImGui::Text("Subframe: %u", renderer.subframeIndex());
     ImGui::Text("Drag left-click to orbit, middle-click to pan, scroll to zoom.");
+    ImGui::End();
+
+    ImGui::SetNextWindowSize(ImVec2(980, 580), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Viewport");
+    ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer.glTextureId())),
+                 ImVec2(static_cast<float>(renderer.width()), static_cast<float>(renderer.height())), ImVec2(0, 1),
+                 ImVec2(1, 0));
     ImGui::End();
 
     ImGui::Render();

@@ -30,6 +30,13 @@ FetchContent_Declare(imgui
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
 
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG master)
+FetchContent_MakeAvailable(stb)
+add_library(stb INTERFACE)
+target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
+
 add_library(imgui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -41,9 +48,56 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 
+find_package(CUDAToolkit REQUIRED)
+
+set(OPTIX_ROOT "$ENV{OPTIX_ROOT}" CACHE PATH "OptiX SDK install (must contain include/optix.h and SDK/sutil)")
+find_path(OPTIX_INCLUDE_DIR optix.h PATHS "${OPTIX_ROOT}/include")
+if(NOT OPTIX_INCLUDE_DIR)
+  message(FATAL_ERROR "OptiX headers not found. Set OPTIX_ROOT (env var or -DOPTIX_ROOT=...) to the SDK install — see README.md.")
+endif()
+if(NOT EXISTS "${OPTIX_ROOT}/SDK/sutil/vec_math.h")
+  message(FATAL_ERROR "OPTIX_ROOT is set but ${OPTIX_ROOT}/SDK/sutil is missing — need the SDK's sample-support headers (vec_math.h, random.h), not just include/.")
+endif()
+
+set(ITALY_CUDA_ARCH "89" CACHE STRING "Target GPU compute capability for the OptiX device kernel (89 = Ada/RTX 40-series)")
+
+# OptiX device programs are consumed at runtime by optixModuleCreate as
+# OptiX-IR text, not linked like normal objects — a direct nvcc invocation is
+# simpler than fighting CMake's native CUDA_ARCHITECTURES object pipeline for
+# this one file. The result is read from disk at startup (see
+# render_config.h.in) rather than embedded via bin2c: this is a dev tool with
+# a fixed, known build-tree layout, so that's a fine simplification for now.
+set(PATHTRACER_CU "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer.cu")
+set(PATHTRACER_OPTIXIR "${CMAKE_BINARY_DIR}/optix_programs/pathtracer.optixir")
+add_custom_command(
+  OUTPUT ${PATHTRACER_OPTIXIR}
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs"
+  COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
+          --optix-ir
+          -arch=sm_${ITALY_CUDA_ARCH}
+          -std=c++17
+          -I "${OPTIX_INCLUDE_DIR}"
+          -I "${OPTIX_ROOT}/SDK"
+          -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+          -o ${PATHTRACER_OPTIXIR}
+          ${PATHTRACER_CU}
+  DEPENDS ${PATHTRACER_CU} "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer_params.h"
+  COMMENT "Compiling OptiX device program pathtracer.cu -> OptiX-IR"
+  VERBATIM
+)
+add_custom_target(italy_optixir DEPENDS ${PATHTRACER_OPTIXIR})
+
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render/render_config.h.in
+  ${CMAKE_BINARY_DIR}/generated/render_config.h
+  @ONLY
+)
+
 add_executable(italy
   src/app/main.cpp
   src/core/orbit_camera.cpp
+  src/render/optix_renderer.cpp
 )
-target_include_directories(italy PRIVATE src)
-target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL)
+add_dependencies(italy italy_optixir)
+target_include_directories(italy PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
+target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb)

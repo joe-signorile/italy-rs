@@ -18,8 +18,11 @@ Full design/phasing: see the plan this repo was scaffolded from —
   installer behind a free Developer Program login:
   1. Log in at https://developer.nvidia.com/designworks/optix/download
   2. Download the Linux `.sh` installer.
-  3. `chmod +x NVIDIA-OptiX-SDK-*-linux64-x86_64.sh && sudo ./NVIDIA-OptiX-SDK-*.sh --skip-license --prefix=/opt/optix`
-  4. `export OPTIX_ROOT=/opt/optix` (CMake looks for this env var).
+  3. The installer expects its target directory to already exist:
+     `chmod +x NVIDIA-OptiX-SDK-*-linux64-x86_64.sh && sudo mkdir -p /opt/optix && sudo chown "$(id -u):$(id -g)" /opt/optix && ./NVIDIA-OptiX-SDK-*.sh --skip-license --prefix=/opt/optix`
+  4. `export OPTIX_ROOT=/opt/optix` (CMake looks for this env var). The build
+     also needs `${OPTIX_ROOT}/SDK/sutil` (vec_math.h, random.h, helpers.h) —
+     that's part of the same installer, not a separate download.
 - CMake >= 3.24, Ninja, a C++20 compiler.
 - Confirmed on this host: `nvcc` (CUDA 13.2) accepts the system default
   gcc/g++ 15.2 as host compiler with no flags needed — the "nvcc lags gcc"
@@ -45,11 +48,40 @@ cmake --build build
 ./build/italy
 ```
 
-GLFW, Dear ImGui, and glm are pulled via CMake `FetchContent` at configure
-time — no system packages needed for those. `tinygltf`/`stb` are added the
-same way once GLB loading lands (phase 3).
+GLFW, Dear ImGui, glm, and stb are pulled via CMake `FetchContent` at
+configure time — no system packages needed for those. `tinygltf` is added
+the same way once GLB loading lands (phase 3).
+
+### Hybrid-GPU laptops (Intel iGPU + NVIDIA dGPU)
+
+On this dev machine (Intel Iris Xe + RTX 4080 Laptop), GLX defaults to the
+Intel iGPU, and CUDA-GL interop (`cudaGraphicsGLRegisterBuffer`) fails with
+"invalid OpenGL or DirectX context" unless the GL context is actually backed
+by the NVIDIA driver. Force it with PRIME render offload:
+
+```
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./build/italy
+```
+
+Not needed on a desktop/single-GPU NVIDIA machine.
+
+### Debugging without eyeballing the live window
+
+Set `ITALY_DUMP_FRAME=/path/to/out.png` to have italy write the accumulated
+render to a PNG after 128 subframes and exit — useful for checking render
+correctness headlessly/from a script rather than watching the window.
 
 ## Status
 
-Phase 1 (window + ImGui shell + orbit camera, no rendering yet). See the
-plan doc for the full phase list.
+Phase 2 done: OptiX 9.1 path tracer (NEE + power-heuristic MIS + Russian
+roulette, iterative not recursive) rendering a hardcoded scene — diffuse,
+mirror, and dielectric-glass spheres plus a quad area light, triangle ground
+plane, mixed triangle/built-in-sphere geometry in one IAS — displayed live
+in the ImGui viewport via CUDA-GL PBO interop, progressive accumulation that
+resets on camera move. Verified by rendering to a PNG and inspecting it:
+correct shadows, mirror reflections, glass refraction, and an emergent
+caustic-bright patch on the ground under the glass sphere.
+
+Not yet done: GLB loading, voxel/SDF resampling, HDRI lighting, SPPM
+caustics, AgX tonemapping, UI controls, denoiser. See the plan doc for the
+full phase list.
