@@ -210,6 +210,69 @@ extern "C" __global__ void __miss__radiance() {
 
 extern "C" __global__ void __miss__occlusion() { optixSetPayload_0(0u); }
 
+// Custom-primitive intersection for a voxel: a plain ray/AABB slab test.
+// OptiX's custom-primitive build input only consumes the AABB array to build
+// the BVH — it doesn't hand the box back to us, so the intersection program
+// re-reads the same AABB buffer via the SBT record. Reports which face was
+// entered (0..5) as attribute_0 so the closest-hit program can derive a flat
+// shading normal without a second geometry query.
+extern "C" __global__ void __intersection__voxel() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const OptixAabb box = rt->voxelAabbs[optixGetPrimitiveIndex()];
+  const float o[3] = {optixGetObjectRayOrigin().x, optixGetObjectRayOrigin().y, optixGetObjectRayOrigin().z};
+  const float d[3] = {optixGetObjectRayDirection().x, optixGetObjectRayDirection().y, optixGetObjectRayDirection().z};
+  const float lo[3] = {box.minX, box.minY, box.minZ};
+  const float hi[3] = {box.maxX, box.maxY, box.maxZ};
+
+  float t0 = optixGetRayTmin();
+  float t1 = optixGetRayTmax();
+  int enterAxis = -1;
+  bool enterUpper = false;
+  for (int axis = 0; axis < 3; ++axis) {
+    const float invD = 1.0f / d[axis];
+    float tNear = (lo[axis] - o[axis]) * invD;
+    float tFar = (hi[axis] - o[axis]) * invD;
+    bool upper = tNear > tFar; // ray travels in -axis direction, entering via the "hi" face
+    if (upper) {
+      const float tmp = tNear;
+      tNear = tFar;
+      tFar = tmp;
+    }
+    if (tNear > t0) {
+      t0 = tNear;
+      enterAxis = axis;
+      enterUpper = upper;
+    }
+    if (tFar < t1)
+      t1 = tFar;
+    if (t0 > t1)
+      return; // no overlap
+  }
+  if (enterAxis < 0)
+    return; // ray origin starts inside the box — treat as a miss (rare, camera never starts inside a voxel here)
+
+  const unsigned int face = static_cast<unsigned int>(enterAxis) * 2 + (enterUpper ? 1u : 0u);
+  optixReportIntersection(t0, 0, face);
+}
+
+// -X,+X,-Y,+Y,-Z,+Z, indexed by __intersection__voxel's face attribute.
+static __forceinline__ __device__ float3 voxelFaceNormal(unsigned int face) {
+  switch (face) {
+  case 0:
+    return make_float3(-1, 0, 0);
+  case 1:
+    return make_float3(1, 0, 0);
+  case 2:
+    return make_float3(0, -1, 0);
+  case 3:
+    return make_float3(0, 1, 0);
+  case 4:
+    return make_float3(0, 0, -1);
+  default:
+    return make_float3(0, 0, 1);
+  }
+}
+
 // Shared normal computation for both built-in geometry types used in the
 // bring-up scene: triangles (ground plane) and built-in spheres.
 static __forceinline__ __device__ float3 computeShadingNormal(const float3 &rayDir) {
@@ -256,6 +319,10 @@ extern "C" __global__ void __closesthit__radiance() {
       const float4 texel = tex2D<float4>(rt->baseColorTex, u, v);
       albedo = make_float3(texel.x, texel.y, texel.z) * rt->albedo; // rt->albedo doubles as baseColorFactor here
     }
+  } else if (rt->materialType == MATERIAL_VOXEL) {
+    const float3 faceN = voxelFaceNormal(optixGetAttribute_0());
+    N = faceforward(faceN, -rayDir, faceN);
+    albedo = rt->voxelColors[optixGetPrimitiveIndex()];
   } else {
     N = computeShadingNormal(rayDir);
   }
@@ -287,7 +354,8 @@ extern "C" __global__ void __closesthit__radiance() {
       emitted = rt->emission * weight;
     }
     done = 1;
-  } else if (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
+  } else if (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE ||
+             rt->materialType == MATERIAL_VOXEL) {
     // Next-event estimation toward the quad light.
     const QuadLight &light = params.light;
     const float z1 = sutil::rnd(seed);

@@ -110,7 +110,14 @@ add_executable(italy
   src/core/orbit_camera.cpp
   src/render/optix_renderer.cpp
   src/io/gltf_loader.cpp
+  src/convert/voxelize.cpp
 )
 add_dependencies(italy italy_optixir)
 target_include_directories(italy PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
 target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
+
+enable_testing()
+add_executable(voxelize_test tests/voxelize_test.cpp src/convert/voxelize.cpp)
+target_include_directories(voxelize_test PRIVATE src)
+target_link_libraries(voxelize_test PRIVATE glm::glm)
+add_test(NAME voxelize_test COMMAND voxelize_test)

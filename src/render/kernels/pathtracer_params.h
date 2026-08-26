@@ -15,6 +15,10 @@ enum MaterialType : unsigned int {
   // albedo comes from a texture sampled with the hit triangle's interpolated
   // UV instead of a constant — used for phase-3 GLB-loaded meshes.
   MATERIAL_TEXTURED_DIFFUSE = 4,
+  // Diffuse BRDF, custom-AABB voxel primitive; albedo is a per-voxel baked
+  // color, shading normal comes from which of the 6 box faces was entered
+  // (see __intersection__voxel) — phase-4 voxel-resampled meshes.
+  MATERIAL_VOXEL = 5,
 };
 
 // A single rectangular area light — enough for phase 2's bring-up scene.
@@ -64,4 +68,12 @@ struct HitGroupData {
   float3 *normals = nullptr;
   float2 *uvs = nullptr;
   cudaTextureObject_t baseColorTex = 0; // 0 => no texture, use albedo as a flat color
+
+  // Only used when materialType == MATERIAL_VOXEL, indexed by
+  // optixGetPrimitiveIndex(): the intersection program does its own ray/box
+  // test against voxelAabbs (OptiX's custom-primitive build input only feeds
+  // the BVH build, not the intersection program), and voxelColors gives that
+  // voxel's baked color.
+  OptixAabb *voxelAabbs = nullptr;
+  float3 *voxelColors = nullptr;
 };

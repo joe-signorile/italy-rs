@@ -11,19 +11,30 @@
 // multi-backend interface set. Upgrade to the fuller interface split if/when
 // the Metal backend actually starts.
 
+#include "convert/voxel_grid.h"
 #include "core/orbit_camera.h"
 #include "io/mesh_asset.h"
 
 namespace italy {
 
+// Exactly one of mesh/voxels should be set; neither set means the fixed
+// bring-up scene. A tagged pair rather than overloaded constructors — the
+// next representation (SDF, phase 5) adds a third alternative here, not
+// another overload.
+struct SceneSource {
+  const MeshAsset *mesh = nullptr;
+  const VoxelGrid *voxels = nullptr;
+};
+
 class OptixRenderer {
 public:
-  // mesh == nullptr: renders the fixed diffuse/mirror/glass/light bring-up
-  // scene from phase 2. mesh != nullptr: renders that loaded GLB mesh
-  // (as MATERIAL_TEXTURED_DIFFUSE triangles) lit by a synthetic quad light
-  // sized to its bounding box — there's no scene-graph/multi-object or HDRI
-  // lighting yet, so a loaded asset still needs *something* to be lit by.
-  OptixRenderer(int width, int height, const MeshAsset *mesh = nullptr);
+  // Empty source: renders the fixed diffuse/mirror/glass/light bring-up
+  // scene from phase 2. source.mesh set: renders that loaded GLB mesh (as
+  // MATERIAL_TEXTURED_DIFFUSE triangles). source.voxels set: renders that
+  // voxelized mesh (as MATERIAL_VOXEL custom AABB primitives). Either way, a
+  // synthetic quad light sized to the bounding box substitutes for real
+  // scene lighting until HDRI support lands.
+  OptixRenderer(int width, int height, const SceneSource &source = {});
   ~OptixRenderer();
 
   OptixRenderer(const OptixRenderer &) = delete;

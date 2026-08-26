@@ -16,6 +16,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include "convert/voxelize.h"
 #include "core/orbit_camera.h"
 #include "io/gltf_loader.h"
 #include "render/optix_renderer.h"
@@ -79,6 +80,27 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Phase 4: `--voxel[=N]` resamples the loaded mesh into a voxel grid
+  // (N cells along its longest bounding-box axis, default 64) and renders
+  // that instead. Same "CLI flag, not UI yet" reasoning as GLB loading.
+  italy::VoxelGrid voxelGrid;
+  bool haveVoxels = false;
+  if (haveMesh) {
+    for (int i = 2; i < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg.rfind("--voxel", 0) == 0) {
+        int resolution = 64;
+        const size_t eq = arg.find('=');
+        if (eq != std::string::npos)
+          resolution = std::atoi(arg.c_str() + eq + 1);
+        voxelGrid = italy::voxelizeMesh(meshAsset, resolution);
+        haveVoxels = true;
+        std::fprintf(stderr, "italy: voxelized at resolution %d -> %zu occupied cells\n", resolution,
+                     voxelGrid.cells.size());
+      }
+    }
+  }
+
   if (!glfwInit()) {
     std::fprintf(stderr, "glfwInit failed\n");
     return 1;
@@ -109,7 +131,12 @@ int main(int argc, char **argv) {
   // Fixed render resolution for phase 2 bring-up — dynamic viewport resize
   // (reallocating the accum buffer/PBO/texture) lands with the UI controls
   // phase.
-  italy::OptixRenderer renderer(960, 540, haveMesh ? &meshAsset : nullptr);
+  italy::SceneSource source;
+  if (haveVoxels)
+    source.voxels = &voxelGrid;
+  else if (haveMesh)
+    source.mesh = &meshAsset;
+  italy::OptixRenderer renderer(960, 540, source);
   if (haveMesh)
     camera.frame(renderer.sceneBoundsCenter(), renderer.sceneBoundsRadius());
   italy::OrbitCamera prevCamera = camera;
@@ -147,7 +174,9 @@ int main(int argc, char **argv) {
     ImGui::NewFrame();
 
     ImGui::Begin("italy");
-    if (haveMesh)
+    if (haveVoxels)
+      ImGui::Text("Loaded: %s -> voxelized (%zu occupied cells)", argv[1], voxelGrid.cells.size());
+    else if (haveMesh)
       ImGui::Text("Loaded: %s (%zu tris%s)", argv[1], meshAsset.positions.size() / 3,
                    meshAsset.hasBaseColorTexture ? ", textured" : "");
     else

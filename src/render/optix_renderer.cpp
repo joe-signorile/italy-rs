@@ -17,6 +17,7 @@
 
 #include <sutil/vec_math.h> // float3 operators/cross/normalize — see buildModule() for why this is safe on the host
 
+#include "convert/voxel_grid.h"
 #include "render/gl_ext.h"
 #include "render/kernels/pathtracer_params.h"
 #include "render/optix_check.h"
@@ -50,13 +51,17 @@ void contextLogCallback(unsigned int level, const char *tag, const char *message
   std::fprintf(stderr, "[optix][%u][%s] %s\n", level, tag, message);
 }
 
-// One static-geometry object in the phase-2 bring-up scene: a GAS (built
-// once) plus the material record it contributes to the SBT.
+enum class GeometryKind { Triangle, Sphere, Voxel };
+
+// One static-geometry object in the scene: a GAS (built once) plus the
+// material record it contributes to the SBT. `kind` selects which hit-group
+// program group (and thus which intersection program) the object's SBT
+// record is packed against.
 struct SceneObject {
   OptixTraversableHandle gas = 0;
   CUdeviceptr gasBuffer = 0;
   HitGroupData material{};
-  bool isTriangle = true; // else: built-in sphere
+  GeometryKind kind = GeometryKind::Triangle;
 };
 
 } // namespace
@@ -72,6 +77,7 @@ struct OptixRenderer::Impl {
   OptixProgramGroup missOcclusionPG = nullptr;
   OptixProgramGroup hitTrianglePG = nullptr;
   OptixProgramGroup hitSpherePG = nullptr;
+  OptixProgramGroup hitVoxelPG = nullptr;
 
   OptixPipeline pipeline = nullptr;
 
@@ -102,6 +108,11 @@ struct OptixRenderer::Impl {
   cudaArray_t baseColorArray = nullptr;
   cudaTextureObject_t baseColorTexObj = 0;
 
+  // Device buffers backing a MATERIAL_VOXEL object's per-primitive AABBs
+  // (also feeds __intersection__voxel) and baked colors — freed in destroy().
+  CUdeviceptr voxelAabbBuffer = 0;
+  CUdeviceptr voxelColorBuffer = 0;
+
   ~Impl() { destroy(); }
 
   void destroy() {
@@ -113,6 +124,10 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(meshNormals));
     if (meshUvs)
       cudaFree(reinterpret_cast<void *>(meshUvs));
+    if (voxelAabbBuffer)
+      cudaFree(reinterpret_cast<void *>(voxelAabbBuffer));
+    if (voxelColorBuffer)
+      cudaFree(reinterpret_cast<void *>(voxelColorBuffer));
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
@@ -134,6 +149,8 @@ struct OptixRenderer::Impl {
       GLBufferFns::get().glDeleteBuffers(1, &pbo);
     if (pipeline)
       optixPipelineDestroy(pipeline);
+    if (hitVoxelPG)
+      optixProgramGroupDestroy(hitVoxelPG);
     if (hitSpherePG)
       optixProgramGroupDestroy(hitSpherePG);
     if (hitTrianglePG)
@@ -170,7 +187,7 @@ struct OptixRenderer::Impl {
     pipelineCompileOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";
     pipelineCompileOptions.usesPrimitiveTypeFlags =
-        OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE | OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE;
+        OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE | OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE | OPTIX_PRIMITIVE_TYPE_FLAGS_CUSTOM;
 
     OptixModuleCompileOptions moduleOptions{};
     moduleOptions.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_3;
@@ -221,10 +238,21 @@ struct OptixRenderer::Impl {
     hitSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
     hitSphereDesc.hitgroup.moduleIS = sphereModule;
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitSpherePG));
+
+    OptixProgramGroupDesc hitVoxelDesc{};
+    hitVoxelDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitVoxelDesc.hitgroup.moduleCH = module;
+    hitVoxelDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+    // Custom (non-builtin) primitive — our own intersection program, same
+    // module as everything else since it's compiled from pathtracer.cu too.
+    hitVoxelDesc.hitgroup.moduleIS = module;
+    hitVoxelDesc.hitgroup.entryFunctionNameIS = "__intersection__voxel";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitVoxelDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitVoxelPG));
   }
 
   void buildPipeline() {
-    OptixProgramGroup groups[] = {raygenPG, missRadiancePG, missOcclusionPG, hitTrianglePG, hitSpherePG};
+    OptixProgramGroup groups[] = {raygenPG,      missRadiancePG, missOcclusionPG,
+                                   hitTrianglePG, hitSpherePG,    hitVoxelPG};
     OptixPipelineLinkOptions linkOptions{};
     const uint32_t maxTraceDepth = 2; // raygen -> radiance hit -> occlusion shadow ray
     linkOptions.maxTraceDepth = maxTraceDepth;
@@ -252,7 +280,7 @@ struct OptixRenderer::Impl {
 
   SceneObject buildTriangleObject(const std::vector<float3> &verts, HitGroupData material) {
     SceneObject obj;
-    obj.isTriangle = true;
+    obj.kind = GeometryKind::Triangle;
     obj.material = material;
 
     CUdeviceptr vertexBuffer = uploadTriangles(verts);
@@ -288,7 +316,7 @@ struct OptixRenderer::Impl {
 
   SceneObject buildSphereObject(float3 center, float radius, HitGroupData material) {
     SceneObject obj;
-    obj.isTriangle = false;
+    obj.kind = GeometryKind::Sphere;
     obj.material = material;
 
     CUdeviceptr vertexBuffer, radiusBuffer;
@@ -347,7 +375,7 @@ struct OptixRenderer::Impl {
 
   SceneObject buildMeshObject(const MeshAsset &mesh) {
     SceneObject obj;
-    obj.isTriangle = true;
+    obj.kind = GeometryKind::Triangle;
     obj.material.materialType = MATERIAL_TEXTURED_DIFFUSE;
     obj.material.albedo = toFloat3(mesh.baseColorFactor);
 
@@ -414,6 +442,55 @@ struct OptixRenderer::Impl {
     return obj;
   }
 
+  SceneObject buildVoxelObject(const VoxelGrid &grid) {
+    SceneObject obj;
+    obj.kind = GeometryKind::Voxel;
+    obj.material.materialType = MATERIAL_VOXEL;
+
+    std::vector<OptixAabb> aabbs(grid.cells.size());
+    for (size_t i = 0; i < grid.cells.size(); ++i) {
+      const glm::vec3 mn = grid.cellMin(grid.cells[i]);
+      const glm::vec3 mx = grid.cellMax(grid.cells[i]);
+      aabbs[i] = OptixAabb{mn.x, mn.y, mn.z, mx.x, mx.y, mx.z};
+    }
+    const size_t aabbBytes = aabbs.size() * sizeof(OptixAabb);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&voxelAabbBuffer), aabbBytes));
+    CUDA_CHECK(
+        cudaMemcpy(reinterpret_cast<void *>(voxelAabbBuffer), aabbs.data(), aabbBytes, cudaMemcpyHostToDevice));
+    obj.material.voxelAabbs = reinterpret_cast<OptixAabb *>(voxelAabbBuffer);
+
+    std::vector<float3> colors(grid.colors.size());
+    for (size_t i = 0; i < grid.colors.size(); ++i)
+      colors[i] = toFloat3(grid.colors[i]);
+    const size_t colorBytes = colors.size() * sizeof(float3);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&voxelColorBuffer), colorBytes));
+    CUDA_CHECK(
+        cudaMemcpy(reinterpret_cast<void *>(voxelColorBuffer), colors.data(), colorBytes, cudaMemcpyHostToDevice));
+    obj.material.voxelColors = reinterpret_cast<float3 *>(voxelColorBuffer);
+
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    input.customPrimitiveArray.aabbBuffers = &voxelAabbBuffer;
+    input.customPrimitiveArray.numPrimitives = static_cast<unsigned int>(aabbs.size());
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.customPrimitiveArray.flags = flags;
+    input.customPrimitiveArray.numSbtRecords = 1;
+
+    OptixAccelBuildOptions accelOptions{};
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+    OptixAccelBufferSizes sizes{};
+    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
+    CUdeviceptr tempBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
+    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
+                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    return obj;
+  }
+
   void buildFixedTestScene() {
     HitGroupData groundMat{};
     groundMat.materialType = MATERIAL_DIFFUSE;
@@ -452,23 +529,40 @@ struct OptixRenderer::Impl {
     boundsRadius = 3.0f;
   }
 
-  void buildMeshScene(const MeshAsset &mesh) {
-    objects.push_back(buildMeshObject(mesh));
-
-    boundsCenter = mesh.boundsCenter();
-    boundsRadius = std::max(mesh.boundsRadius(), 1e-3f);
-
-    // Light sized/positioned relative to the mesh so it's a sensible key
-    // light regardless of the asset's own scale.
-    const float3 c = toFloat3(boundsCenter);
-    const float r = boundsRadius;
+  // Key light sized/positioned relative to a bounding sphere so it's sensible
+  // regardless of the loaded asset's own scale — shared by the mesh and
+  // voxel scenes, which both need *something* to be lit by (no HDRI yet).
+  void addBoundsKeyLight(const glm::vec3 &center, float radius) {
+    const float3 c = toFloat3(center);
+    const float r = radius;
     addLightQuad(make_float3(c.x - r, c.y + r * 2.2f, c.z - r), make_float3(r * 2.0f, 0, 0),
                  make_float3(0, 0, r * 2.0f), make_float3(20.0f, 20.0f, 18.0f));
   }
 
-  void buildScene(const MeshAsset *mesh) {
-    if (mesh)
-      buildMeshScene(*mesh);
+  void buildMeshScene(const MeshAsset &mesh) {
+    objects.push_back(buildMeshObject(mesh));
+    boundsCenter = mesh.boundsCenter();
+    boundsRadius = std::max(mesh.boundsRadius(), 1e-3f);
+    addBoundsKeyLight(boundsCenter, boundsRadius);
+  }
+
+  void buildVoxelScene(const VoxelGrid &grid) {
+    objects.push_back(buildVoxelObject(grid));
+    glm::vec3 mn(1e30f), mx(-1e30f);
+    for (const glm::ivec3 &c : grid.cells) {
+      mn = glm::min(mn, grid.cellMin(c));
+      mx = glm::max(mx, grid.cellMax(c));
+    }
+    boundsCenter = (mn + mx) * 0.5f;
+    boundsRadius = std::max(glm::length(mx - mn) * 0.5f, 1e-3f);
+    addBoundsKeyLight(boundsCenter, boundsRadius);
+  }
+
+  void buildScene(const SceneSource &source) {
+    if (source.voxels)
+      buildVoxelScene(*source.voxels);
+    else if (source.mesh)
+      buildMeshScene(*source.mesh);
     else
       buildFixedTestScene();
 
@@ -535,7 +629,18 @@ struct OptixRenderer::Impl {
 
     std::vector<HitGroupRecord> hitRecords(objects.size());
     for (size_t i = 0; i < objects.size(); ++i) {
-      OptixProgramGroup pg = objects[i].isTriangle ? hitTrianglePG : hitSpherePG;
+      OptixProgramGroup pg;
+      switch (objects[i].kind) {
+      case GeometryKind::Sphere:
+        pg = hitSpherePG;
+        break;
+      case GeometryKind::Voxel:
+        pg = hitVoxelPG;
+        break;
+      default:
+        pg = hitTrianglePG;
+        break;
+      }
       OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
       hitRecords[i].data = objects[i].material;
     }
@@ -567,13 +672,13 @@ struct OptixRenderer::Impl {
   }
 };
 
-OptixRenderer::OptixRenderer(int width, int height, const MeshAsset *mesh)
+OptixRenderer::OptixRenderer(int width, int height, const SceneSource &source)
     : impl_(new Impl()), width_(width), height_(height) {
   impl_->initContext();
   impl_->buildModule();
   impl_->buildProgramGroups();
   impl_->buildPipeline();
-  impl_->buildScene(mesh);
+  impl_->buildScene(source);
   impl_->buildSbt();
   impl_->initGLInterop(width, height);
 

@@ -61,6 +61,26 @@ A small bundled test asset lives at `assets/test.glb`. Single mesh/primitive
 only for now (no scene graph, no node transforms) — good enough for "one
 textured object," which is the phase-3 ask.
 
+To voxelize that mesh instead of rendering it as textured triangles:
+
+```
+./build/italy path/to/asset.glb --voxel=64
+```
+
+`64` is cells along the mesh's longest bounding-box axis (default if
+`--voxel` is given with no `=N`). Voxel color is baked from the source
+texture/material at conversion time, not sampled live.
+
+### Tests
+
+```
+ctest --test-dir build
+```
+
+Currently just the voxelizer's triangle-box SAT test (`tests/voxelize_test.cpp`)
+— the rendering core itself is verified visually (see "Debugging without
+eyeballing the live window" below), per the plan doc's reasoning.
+
 ### Hybrid-GPU laptops (Intel iGPU + NVIDIA dGPU)
 
 On this dev machine (Intel Iris Xe + RTX 4080 Laptop), GLX defaults to the
@@ -100,5 +120,17 @@ primitive (correct smooth-normal shading, falls back to the material's flat
 device model (correct UV-mapped texture — grille holes, buttons, panel seams
 all land in the right places).
 
-Not yet done: voxel/SDF resampling, HDRI lighting, SPPM caustics, AgX
-tonemapping, UI controls, denoiser. See the plan doc for the full phase list.
+Phase 4 done: mesh -> sparse voxel grid (exact triangle/AABB SAT test, not
+just bbox overlap — see `src/convert/voxelize.cpp`), rendered as
+`MATERIAL_VOXEL` custom-AABB primitives with OptiX's hardware BVH doing the
+sparse traversal (no hand-rolled DDA raymarch). Per-voxel color is baked from
+the source texture/`baseColorFactor` at conversion time; shading normal comes
+from which of the 6 box faces the intersection program's ray/slab test
+entered. Verified three ways: a unit-test on the SAT logic itself (shell
+occupied, interior empty), a visual check on the small primitive (correct
+blocky silhouette matching the smooth original), and a visual check on the
+272k-triangle textured device model (buttons/grille/seams still legible after
+voxelization, with correctly baked colors).
+
+Not yet done: SDF resampling, HDRI lighting, SPPM caustics, AgX tonemapping,
+UI controls, denoiser. See the plan doc for the full phase list.
