@@ -260,7 +260,11 @@ extern "C" __global__ void __raygen__rg() {
     accum = lerp(prevColor, accum, a);
   }
   params.accumBuffer[pixel] = make_float4(accum, 1.0f);
-  params.frameBuffer[pixel] = sutil::make_color(accum);
+  // Exposure is applied only to the display output, not the stored
+  // accumulator — so dragging the exposure slider doesn't need an
+  // accumulation reset, it just changes how the same HDR average is
+  // displayed this frame.
+  params.frameBuffer[pixel] = sutil::make_color(accum * params.exposure);
 }
 
 extern "C" __global__ void __miss__radiance() {

@@ -57,6 +57,7 @@ struct Params {
   unsigned int width;
   unsigned int height;
   unsigned int samplesPerLaunch;
+  float exposure; // linear multiplier applied just before tonemapping (phase 9 UI control)
 
   float3 eye, U, V, W; // camera basis, W points along view direction (not normalized: encodes FOV)
 

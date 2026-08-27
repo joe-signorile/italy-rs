@@ -50,8 +50,11 @@ public:
 
   // Renders one progressive subframe (accumulates onto the previous one) and
   // updates the GL texture returned by glTextureId(). Call resetAccumulation()
-  // first if the camera or scene changed since the last call.
-  void render(const OrbitCamera &camera);
+  // first if the camera or scene changed since the last call. samplesPerLaunch
+  // trades per-frame cost for faster convergence; exposure only affects the
+  // displayed tonemap, not the stored HDR accumulator (see pathtracer.cu),
+  // so it's free to change every frame without resetting accumulation.
+  void render(const OrbitCamera &camera, unsigned int samplesPerLaunch = 1, float exposure = 1.0f);
 
   void resetAccumulation();
 

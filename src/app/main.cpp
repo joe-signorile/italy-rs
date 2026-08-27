@@ -1,10 +1,14 @@
-// Phase 2: window + Dear ImGui shell + orbit camera + OptiX path-traced
-// viewport. The renderer accumulates progressively while the camera is
-// still and resets whenever it moves.
+// Phase 9: live ImGui controls — load a GLB, switch mesh/voxel/SDF
+// representation, pick an HDRI preset, tune exposure/samples-per-launch —
+// on top of the phase 2 window/camera/viewport shell. CLI args (still
+// supported, mainly for scripted verification/ITALY_DUMP_FRAME use) seed
+// the same state the UI edits, then both go through one shared rebuild
+// path so they can't drift out of sync with each other.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,9 +42,9 @@ bool cameraChanged(const italy::OrbitCamera &a, const italy::OrbitCamera &b) {
   return glm::dot(da, da) > 1e-10f || glm::dot(dt, dt) > 1e-10f;
 }
 
-// Debug/verification aid: set ITALY_DUMP_FRAME=path.png and (optionally)
-// ITALY_DUMP_AFTER_SUBFRAME=N to write out the accumulated render and exit —
-// lets a render-correctness check happen without eyeballing a live window.
+// Debug/verification aid: set ITALY_DUMP_FRAME=path.png to write out the
+// accumulated render and exit — lets a render-correctness check happen
+// without eyeballing a live window.
 void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *window) {
   const char *path = std::getenv("ITALY_DUMP_FRAME");
   if (!path)
@@ -62,91 +66,155 @@ void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *wind
   glfwSetWindowShouldClose(window, GLFW_TRUE);
 }
 
+// Explicit `int` underlying type: ImGui::RadioButton takes an `int*`, and
+// the UI loop below reinterpret_casts &state.representation/&state.envChoice
+// to one — relying on the (already-guaranteed-by-the-standard-for-scoped-
+// enums-with-no-explicit-type) size/alignment match to work is the kind of
+// thing worth spelling out rather than leaving implicit.
+enum class Representation : int { Mesh, Voxel, Sdf };
+enum class EnvChoice : int { None, Overcast, Midnight, Noon, Custom };
+
+// Everything the UI edits, plus the loaded/resampled assets those edits
+// produce. Assets are kept here (not as OptixRenderer members) because
+// SceneSource only borrows pointers into them for the duration of the
+// OptixRenderer constructor call — this struct is what actually owns them,
+// and must outlive whatever SceneSource is built from it.
+struct AppState {
+  italy::MeshAsset meshAsset;
+  bool haveMesh = false;
+  italy::VoxelGrid voxelGrid;
+  italy::SdfGrid sdfGrid;
+  italy::EnvironmentMap environment;
+  bool haveEnvironment = false;
+
+  char glbPathBuf[512] = "";
+  Representation representation = Representation::Mesh;
+  int resolution = 64;
+  EnvChoice envChoice = EnvChoice::None;
+  char hdriPathBuf[512] = "";
+
+  float exposure = 1.0f;
+  int samplesPerLaunch = 1;
+
+  std::string statusLine = "Showing the built-in test scene.";
+};
+
+// Re-loads/re-resamples everything from the current UI state and rebuilds
+// the renderer from scratch. Deliberately one all-or-nothing "apply" step
+// rather than incrementally patching the live scene — OptixRenderer has no
+// partial-rebuild API (see its header), and voxelizing/SDF-baking large
+// meshes isn't cheap enough to redo on every slider tick anyway, so a single
+// explicit rebuild point keeps the cost visible and predictable. Shared by
+// startup (seeded from CLI args) and the UI's "Apply" button so the two
+// entry points can't drift out of sync with each other.
+void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer, italy::OrbitCamera &camera) {
+  state.haveMesh = false;
+  if (state.glbPathBuf[0] != '\0') {
+    std::string err;
+    if (italy::loadGlb(state.glbPathBuf, state.meshAsset, err)) {
+      state.haveMesh = true;
+      state.statusLine = "Loaded " + std::string(state.glbPathBuf) + " (" +
+                          std::to_string(state.meshAsset.positions.size() / 3) + " tris" +
+                          (state.meshAsset.hasBaseColorTexture ? ", textured)" : ")");
+    } else {
+      state.statusLine = "Failed to load " + std::string(state.glbPathBuf) + ": " + err;
+    }
+  } else {
+    state.statusLine = "Showing the built-in test scene.";
+  }
+
+  bool haveVoxels = false, haveSdf = false;
+  if (state.haveMesh) {
+    if (state.representation == Representation::Voxel) {
+      state.voxelGrid = italy::voxelizeMesh(state.meshAsset, state.resolution);
+      haveVoxels = true;
+      state.statusLine += " -> voxelized (" + std::to_string(state.voxelGrid.cells.size()) + " cells)";
+    } else if (state.representation == Representation::Sdf) {
+      state.sdfGrid = italy::bakeSdf(state.meshAsset, state.resolution);
+      haveSdf = true;
+      state.statusLine += " -> SDF (" + std::to_string(state.sdfGrid.nx) + "x" + std::to_string(state.sdfGrid.ny) +
+                           "x" + std::to_string(state.sdfGrid.nz) + ")";
+    }
+  }
+
+  state.haveEnvironment = false;
+  std::string hdriPath;
+  switch (state.envChoice) {
+  case EnvChoice::Overcast:
+    hdriPath = "assets/hdri/overcast_day.hdr";
+    break;
+  case EnvChoice::Midnight:
+    hdriPath = "assets/hdri/midnight.hdr";
+    break;
+  case EnvChoice::Noon:
+    hdriPath = "assets/hdri/noon.hdr";
+    break;
+  case EnvChoice::Custom:
+    hdriPath = state.hdriPathBuf;
+    break;
+  case EnvChoice::None:
+    break;
+  }
+  if (!hdriPath.empty()) {
+    std::string err;
+    if (italy::loadEnvironmentMap(hdriPath, state.environment, err)) {
+      state.haveEnvironment = true;
+    } else {
+      state.statusLine += " | environment failed: " + err;
+      std::fprintf(stderr, "italy: failed to load environment %s: %s\n", hdriPath.c_str(), err.c_str());
+    }
+  }
+
+  italy::SceneSource source;
+  if (haveSdf)
+    source.sdf = &state.sdfGrid;
+  else if (haveVoxels)
+    source.voxels = &state.voxelGrid;
+  else if (state.haveMesh)
+    source.mesh = &state.meshAsset;
+  if (state.haveEnvironment)
+    source.environment = &state.environment;
+
+  renderer = std::make_unique<italy::OptixRenderer>(960, 540, source);
+  if (state.haveMesh)
+    camera.frame(renderer->sceneBoundsCenter(), renderer->sceneBoundsRadius());
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-  // Phase 3: optional GLB path on the command line loads and renders that
-  // mesh (as textured triangles) instead of the phase-2 fixed test scene.
-  // A file-picker UI comes with phase 9; a CLI arg is the smallest thing
-  // that lets ingestion be exercised/verified now.
-  italy::MeshAsset meshAsset;
-  bool haveMesh = false;
-  if (argc > 1 && std::string(argv[1]).rfind("--", 0) != 0) {
-    std::string err;
-    if (italy::loadGlb(argv[1], meshAsset, err)) {
-      haveMesh = true;
-      std::fprintf(stderr, "italy: loaded %s (%zu triangles%s)\n", argv[1], meshAsset.positions.size() / 3,
-                   meshAsset.hasBaseColorTexture ? ", textured" : "");
-    } else {
-      std::fprintf(stderr, "italy: failed to load %s: %s\n", argv[1], err.c_str());
-    }
-  }
+  AppState state;
 
-  // Phase 4: `--voxel[=N]` resamples the loaded mesh into a voxel grid
-  // (N cells along its longest bounding-box axis, default 64) and renders
-  // that instead. Same "CLI flag, not UI yet" reasoning as GLB loading.
-  italy::VoxelGrid voxelGrid;
-  bool haveVoxels = false;
-  // Phase 5: `--sdf[=N]` bakes a signed distance field instead (mutually
-  // exclusive with --voxel; if both are given, --sdf wins — matches
-  // OptixRenderer::buildScene's own sdf-before-voxels-before-mesh priority).
-  italy::SdfGrid sdfGrid;
-  bool haveSdf = false;
-  if (haveMesh) {
-    for (int i = 2; i < argc; ++i) {
-      const std::string arg = argv[i];
-      const size_t eq = arg.find('=');
-      const int resolution = eq != std::string::npos ? std::atoi(arg.c_str() + eq + 1) : 64;
-      if (arg.rfind("--voxel", 0) == 0) {
-        voxelGrid = italy::voxelizeMesh(meshAsset, resolution);
-        haveVoxels = true;
-        std::fprintf(stderr, "italy: voxelized at resolution %d -> %zu occupied cells\n", resolution,
-                     voxelGrid.cells.size());
-      } else if (arg.rfind("--sdf", 0) == 0) {
-        sdfGrid = italy::bakeSdf(meshAsset, resolution);
-        haveSdf = true;
-        std::fprintf(stderr, "italy: baked SDF at resolution %d -> %dx%dx%d grid\n", resolution, sdfGrid.nx,
-                     sdfGrid.ny, sdfGrid.nz);
-      }
-    }
-  }
-
-  // Phase 6: `--env=<overcast|midnight|noon>` selects a bundled HDRI preset;
-  // `--hdri=<path>` loads an arbitrary .hdr file. Applies regardless of
-  // which geometry mode is active (including the fixed test scene — a good
-  // way to see materials like glass/mirror against real environment
-  // lighting), so it's scanned independently of haveMesh.
-  italy::EnvironmentMap environment;
-  bool haveEnvironment = false;
+  // CLI args seed the same UI state rebuildScene() reads — kept mainly for
+  // scripted verification (ITALY_DUMP_FRAME runs, README examples) rather
+  // than as the primary way to drive the app now that the UI can do this.
+  if (argc > 1 && std::string(argv[1]).rfind("--", 0) != 0)
+    std::snprintf(state.glbPathBuf, sizeof(state.glbPathBuf), "%s", argv[1]);
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const size_t eq = arg.find('=');
-    if (eq == std::string::npos)
-      continue;
-    const std::string key = arg.substr(0, eq);
-    const std::string value = arg.substr(eq + 1);
-    std::string hdriPath;
-    if (key == "--env") {
+    const std::string key = eq != std::string::npos ? arg.substr(0, eq) : arg;
+    const std::string value = eq != std::string::npos ? arg.substr(eq + 1) : std::string();
+    if (key == "--voxel") {
+      state.representation = Representation::Voxel;
+      if (!value.empty())
+        state.resolution = std::atoi(value.c_str());
+    } else if (key == "--sdf") {
+      state.representation = Representation::Sdf;
+      if (!value.empty())
+        state.resolution = std::atoi(value.c_str());
+    } else if (key == "--env") {
       if (value == "overcast")
-        hdriPath = "assets/hdri/overcast_day.hdr";
+        state.envChoice = EnvChoice::Overcast;
       else if (value == "midnight")
-        hdriPath = "assets/hdri/midnight.hdr";
+        state.envChoice = EnvChoice::Midnight;
       else if (value == "noon")
-        hdriPath = "assets/hdri/noon.hdr";
+        state.envChoice = EnvChoice::Noon;
       else
         std::fprintf(stderr, "italy: unknown --env preset '%s' (try overcast, midnight, noon)\n", value.c_str());
     } else if (key == "--hdri") {
-      hdriPath = value;
-    }
-    if (!hdriPath.empty()) {
-      std::string err;
-      if (italy::loadEnvironmentMap(hdriPath, environment, err)) {
-        haveEnvironment = true;
-        std::fprintf(stderr, "italy: loaded environment %s (%dx%d)\n", hdriPath.c_str(), environment.width,
-                     environment.height);
-      } else {
-        std::fprintf(stderr, "italy: failed to load environment %s: %s\n", hdriPath.c_str(), err.c_str());
-      }
+      state.envChoice = EnvChoice::Custom;
+      std::snprintf(state.hdriPathBuf, sizeof(state.hdriPathBuf), "%s", value.c_str());
     }
   }
 
@@ -177,21 +245,8 @@ int main(int argc, char **argv) {
   italy::OrbitCamera camera;
   MouseState mouse;
 
-  // Fixed render resolution for phase 2 bring-up — dynamic viewport resize
-  // (reallocating the accum buffer/PBO/texture) lands with the UI controls
-  // phase.
-  italy::SceneSource source;
-  if (haveSdf)
-    source.sdf = &sdfGrid;
-  else if (haveVoxels)
-    source.voxels = &voxelGrid;
-  else if (haveMesh)
-    source.mesh = &meshAsset;
-  if (haveEnvironment)
-    source.environment = &environment;
-  italy::OptixRenderer renderer(960, 540, source);
-  if (haveMesh)
-    camera.frame(renderer.sceneBoundsCenter(), renderer.sceneBoundsRadius());
+  std::unique_ptr<italy::OptixRenderer> renderer;
+  rebuildScene(state, renderer, camera);
   italy::OrbitCamera prevCamera = camera;
 
   while (!glfwWindowShouldClose(window)) {
@@ -214,40 +269,73 @@ int main(int argc, char **argv) {
     }
 
     if (cameraChanged(camera, prevCamera)) {
-      renderer.resetAccumulation();
+      renderer->resetAccumulation();
       prevCamera = camera;
     }
-    renderer.render(camera);
+    renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure);
 
-    if (std::getenv("ITALY_DUMP_FRAME") && renderer.subframeIndex() >= 128)
-      dumpFrameIfRequested(renderer, window);
+    if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= 128)
+      dumpFrameIfRequested(*renderer, window);
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
     ImGui::Begin("italy");
-    if (haveSdf)
-      ImGui::Text("Loaded: %s -> SDF (%dx%dx%d grid)", argv[1], sdfGrid.nx, sdfGrid.ny, sdfGrid.nz);
-    else if (haveVoxels)
-      ImGui::Text("Loaded: %s -> voxelized (%zu occupied cells)", argv[1], voxelGrid.cells.size());
-    else if (haveMesh)
-      ImGui::Text("Loaded: %s (%zu tris%s)", argv[1], meshAsset.positions.size() / 3,
-                   meshAsset.hasBaseColorTexture ? ", textured" : "");
-    else
-      ImGui::Text("No GLB given on the command line — showing the built-in test scene.");
-    ImGui::Text("Lighting: %s", haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
+    ImGui::TextWrapped("%s", state.statusLine.c_str());
+    ImGui::Text("Lighting: %s", state.haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
+    ImGui::Separator();
+
+    ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
+
+    bool apply = ImGui::Button("Load / Apply");
+
+    if (state.haveMesh) {
+      ImGui::Text("Representation");
+      apply |= ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
+      ImGui::SameLine();
+      apply |= ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
+      ImGui::SameLine();
+      apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
+      if (state.representation != Representation::Mesh)
+        ImGui::SliderInt("Resolution", &state.resolution, 8, 256);
+    }
+
+    ImGui::Separator();
+    ImGui::Text("HDRI");
+    apply |= ImGui::RadioButton("None", reinterpret_cast<int *>(&state.envChoice), 0);
+    ImGui::SameLine();
+    apply |= ImGui::RadioButton("Overcast", reinterpret_cast<int *>(&state.envChoice), 1);
+    ImGui::SameLine();
+    apply |= ImGui::RadioButton("Midnight", reinterpret_cast<int *>(&state.envChoice), 2);
+    ImGui::SameLine();
+    apply |= ImGui::RadioButton("Noon", reinterpret_cast<int *>(&state.envChoice), 3);
+    ImGui::SameLine();
+    apply |= ImGui::RadioButton("Custom", reinterpret_cast<int *>(&state.envChoice), 4);
+    if (state.envChoice == EnvChoice::Custom)
+      ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
+
+    // Note: RadioButton edits above already trigger `apply` on click, same
+    // as the button — representation/HDRI changes need a full scene rebuild
+    // either way, so there's no cheaper "preview" path to offer here.
+    if (apply)
+      rebuildScene(state, renderer, camera);
+
+    ImGui::Separator();
+    ImGui::SliderFloat("Exposure", &state.exposure, 0.1f, 8.0f);
+    ImGui::SliderInt("Samples/launch", &state.samplesPerLaunch, 1, 16);
+
     ImGui::Separator();
     const glm::vec3 pos = camera.position();
     ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
-    ImGui::Text("Subframe: %u", renderer.subframeIndex());
+    ImGui::Text("Subframe: %u", renderer->subframeIndex());
     ImGui::Text("Drag left-click to orbit, middle-click to pan, scroll to zoom.");
     ImGui::End();
 
     ImGui::SetNextWindowSize(ImVec2(980, 580), ImGuiCond_FirstUseEver);
     ImGui::Begin("Viewport");
-    ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer.glTextureId())),
-                 ImVec2(static_cast<float>(renderer.width()), static_cast<float>(renderer.height())), ImVec2(0, 1),
+    ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())),
+                 ImVec2(static_cast<float>(renderer->width()), static_cast<float>(renderer->height())), ImVec2(0, 1),
                  ImVec2(1, 0));
     ImGui::End();
 

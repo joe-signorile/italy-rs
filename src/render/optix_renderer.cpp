@@ -1134,7 +1134,7 @@ OptixRenderer::~OptixRenderer() {
 
 void OptixRenderer::resetAccumulation() { subframeIndex_ = 0; }
 
-void OptixRenderer::render(const OrbitCamera &camera) {
+void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLaunch, float exposure) {
   const glm::vec3 eye = camera.position();
   const glm::vec3 target = camera.target();
   const glm::vec3 forward = glm::normalize(target - eye);
@@ -1149,7 +1149,8 @@ void OptixRenderer::render(const OrbitCamera &camera) {
   params.accumBuffer = reinterpret_cast<float4 *>(impl_->accumBuffer);
   params.width = static_cast<unsigned int>(width_);
   params.height = static_cast<unsigned int>(height_);
-  params.samplesPerLaunch = 1;
+  params.samplesPerLaunch = samplesPerLaunch;
+  params.exposure = exposure;
   params.eye = toFloat3(eye);
   params.U = toFloat3(right * tanHalfFov * aspect);
   params.V = toFloat3(up * tanHalfFov);
