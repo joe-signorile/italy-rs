@@ -96,6 +96,7 @@ struct AppState {
   float exposure = 1.0f;
   int samplesPerLaunch = 1;
   bool denoise = false;
+  italy::TonemapOperator tonemap = italy::TonemapOperator::AgX;
 
   std::string statusLine = "Showing the built-in test scene.";
 };
@@ -246,11 +247,20 @@ int main(int argc, char **argv) {
   italy::OrbitCamera camera;
   MouseState mouse;
 
-  // Testing hook, same spirit as ITALY_DUMP_FRAME: the denoiser toggle is
-  // UI-only otherwise, so scripted before/after verification needs a way in
-  // that doesn't require actually clicking the checkbox.
+  // Testing hooks, same spirit as ITALY_DUMP_FRAME: these toggles are UI-only
+  // otherwise, so scripted before/after verification needs a way in that
+  // doesn't require actually clicking the checkbox/radio button.
   if (std::getenv("ITALY_FORCE_DENOISE"))
     state.denoise = true;
+  if (const char *tm = std::getenv("ITALY_TONEMAP")) {
+    const std::string v = tm;
+    if (v == "agx") state.tonemap = italy::TonemapOperator::AgX;
+    else if (v == "reinhard") state.tonemap = italy::TonemapOperator::Reinhard;
+    else if (v == "aces") state.tonemap = italy::TonemapOperator::Aces;
+    else if (v == "hable") state.tonemap = italy::TonemapOperator::Hable;
+    else if (v == "clamp") state.tonemap = italy::TonemapOperator::Clamp;
+    else std::fprintf(stderr, "italy: unknown ITALY_TONEMAP '%s'\n", v.c_str());
+  }
 
   std::unique_ptr<italy::OptixRenderer> renderer;
   rebuildScene(state, renderer, camera);
@@ -279,7 +289,8 @@ int main(int argc, char **argv) {
       renderer->resetAccumulation();
       prevCamera = camera;
     }
-    renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure, state.denoise);
+    renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure, state.denoise,
+                      state.tonemap);
 
     const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
     const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
@@ -334,6 +345,17 @@ int main(int argc, char **argv) {
     ImGui::SliderFloat("Exposure", &state.exposure, 0.1f, 8.0f);
     ImGui::SliderInt("Samples/launch", &state.samplesPerLaunch, 1, 16);
     ImGui::Checkbox("Denoiser", &state.denoise);
+
+    ImGui::Text("Tonemap");
+    ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.tonemap), 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.tonemap), 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.tonemap), 2);
+    ImGui::SameLine();
+    ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.tonemap), 3);
+    ImGui::SameLine();
+    ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.tonemap), 4);
 
     ImGui::Separator();
     const glm::vec3 pos = camera.position();

@@ -1230,7 +1230,8 @@ OptixRenderer::~OptixRenderer() {
 
 void OptixRenderer::resetAccumulation() { subframeIndex_ = 0; }
 
-void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLaunch, float exposure, bool denoise) {
+void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLaunch, float exposure, bool denoise,
+                            TonemapOperator tonemap) {
   const glm::vec3 eye = camera.position();
   const glm::vec3 target = camera.target();
   const glm::vec3 forward = glm::normalize(target - eye);
@@ -1247,6 +1248,7 @@ void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLau
   params.height = static_cast<unsigned int>(height_);
   params.samplesPerLaunch = samplesPerLaunch;
   params.exposure = exposure;
+  params.tonemapOperator = static_cast<unsigned int>(tonemap);
   params.eye = toFloat3(eye);
   params.U = toFloat3(right * tanHalfFov * aspect);
   params.V = toFloat3(up * tanHalfFov);

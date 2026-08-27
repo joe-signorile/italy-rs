@@ -59,6 +59,13 @@ struct Params {
   unsigned int samplesPerLaunch;
   float exposure; // linear multiplier applied just before tonemapping (phase 9 UI control)
 
+  // Phase 8: which view transform applyTonemapAndQuantize() (pathtracer.cu)
+  // uses to convert linear HDR into the displayed 8-bit sRGB image. Values
+  // mirror italy::TonemapOperator (optix_renderer.h) by convention, not a
+  // shared type — same "device-side enums stay device-side" pattern as
+  // MaterialType above.
+  unsigned int tonemapOperator;
+
   // Phase 10 denoiser: when nonzero, __raygen__rg skips its own
   // frameBuffer write (the noisy tonemap would just be overwritten anyway)
   // and optix_renderer.cpp instead denoises accumBuffer into denoisedBuffer,

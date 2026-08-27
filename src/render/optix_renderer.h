@@ -19,6 +19,21 @@
 
 namespace italy {
 
+// Phase 8: which view transform converts the accumulated (and optionally
+// denoised) linear HDR radiance into the displayed 8-bit sRGB image. Plain
+// C++ enum, zero CUDA dependency — keeps the RHI seam intact (see the class
+// comment below). Numerically mirrored, not shared as a type, by the
+// device-side dispatcher in pathtracer.cu (matches how MaterialType etc.
+// already stay device-side-only) — see pathtracer_params.h's
+// Params::tonemapOperator comment.
+enum class TonemapOperator : int {
+  AgX = 0,      // default: Blender's modern filmic replacement, graceful highlight rolloff
+  Reinhard = 1, // alternate/debugging aid
+  Aces = 2,     // alternate/debugging aid (Narkowicz 2015 fit)
+  Hable = 3,    // alternate/debugging aid (Uncharted2 filmic curve)
+  Clamp = 4,    // alternate/debugging aid: the naive clamp(0,1) every render before this phase used
+};
+
 // Exactly one of mesh/voxels/sdf should be set; none set means the fixed
 // bring-up scene. A tagged struct rather than overloaded constructors, since
 // a bare pointer overload set would be ambiguous for the nullptr default.
@@ -56,9 +71,11 @@ public:
   // so it's free to change every frame without resetting accumulation.
   // denoise runs the OptiX AI denoiser over the accumulated HDR buffer
   // before tonemapping — same free-to-toggle-any-frame property as
-  // exposure, since it never touches the stored accumulator either.
+  // exposure, since it never touches the stored accumulator either. Same
+  // for tonemap: applied only at final display time, safe to change any
+  // frame.
   void render(const OrbitCamera &camera, unsigned int samplesPerLaunch = 1, float exposure = 1.0f,
-              bool denoise = false);
+              bool denoise = false, TonemapOperator tonemap = TonemapOperator::AgX);
 
   void resetAccumulation();
 

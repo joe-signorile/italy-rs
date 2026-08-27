@@ -59,6 +59,99 @@ static __forceinline__ __device__ float schlickFresnel(float cosTheta, float ior
 }
 
 // ----------------------------------------------------------------------------
+// Tonemapping (phase 8): converts linear HDR radiance to the [0,1] range
+// sutil::toSRGB()/quantizeUnsigned8Bits() (sutil/cuda/helpers.h) then encode
+// to 8-bit display output — same final encode step every operator shares,
+// only what happens before it differs. AgX is the default; the rest are
+// alternates/debugging aids (see optix_renderer.h's TonemapOperator).
+// ----------------------------------------------------------------------------
+
+// AgX: a widely-circulated community GLSL approximation of Blender's AgX
+// view transform (the same one Godot 4.3+ and Bevy ship instead of pulling
+// in OpenColorIO for a single transform) — inset matrix into a
+// log2-encoded working space, a 6th-order polynomial fit of AgX's "base
+// contrast" sigmoid, then an outset matrix back to linear. The matrix and
+// polynomial constants below are reproduced from memory of that
+// community fit, not diffed against Blender's reference OCIO config
+// byte-for-byte in this environment (no Blender install/reference render
+// available here to diff against) — verification is behavioral: does it
+// visibly preserve highlight gradation instead of clipping to flat white,
+// compared side by side against TONEMAP_CLAMP (see render()'s comparison
+// dumps). Output is still linear-ish (matching AgX's own convention); the
+// caller applies the sRGB OETF afterward like every other operator here.
+static __forceinline__ __device__ float3 agxContrastApprox(float3 x) {
+  const float3 x2 = x * x;
+  const float3 x4 = x2 * x2;
+  return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x + 0.4298f * x2 + 0.1191f * x - 0.00232f;
+}
+
+static __forceinline__ __device__ float3 agxTonemap(float3 c) {
+  // AgX Inset matrix (working linear -> AgX log2 space).
+  const float3 r = make_float3(0.856627153315983f, 0.0951212405381588f, 0.0482516061458583f);
+  const float3 g = make_float3(0.137318972929847f, 0.761241990602591f, 0.101439036467562f);
+  const float3 b = make_float3(0.11189821299995f, 0.0767994186031903f, 0.811302368396859f);
+  float3 v = make_float3(dot(make_float3(r.x, g.x, b.x), c), dot(make_float3(r.y, g.y, b.y), c),
+                          dot(make_float3(r.z, g.z, b.z), c));
+
+  const float minEv = -12.47393f, maxEv = 4.026069f;
+  v = make_float3(fmaxf(v.x, 1e-10f), fmaxf(v.y, 1e-10f), fmaxf(v.z, 1e-10f));
+  v = make_float3(log2f(v.x), log2f(v.y), log2f(v.z));
+  v = clamp((v - minEv) / (maxEv - minEv), 0.0f, 1.0f);
+  v = agxContrastApprox(v);
+
+  // AgX Outset matrix (AgX space -> display-referred linear).
+  const float3 or_ = make_float3(1.1271005818144368f, -0.11060664309660323f, -0.016493938717834573f);
+  const float3 og = make_float3(-0.1413297634984383f, 1.157823702216272f, -0.016493938717834257f);
+  const float3 ob = make_float3(-0.14132976349843826f, -0.11060664309660294f, 1.2519364065950405f);
+  return make_float3(dot(make_float3(or_.x, og.x, ob.x), v), dot(make_float3(or_.y, og.y, ob.y), v),
+                      dot(make_float3(or_.z, og.z, ob.z), v));
+}
+
+// Simple Reinhard (c / (1+c)) — the classic "everything gently compresses
+// toward white" operator, kept mainly as a contrast baseline against AgX.
+static __forceinline__ __device__ float3 reinhardTonemap(float3 c) { return c / (make_float3(1.0f) + c); }
+
+// Narkowicz 2015 ACES filmic curve fit.
+static __forceinline__ __device__ float3 acesFilmicTonemap(float3 x) {
+  const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0f, 1.0f);
+}
+
+// Uncharted2/Hable filmic curve.
+static __forceinline__ __device__ float3 hablePartial(float3 x) {
+  const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
+  return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+static __forceinline__ __device__ float3 hableTonemap(float3 c) {
+  const float exposureBias = 2.0f;
+  const float3 curr = hablePartial(c * exposureBias);
+  const float3 whiteScale = make_float3(1.0f) / hablePartial(make_float3(11.2f));
+  return curr * whiteScale;
+}
+
+static __forceinline__ __device__ uchar4 applyTonemapAndQuantize(float3 hdr, unsigned int op) {
+  float3 mapped;
+  switch (op) {
+  case 1: // Reinhard
+    mapped = reinhardTonemap(hdr);
+    break;
+  case 2: // ACES
+    mapped = acesFilmicTonemap(hdr);
+    break;
+  case 3: // Hable
+    mapped = hableTonemap(hdr);
+    break;
+  case 4: // Clamp — the bare behavior every render used before this phase
+    mapped = hdr;
+    break;
+  default: // AgX
+    mapped = agxTonemap(hdr);
+    break;
+  }
+  return sutil::make_color(mapped);
+}
+
+// ----------------------------------------------------------------------------
 // HDRI/environment lighting (phase 6): equirectangular image, importance
 // sampled via a piecewise-constant 2D distribution (PBRT-style: a marginal
 // CDF over rows, a conditional CDF over columns within the sampled row).
@@ -268,7 +361,7 @@ extern "C" __global__ void __raygen__rg() {
   // the result instead, so writing a tonemap of the *noisy* accum here
   // would just be wasted work, immediately overwritten.
   if (!params.denoiserEnabled)
-    params.frameBuffer[pixel] = sutil::make_color(accum * params.exposure);
+    params.frameBuffer[pixel] = applyTonemapAndQuantize(accum * params.exposure, params.tonemapOperator);
 }
 
 // Phase 10: reads the denoiser's output (already-converged-looking HDR)
@@ -282,7 +375,7 @@ extern "C" __global__ void __raygen__tonemap() {
   const uint3 idx = optixGetLaunchIndex();
   const unsigned int pixel = idx.y * params.width + idx.x;
   const float3 color = make_float3(params.denoisedBuffer[pixel]);
-  params.frameBuffer[pixel] = sutil::make_color(color * params.exposure);
+  params.frameBuffer[pixel] = applyTonemapAndQuantize(color * params.exposure, params.tonemapOperator);
 }
 
 extern "C" __global__ void __miss__radiance() {
