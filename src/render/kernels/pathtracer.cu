@@ -291,6 +291,12 @@ extern "C" __global__ void __miss__radiance() {
 
 extern "C" __global__ void __miss__occlusion() { optixSetPayload_0(0u); }
 
+// Gather queries (missSBTIndex 2, see the gather trace in
+// __closesthit__radiance) intentionally do nothing on a miss: "no photons
+// within radius" needs no payload change, since the accumulator (payload
+// registers 6-8) was already zero-initialized by the caller.
+extern "C" __global__ void __miss__gather() {}
+
 // Shared ray/AABB slab test — used by both the voxel intersection program
 // (box IS the primitive) and the SDF one (box just bounds where to start/
 // stop sphere tracing). Returns false for no overlap; otherwise t0/t1 are
@@ -605,6 +611,45 @@ extern "C" __global__ void __closesthit__radiance() {
       }
     }
 
+    // Caustics: gather nearby deposited photons (see phase-7 comment on
+    // Params::photonHandle) and add their contribution alongside NEE — same
+    // "radiance" channel, so it gets the same attenuation multiply in the
+    // raygen loop. No-op when there's no photon map for this scene.
+    if (params.photonHandle) {
+      unsigned int g0 = __float_as_uint(N.x), g1 = __float_as_uint(N.y), g2 = __float_as_uint(N.z);
+      unsigned int g3 = __float_as_uint(albedo.x), g4 = __float_as_uint(albedo.y), g5 = __float_as_uint(albedo.z);
+      unsigned int g6 = 0u, g7 = 0u, g8 = 0u;
+      // Any fixed direction correctly finds every sphere containing P, as
+      // long as tmax covers the largest possible chord through one of
+      // them (the diameter) — see optix_renderer.cpp's photon-BVH comment
+      // for the derivation. N is a convenient already-unit-length choice.
+      const float tmax = 2.02f * params.photonGatherRadius;
+      optixTrace(params.photonHandle, P, N, 0.0f, tmax, 0.0f, OptixVisibilityMask(1), OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
+                 params.gatherHitSbtOffset, 1, 2, g0, g1, g2, g3, g4, g5, g6, g7, g8);
+      const float3 gathered = make_float3(__uint_as_float(g6), __uint_as_float(g7), __uint_as_float(g8));
+      const float diskArea = M_PIf * params.photonGatherRadius * params.photonGatherRadius;
+      // Normalize by *this pass's* emitted count, not the cumulative
+      // totalPhotonsEmitted: the photon buffer is rebuilt fresh each pass
+      // (old photons aren't kept/accumulated — see optix_renderer.cpp's
+      // tracePhotonPass), so it only ever holds this pass's photons.
+      // Dividing by the ever-growing cumulative total made the estimate
+      // decay toward zero after enough passes instead of converging —
+      // caught by instrumenting the deposited-photon-count logging and
+      // noticing the render wasn't visibly different from having caustics
+      // off at all. Bias from the shrinking radius, and noise from a
+      // single pass's photon count, both average out via the same
+      // subframe accumulation that already smooths NEE noise.
+      radiance += gathered / (diskArea * fmaxf(static_cast<float>(params.photonBatchSize), 1.0f));
+      // Debug aid used to verify the gather is finding a spatially coherent
+      // caustic and not just noise/nothing, independent of how visible it
+      // is against direct lighting: build with
+      // `-DITALY_DEBUG_CAUSTICS_ONLY` (not part of the normal CMake build)
+      // to replace radiance with *only* the (heavily boosted) caustic term.
+#ifdef ITALY_DEBUG_CAUSTICS_ONLY
+      radiance = gathered / (diskArea * fmaxf(static_cast<float>(params.photonBatchSize), 1.0f)) * 200.0f;
+#endif
+    }
+
     // Sample the next bounce direction (cosine-weighted).
     float3 local;
     cosineSampleHemisphere(sutil::rnd(seed), sutil::rnd(seed), local);
@@ -653,4 +698,153 @@ extern "C" __global__ void __closesthit__radiance() {
   optixSetPayload_16(__float_as_uint(nextDirection.y));
   optixSetPayload_17(__float_as_uint(nextDirection.z));
   optixSetPayload_18(static_cast<unsigned int>(done));
+}
+
+// Any-hit half of the "ray-traced range query" trick used to gather nearby
+// photons: any-hit runs once per candidate primitive along the ray *without*
+// stopping traversal (optixIgnoreIntersection keeps it going), so as long as
+// the ray is long enough to guarantee crossing every candidate photon-sphere
+// it starts inside (see __closesthit__radiance's tmax comment), this visits
+// every photon within photonGatherRadius of the query point exactly once.
+// Payload: p0-2 query shading normal, p3-5 query albedo (both set by the
+// caller before tracing), p6-8 running sum (read-modify-write here).
+extern "C" __global__ void __anyhit__gather() {
+  const Photon &p = params.photons[optixGetPrimitiveIndex()];
+  const float3 N = make_float3(__uint_as_float(optixGetPayload_0()), __uint_as_float(optixGetPayload_1()),
+                                __uint_as_float(optixGetPayload_2()));
+  const float cosTheta = dot(N, -p.direction);
+  if (cosTheta > 0.0f) {
+    const float3 albedo = make_float3(__uint_as_float(optixGetPayload_3()), __uint_as_float(optixGetPayload_4()),
+                                       __uint_as_float(optixGetPayload_5()));
+    const float3 sum = make_float3(__uint_as_float(optixGetPayload_6()), __uint_as_float(optixGetPayload_7()),
+                                    __uint_as_float(optixGetPayload_8())) +
+                        (albedo / M_PIf) * p.power * cosTheta;
+    optixSetPayload_6(__float_as_uint(sum.x));
+    optixSetPayload_7(__float_as_uint(sum.y));
+    optixSetPayload_8(__float_as_uint(sum.z));
+  }
+  optixIgnoreIntersection();
+}
+
+// ----------------------------------------------------------------------------
+// Photon emission/tracing (phase 7 caustics). Iterative bounce loop in
+// raygen, same shape as __raygen__rg/trace() above, but with a much smaller
+// dedicated payload — this is a separate, simpler walk (emit from the light,
+// follow specular bounces, deposit at the first diffuse hit, done) rather
+// than a variant of the camera path. Scoped to MATERIAL_DIFFUSE/MIRROR/
+// GLASS/LIGHT only (the fixed bring-up scene) — see optix_renderer.cpp's
+// buildPhotonPipeline() for why mesh/voxel/sdf scenes don't get a photon map
+// at all.
+//
+// Payload: p0 seed, p1-3 power, p4-6 next direction, p7 causticEligible
+// (0/1 — becomes 1 after the first specular bounce; only photons that pass
+// through at least one specular surface get deposited, since direct
+// light->diffuse paths are already handled by NEE), p8 done, p9-11 next
+// origin.
+// ----------------------------------------------------------------------------
+
+extern "C" __global__ void __closesthit__photon() {
+  HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const float3 rayDir = optixGetWorldRayDirection();
+  const float3 N = computeShadingNormal(rayDir);
+  const float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
+
+  unsigned int seed = optixGetPayload_0();
+  float3 power = make_float3(__uint_as_float(optixGetPayload_1()), __uint_as_float(optixGetPayload_2()),
+                              __uint_as_float(optixGetPayload_3()));
+  unsigned int causticEligible = optixGetPayload_7();
+
+  float3 nextDirection = rayDir;
+  unsigned int done = 1u;
+
+  if (rt->materialType == MATERIAL_MIRROR) {
+    nextDirection = reflect(rayDir, N);
+    power = power * rt->albedo;
+    causticEligible = 1u;
+    done = 0u;
+  } else if (rt->materialType == MATERIAL_GLASS) {
+    const bool entering = dot(rayDir, N) < 0.0f;
+    const float3 n = entering ? N : -N;
+    const float eta = entering ? (1.0f / rt->ior) : rt->ior;
+    const float cosTheta = fminf(fabsf(dot(rayDir, n)), 1.0f);
+    const float fresnel = schlickFresnel(cosTheta, entering ? rt->ior : (1.0f / rt->ior));
+    float3 refracted;
+    const bool canRefract = refractRay(rayDir, n, eta, refracted);
+    nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
+    power = power * rt->albedo;
+    causticEligible = 1u;
+    done = 0u;
+  } else if (rt->materialType == MATERIAL_DIFFUSE && causticEligible) {
+    // Deposit and terminate — single-bounce caustics only (matches the
+    // "light through glass onto a table" verification scenario exactly;
+    // multi-bounce caustic chains are a natural but unneeded-for-MVP
+    // extension, same "obvious next step, not required now" spirit as the
+    // rest of this file's scope choices).
+    const unsigned int idx = atomicAdd(params.photonCounter, 1u);
+    if (idx < params.photonCapacity) {
+      params.photons[idx].position = P;
+      params.photons[idx].direction = rayDir;
+      params.photons[idx].power = power;
+    }
+    done = 1u;
+  }
+  // MATERIAL_DIFFUSE-without-causticEligible (direct light->diffuse, already
+  // covered by NEE) and MATERIAL_LIGHT (photon hit another light) both fall
+  // through to the done=1u/no-deposit default above.
+
+  optixSetPayload_0(seed);
+  optixSetPayload_1(__float_as_uint(power.x));
+  optixSetPayload_2(__float_as_uint(power.y));
+  optixSetPayload_3(__float_as_uint(power.z));
+  optixSetPayload_4(__float_as_uint(nextDirection.x));
+  optixSetPayload_5(__float_as_uint(nextDirection.y));
+  optixSetPayload_6(__float_as_uint(nextDirection.z));
+  optixSetPayload_7(causticEligible);
+  optixSetPayload_8(done);
+  optixSetPayload_9(__float_as_uint(P.x));
+  optixSetPayload_10(__float_as_uint(P.y));
+  optixSetPayload_11(__float_as_uint(P.z));
+}
+
+extern "C" __global__ void __miss__photon() { optixSetPayload_8(1u); /* done — escaped the scene */ }
+
+extern "C" __global__ void __raygen__photon() {
+  const unsigned int idx = optixGetLaunchIndex().x;
+  // Distinct seed stream from camera rays: same idx values are used by both
+  // (photon launch width vs. pixel count don't correspond to anything), and
+  // params.subframeIndex vs a would-be "photon pass index" would otherwise
+  // coincide too, so tea<> alone isn't enough — fold in a large odd
+  // constant to decorrelate the two RNG streams.
+  unsigned int seed = sutil::tea<4>(idx, params.totalPhotonsEmitted + 0x9e3779b9u);
+
+  const QuadLight &light = params.light;
+  const float z1 = sutil::rnd(seed), z2 = sutil::rnd(seed);
+  float3 origin = light.corner + light.v1 * z1 + light.v2 * z2;
+  float3 local;
+  cosineSampleHemisphere(sutil::rnd(seed), sutil::rnd(seed), local);
+  Onb onb(light.normal);
+  float3 direction = onb.toWorld(local);
+
+  const float area = length(cross(light.v1, light.v2));
+  // Total emitted flux for a Lambertian area emitter is Le * A * pi; spread
+  // evenly across this pass's photons.
+  float3 power = (light.emission * area * M_PIf) / fmaxf(static_cast<float>(params.photonBatchSize), 1.0f);
+
+  unsigned int causticEligible = 0u;
+  for (int depth = 0; depth < 8; ++depth) {
+    unsigned int p0 = seed, p1 = __float_as_uint(power.x), p2 = __float_as_uint(power.y),
+                 p3 = __float_as_uint(power.z), p4 = __float_as_uint(direction.x), p5 = __float_as_uint(direction.y),
+                 p6 = __float_as_uint(direction.z), p7 = causticEligible, p8 = 0u, p9 = __float_as_uint(origin.x),
+                 p10 = __float_as_uint(origin.y), p11 = __float_as_uint(origin.z);
+    optixTrace(params.handle, origin, direction, 1e-3f, 1e16f, 0.0f, OptixVisibilityMask(1), OPTIX_RAY_FLAG_NONE, 0, 1,
+               0, p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11);
+    seed = p0;
+    power = make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3));
+    direction = make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6));
+    causticEligible = p7;
+    const unsigned int done = p8;
+    origin = make_float3(__uint_as_float(p9), __uint_as_float(p10), __uint_as_float(p11));
+    if (done)
+      break;
+  }
 }

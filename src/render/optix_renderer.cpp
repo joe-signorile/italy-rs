@@ -80,6 +80,20 @@ struct OptixRenderer::Impl {
   OptixProgramGroup hitVoxelPG = nullptr;
   OptixProgramGroup hitSdfPG = nullptr;
 
+  // Phase 7 caustics: a second SBT (photonSbt) sharing this same
+  // pipeline/context, used only for the photon-emission launch — see
+  // buildPhotonPipeline()'s comment for why a second SBT rather than
+  // ray-type-multiplexing the existing one. gatherHitPG/gatherMissPG,
+  // though, extend the *main* radianceSbt directly (the gather trace is
+  // issued from inside __closesthit__radiance, which runs under
+  // radianceSbt's binding — see the Params::gatherHitSbtOffset comment).
+  OptixProgramGroup photonRaygenPG = nullptr;
+  OptixProgramGroup photonMissPG = nullptr;
+  OptixProgramGroup photonHitTrianglePG = nullptr;
+  OptixProgramGroup photonHitSpherePG = nullptr;
+  OptixProgramGroup gatherHitPG = nullptr;
+  OptixProgramGroup gatherMissPG = nullptr;
+
   OptixPipeline pipeline = nullptr;
 
   std::vector<SceneObject> objects;
@@ -129,6 +143,27 @@ struct OptixRenderer::Impl {
   int envWidth = 0;
   int envHeight = 0;
 
+  // Caustics (phase 7) — only built for the fixed test scene (the only one
+  // with specular objects to seed a caustic from) and only when there's no
+  // environment map (photon emission samples params.light, which is unset
+  // when hasEnvironment). Global-radius progressive photon mapping — see
+  // Params::photonHandle's doc comment for which published variant this is.
+  bool enablePhotonMapping = false;
+  static constexpr unsigned int kPhotonBatchSize = 1u << 16; // 65536 photons/pass
+  static constexpr unsigned int kPhotonCapacity = 1u << 18;  // generous headroom over the batch size
+  static constexpr float kPpmAlpha = 0.7f;                   // standard PPM radius-decay constant
+  OptixShaderBindingTable photonSbt{};
+  CUdeviceptr photonBuffer = 0;      // Photon[kPhotonCapacity]
+  CUdeviceptr photonCounterBuffer = 0; // single atomic uint
+  CUdeviceptr photonGasBuffer = 0;
+  CUdeviceptr photonGasVertexBuffer = 0; // kept alive across rebuilds — see buildPhotonMap()
+  CUdeviceptr photonGasRadiusBuffer = 0;
+  OptixTraversableHandle photonGasHandle = 0;
+  unsigned int photonPassIndex = 0;
+  float photonRadius = 0.0f;
+  unsigned int totalPhotonsEmitted = 0;
+  unsigned int gatherHitSbtOffset = 0;
+
   ~Impl() { destroy(); }
 
   void destroy() {
@@ -154,6 +189,22 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(envMarginalCdfBuffer));
     if (envConditionalCdfBuffer)
       cudaFree(reinterpret_cast<void *>(envConditionalCdfBuffer));
+    if (photonBuffer)
+      cudaFree(reinterpret_cast<void *>(photonBuffer));
+    if (photonCounterBuffer)
+      cudaFree(reinterpret_cast<void *>(photonCounterBuffer));
+    if (photonGasBuffer)
+      cudaFree(reinterpret_cast<void *>(photonGasBuffer));
+    if (photonGasVertexBuffer)
+      cudaFree(reinterpret_cast<void *>(photonGasVertexBuffer));
+    if (photonGasRadiusBuffer)
+      cudaFree(reinterpret_cast<void *>(photonGasRadiusBuffer));
+    if (photonSbt.raygenRecord)
+      cudaFree(reinterpret_cast<void *>(photonSbt.raygenRecord));
+    if (photonSbt.missRecordBase)
+      cudaFree(reinterpret_cast<void *>(photonSbt.missRecordBase));
+    if (photonSbt.hitgroupRecordBase)
+      cudaFree(reinterpret_cast<void *>(photonSbt.hitgroupRecordBase));
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
@@ -175,6 +226,18 @@ struct OptixRenderer::Impl {
       GLBufferFns::get().glDeleteBuffers(1, &pbo);
     if (pipeline)
       optixPipelineDestroy(pipeline);
+    if (gatherMissPG)
+      optixProgramGroupDestroy(gatherMissPG);
+    if (gatherHitPG)
+      optixProgramGroupDestroy(gatherHitPG);
+    if (photonHitSpherePG)
+      optixProgramGroupDestroy(photonHitSpherePG);
+    if (photonHitTrianglePG)
+      optixProgramGroupDestroy(photonHitTrianglePG);
+    if (photonMissPG)
+      optixProgramGroupDestroy(photonMissPG);
+    if (photonRaygenPG)
+      optixProgramGroupDestroy(photonRaygenPG);
     if (hitSdfPG)
       optixProgramGroupDestroy(hitSdfPG);
     if (hitVoxelPG)
@@ -284,13 +347,62 @@ struct OptixRenderer::Impl {
     hitSdfDesc.hitgroup.moduleIS = module;
     hitSdfDesc.hitgroup.entryFunctionNameIS = "__intersection__sdf";
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitSdfDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitSdfPG));
+
+    // Phase 7 caustics: photon emission (own raygen/miss, reuses the
+    // triangle/sphere IS modules already built above) and the gather query
+    // (sphere IS + any-hit only, no closest-hit — see __anyhit__gather).
+    OptixProgramGroupDesc photonRaygenDesc{};
+    photonRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    photonRaygenDesc.raygen.module = module;
+    photonRaygenDesc.raygen.entryFunctionName = "__raygen__photon";
+    OPTIX_CHECK_LOG(
+        optixProgramGroupCreate(context, &photonRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonRaygenPG));
+
+    OptixProgramGroupDesc photonMissDesc{};
+    photonMissDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    photonMissDesc.miss.module = module;
+    photonMissDesc.miss.entryFunctionName = "__miss__photon";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &photonMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonMissPG));
+
+    OptixProgramGroupDesc photonHitTriDesc{};
+    photonHitTriDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    photonHitTriDesc.hitgroup.moduleCH = module;
+    photonHitTriDesc.hitgroup.entryFunctionNameCH = "__closesthit__photon";
+    OPTIX_CHECK_LOG(
+        optixProgramGroupCreate(context, &photonHitTriDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonHitTrianglePG));
+
+    OptixProgramGroupDesc photonHitSphereDesc{};
+    photonHitSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    photonHitSphereDesc.hitgroup.moduleCH = module;
+    photonHitSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__photon";
+    photonHitSphereDesc.hitgroup.moduleIS = sphereModule;
+    OPTIX_CHECK_LOG(
+        optixProgramGroupCreate(context, &photonHitSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonHitSpherePG));
+
+    OptixProgramGroupDesc gatherHitDesc{};
+    gatherHitDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    gatherHitDesc.hitgroup.moduleAH = module;
+    gatherHitDesc.hitgroup.entryFunctionNameAH = "__anyhit__gather";
+    gatherHitDesc.hitgroup.moduleIS = sphereModule; // photons are spheres of radius photonGatherRadius
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &gatherHitDesc, 1, &pgOptions, LOG, &LOG_SIZE, &gatherHitPG));
+
+    OptixProgramGroupDesc gatherMissDesc{};
+    gatherMissDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    gatherMissDesc.miss.module = module;
+    gatherMissDesc.miss.entryFunctionName = "__miss__gather";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &gatherMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &gatherMissPG));
   }
 
   void buildPipeline() {
-    OptixProgramGroup groups[] = {raygenPG,      missRadiancePG, missOcclusionPG,
-                                   hitTrianglePG, hitSpherePG,    hitVoxelPG, hitSdfPG};
+    OptixProgramGroup groups[] = {raygenPG,       missRadiancePG,     missOcclusionPG,   hitTrianglePG,
+                                   hitSpherePG,    hitVoxelPG,         hitSdfPG,          photonRaygenPG,
+                                   photonMissPG,   photonHitTrianglePG, photonHitSpherePG, gatherHitPG,
+                                   gatherMissPG};
     OptixPipelineLinkOptions linkOptions{};
-    const uint32_t maxTraceDepth = 2; // raygen -> radiance hit -> occlusion shadow ray
+    // raygen -> radiance hit -> occlusion shadow ray (2), or raygen ->
+    // radiance hit -> gather query (2), or photon-raygen -> photon-hit (1,
+    // no nested trace) — 2 covers every path in this pipeline.
+    const uint32_t maxTraceDepth = 2;
     linkOptions.maxTraceDepth = maxTraceDepth;
     OPTIX_CHECK_LOG(optixPipelineCreate(context, &pipelineCompileOptions, &linkOptions, groups,
                                          sizeof(groups) / sizeof(groups[0]), LOG, &LOG_SIZE, &pipeline));
@@ -618,10 +730,19 @@ struct OptixRenderer::Impl {
     glassMat.materialType = MATERIAL_GLASS;
     glassMat.albedo = make_float3(1.0f, 1.0f, 1.0f);
     glassMat.ior = 1.5f;
-    objects.push_back(buildSphereObject(make_float3(1.4f, -0.4f, -0.6f), 0.6f, glassMat));
+    // Floating above the plane (not resting on it) on purpose: refracted
+    // rays need room to converge before hitting a receiving surface, or the
+    // caustic never has a chance to focus — standard practice for a
+    // glass-caustic demo scene, not a physical-plausibility slip.
+    objects.push_back(buildSphereObject(make_float3(1.4f, 0.5f, -0.6f), 0.6f, glassMat));
 
     boundsCenter = glm::vec3(0.0f, 0.2f, 0.0f);
     boundsRadius = 3.0f;
+
+    // Caustics only make sense here: this is the only scene with specular
+    // (mirror/glass) objects to seed one from. Requires the quad light
+    // (addLightQuad already skipped it if hasEnvironment is set).
+    enablePhotonMapping = !hasEnvironment;
   }
 
   // Key light sized/positioned relative to a bounding sphere so it's sensible
@@ -718,6 +839,153 @@ struct OptixRenderer::Impl {
       buildFixedTestScene();
 
     buildIAS();
+
+    if (enablePhotonMapping) {
+      buildPhotonSbt();
+      photonRadius = boundsRadius * 0.05f;
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonBuffer), sizeof(Photon) * kPhotonCapacity));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonCounterBuffer), sizeof(unsigned int)));
+    }
+  }
+
+  // A second SBT sharing this same pipeline, used only for the photon-
+  // emission launch. optixLaunch's SBT argument is what resolves every
+  // trace call's hit-group/miss index for programs invoked *by* that
+  // launch (raygen and anything reached from it) — so __raygen__photon's
+  // own optixTrace(params.handle, ..., sbtOffset=<object index>, ...) calls
+  // resolve against *this* table, reaching __closesthit__photon for the
+  // same objects that radianceSbt resolves to __closesthit__radiance.
+  // That's the whole reason this needs to be a separate table rather than
+  // extending radianceSbt (like the gather hit-group is): the emission
+  // raygen hits the *same* scene instances as the camera raygen, and
+  // instance.sbtOffset is baked into the IAS at object-index granularity,
+  // not ray-type granularity — a second SBT sidesteps needing to introduce
+  // ray-type-multiplexed indexing (sbtOffset*RAY_TYPE_COUNT+rayType) into
+  // the already-verified radiance/occlusion indexing at all.
+  void buildPhotonSbt() {
+    RayGenRecord rgRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(photonRaygenPG, &rgRecord));
+    CUdeviceptr d_rg;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
+
+    MissRecord missRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(photonMissPG, &missRecord));
+    CUdeviceptr d_miss;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_miss), &missRecord, sizeof(missRecord), cudaMemcpyHostToDevice));
+
+    std::vector<HitGroupRecord> hitRecords(objects.size());
+    for (size_t i = 0; i < objects.size(); ++i) {
+      // Fixed test scene only ever has triangle/sphere objects (see
+      // enablePhotonMapping) — no voxel/sdf case to handle here.
+      OptixProgramGroup pg = objects[i].kind == GeometryKind::Sphere ? photonHitSpherePG : photonHitTrianglePG;
+      OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
+      hitRecords[i].data = objects[i].material;
+    }
+    CUdeviceptr d_hit;
+    const size_t hitBytes = hitRecords.size() * sizeof(HitGroupRecord);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_hit), hitBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_hit), hitRecords.data(), hitBytes, cudaMemcpyHostToDevice));
+
+    photonSbt.raygenRecord = d_rg;
+    photonSbt.missRecordBase = d_miss;
+    photonSbt.missRecordStrideInBytes = sizeof(MissRecord);
+    photonSbt.missRecordCount = 1;
+    photonSbt.hitgroupRecordBase = d_hit;
+    photonSbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
+    photonSbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
+  }
+
+  // Emits one pass of photons (the caller must already have uploaded a
+  // Params with photons/photonCounter/photonCapacity/photonBatchSize/light/
+  // handle set, for the emission launch itself to read), then rebuilds the
+  // photon BVH (a GAS of uniform-radius spheres, one per deposited photon).
+  // Returns the radius baked into that GAS — the caller needs this exact
+  // value for the *next* Params upload (params.photonGatherRadius), since
+  // photonRadius itself is shrunk here in preparation for next pass and no
+  // longer matches what was just built. Called once per render() call — see
+  // that function for why camera movement doesn't reset any of this (the
+  // photon map is view-independent).
+  float tracePhotonPass() {
+    const float radiusThisPass = photonRadius;
+    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(photonCounterBuffer), 0, sizeof(unsigned int), stream));
+    OPTIX_CHECK(optixLaunch(pipeline, stream, paramsBuffer, sizeof(Params), &photonSbt, kPhotonBatchSize, 1, 1));
+
+    unsigned int deposited = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&deposited, reinterpret_cast<void *>(photonCounterBuffer), sizeof(unsigned int),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    deposited = std::min(deposited, kPhotonCapacity);
+    if (photonPassIndex < 3 || photonPassIndex % 64 == 0)
+      std::fprintf(stderr, "italy: photon pass %u: %u caustic photons deposited (radius %.4f)\n", photonPassIndex,
+                   deposited, radiusThisPass);
+
+    if (deposited > 0) {
+      if (photonGasBuffer) {
+        cudaFree(reinterpret_cast<void *>(photonGasBuffer));
+        photonGasBuffer = 0;
+      }
+      if (photonGasVertexBuffer) {
+        cudaFree(reinterpret_cast<void *>(photonGasVertexBuffer));
+        photonGasVertexBuffer = 0;
+      }
+      if (photonGasRadiusBuffer) {
+        cudaFree(reinterpret_cast<void *>(photonGasRadiusBuffer));
+        photonGasRadiusBuffer = 0;
+      }
+
+      // The sphere build input wants a plain position buffer, but Photon
+      // interleaves position/direction/power — extract just the positions
+      // rather than fighting a non-float3 stride through the sphere API.
+      std::vector<Photon> photonsHost(deposited);
+      CUDA_CHECK(cudaMemcpy(photonsHost.data(), reinterpret_cast<void *>(photonBuffer), deposited * sizeof(Photon),
+                             cudaMemcpyDeviceToHost));
+      std::vector<float3> positions(deposited);
+      for (unsigned int i = 0; i < deposited; ++i)
+        positions[i] = photonsHost[i].position;
+
+      CUDA_CHECK(
+          cudaMalloc(reinterpret_cast<void **>(&photonGasVertexBuffer), deposited * sizeof(float3)));
+      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(photonGasVertexBuffer), positions.data(),
+                             deposited * sizeof(float3), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonGasRadiusBuffer), sizeof(float)));
+      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(photonGasRadiusBuffer), &radiusThisPass, sizeof(float),
+                             cudaMemcpyHostToDevice));
+
+      OptixBuildInput input{};
+      input.type = OPTIX_BUILD_INPUT_TYPE_SPHERES;
+      input.sphereArray.vertexBuffers = &photonGasVertexBuffer;
+      input.sphereArray.numVertices = deposited;
+      input.sphereArray.radiusBuffers = &photonGasRadiusBuffer;
+      input.sphereArray.singleRadius = 1;
+      static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+      input.sphereArray.flags = flags;
+      input.sphereArray.numSbtRecords = 1;
+
+      OptixAccelBuildOptions accelOptions{};
+      accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
+      accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+      OptixAccelBufferSizes sizes{};
+      OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
+      CUdeviceptr tempBuffer;
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonGasBuffer), sizes.outputSizeInBytes));
+      OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
+                                   photonGasBuffer, sizes.outputSizeInBytes, &photonGasHandle, nullptr, 0));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      cudaFree(reinterpret_cast<void *>(tempBuffer));
+    } else {
+      photonGasHandle = 0; // no caustic photons yet this run — gather becomes a no-op (see photonHandle==0 check)
+    }
+
+    totalPhotonsEmitted += kPhotonBatchSize;
+    // Original (non-stochastic-per-point) PPM radius decay, Hachisuka/Ogaki/
+    // Jensen 2008: R shrinks roughly as 1/sqrt(pass index), guaranteeing the
+    // density-estimate bias vanishes as passes -> infinity.
+    photonRadius *= std::sqrt((photonPassIndex + kPpmAlpha) / (photonPassIndex + 1.0f));
+    ++photonPassIndex;
+    return radiusThisPass;
   }
 
   void buildIAS() {
@@ -769,16 +1037,26 @@ struct OptixRenderer::Impl {
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
 
-    MissRecord missRecords[2]{};
+    // Miss index 2 (__miss__gather) backs the photon gather query issued
+    // from inside __closesthit__radiance — see Params::photonHandle. It's
+    // appended unconditionally (harmless/unused when there's no photon map)
+    // rather than only when enablePhotonMapping, since the alternative is a
+    // second SBT-layout variant to keep straight.
+    MissRecord missRecords[3]{};
     OPTIX_CHECK(optixSbtRecordPackHeader(missRadiancePG, &missRecords[0]));
     missRecords[0].data.bgColor = make_float3(0.05f, 0.06f, 0.08f);
     OPTIX_CHECK(optixSbtRecordPackHeader(missOcclusionPG, &missRecords[1]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(gatherMissPG, &missRecords[2]));
     CUdeviceptr d_miss;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecords)));
     CUDA_CHECK(
         cudaMemcpy(reinterpret_cast<void *>(d_miss), missRecords, sizeof(missRecords), cudaMemcpyHostToDevice));
 
-    std::vector<HitGroupRecord> hitRecords(objects.size());
+    // One extra record past the per-object ones, for the gather hit-group —
+    // see Params::gatherHitSbtOffset for why it has to live at a
+    // scene-object-count-dependent index rather than a fixed one.
+    gatherHitSbtOffset = static_cast<unsigned int>(objects.size());
+    std::vector<HitGroupRecord> hitRecords(objects.size() + 1);
     for (size_t i = 0; i < objects.size(); ++i) {
       OptixProgramGroup pg;
       switch (objects[i].kind) {
@@ -798,6 +1076,7 @@ struct OptixRenderer::Impl {
       OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
       hitRecords[i].data = objects[i].material;
     }
+    OPTIX_CHECK(optixSbtRecordPackHeader(gatherHitPG, &hitRecords[gatherHitSbtOffset]));
     CUdeviceptr d_hit;
     const size_t hitBytes = hitRecords.size() * sizeof(HitGroupRecord);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_hit), hitBytes));
@@ -806,7 +1085,7 @@ struct OptixRenderer::Impl {
     sbt.raygenRecord = d_rg;
     sbt.missRecordBase = d_miss;
     sbt.missRecordStrideInBytes = sizeof(MissRecord);
-    sbt.missRecordCount = 2;
+    sbt.missRecordCount = 3;
     sbt.hitgroupRecordBase = d_hit;
     sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
     sbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
@@ -883,6 +1162,25 @@ void OptixRenderer::render(const OrbitCamera &camera) {
     params.envConditionalCdf = reinterpret_cast<float *>(impl_->envConditionalCdfBuffer);
     params.envWidth = impl_->envWidth;
     params.envHeight = impl_->envHeight;
+  }
+  params.gatherHitSbtOffset = impl_->gatherHitSbtOffset;
+
+  // Caustics: run one photon-emission pass and rebuild the photon BVH
+  // *before* the main launch, so this frame's gather queries see it. Not
+  // gated on camera movement (unlike accumBuffer/subframeIndex) — the
+  // photon map doesn't depend on the camera at all, so it keeps
+  // progressively refining regardless of orbiting/panning.
+  if (impl_->enablePhotonMapping) {
+    params.photons = reinterpret_cast<Photon *>(impl_->photonBuffer);
+    params.photonCounter = reinterpret_cast<unsigned int *>(impl_->photonCounterBuffer);
+    params.photonCapacity = Impl::kPhotonCapacity;
+    params.photonBatchSize = Impl::kPhotonBatchSize;
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
+                               cudaMemcpyHostToDevice, impl_->stream));
+    const float radiusUsed = impl_->tracePhotonPass();
+    params.photonHandle = impl_->photonGasHandle;
+    params.photonGatherRadius = radiusUsed;
+    params.totalPhotonsEmitted = impl_->totalPhotonsEmitted;
   }
 
   CUDA_CHECK(cudaGraphicsMapResources(1, &impl_->cudaPbo, impl_->stream));

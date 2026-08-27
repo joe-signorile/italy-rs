@@ -40,6 +40,16 @@ struct QuadLight {
   float3 emission;
 };
 
+// A single deposited caustic photon (see phase-7 comment on Params below).
+// `direction` is the direction the photon was traveling when it hit the
+// diffuse surface (needed by the gather step's cosine term), not a
+// reflection/half-vector — matches how radiance's NEE branch uses `L`.
+struct Photon {
+  float3 position;
+  float3 direction;
+  float3 power;
+};
+
 struct Params {
   unsigned int subframeIndex;
   float4 *accumBuffer; // HDR accumulation, width*height, persists across subframes
@@ -69,6 +79,33 @@ struct Params {
   float *envConditionalCdf; // height*(width+1), row-major
   int envWidth;
   int envHeight;
+
+  // Caustics (phase 7): a global-radius progressive photon map — the
+  // original Hachisuka/Ogaki/Jensen 2008 PPM formulation (one shared radius,
+  // shrunk each pass via R_{i+1} = R_i * sqrt((i+alpha)/(i+1))), not the
+  // later per-visible-point Stochastic PPM (2009) refinement — see
+  // buildPhotonPipeline()'s comment in optix_renderer.cpp for why. Only
+  // built for the fixed bring-up scene (the only one with specular objects
+  // to seed a caustic from); photonHandle == 0 means "no photon map,
+  // gather is a no-op," so every other scene renders exactly as it did
+  // before this phase.
+  OptixTraversableHandle photonHandle;
+  Photon *photons;                // capacity photonCapacity; valid entries: min(*photonCounter, photonCapacity)
+  unsigned int *photonCounter;    // atomic append index, host resets to 0 before each photon-emission launch
+  unsigned int photonCapacity;
+  unsigned int photonBatchSize;   // photons emitted per pass — the photon raygen's launch width
+  float photonGatherRadius;
+  unsigned int totalPhotonsEmitted;
+  // The gather trace targets photonHandle directly (a bare GAS, no IAS/
+  // instance wrapping — there's only one build input, photons-as-spheres),
+  // so its SBT hit-group index is *only* the SBTOffset argument passed to
+  // that optixTrace call (no instance.sbtOffset to add, unlike every other
+  // trace call in this file which goes through params.handle's per-object
+  // instances). That argument therefore has to skip past the scene's own
+  // per-object hit-group records — hardcoding a literal here would silently
+  // collide with whichever scene object happens to land on that index, so
+  // the host computes and passes the right value (objects.size()) instead.
+  unsigned int gatherHitSbtOffset;
 };
 
 struct RayGenData {};
