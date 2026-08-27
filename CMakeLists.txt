@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(italy LANGUAGES CXX)
+project(italy-rs LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -113,8 +113,9 @@ configure_file(
   @ONLY
 )
 
-add_executable(italy
+add_executable(italy-rs
   src/app/main.cpp
+  src/app/app_window.cpp
   src/core/orbit_camera.cpp
   src/render/optix_renderer.cpp
   src/io/gltf_loader.cpp
@@ -122,9 +123,9 @@ add_executable(italy
   src/convert/sdf_baker.cpp
   src/render/environment.cpp
 )
-add_dependencies(italy italy_optixir_pathtracer italy_optixir_sdf_bake)
-target_include_directories(italy PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
-target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
+add_dependencies(italy-rs italy_optixir_pathtracer italy_optixir_sdf_bake)
+target_include_directories(italy-rs PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
+target_link_libraries(italy-rs PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
 
 enable_testing()
 add_executable(voxelize_test tests/voxelize_test.cpp src/convert/voxelize.cpp)

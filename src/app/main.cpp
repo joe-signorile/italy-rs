@@ -14,12 +14,11 @@
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
-#include <imgui_impl_glfw.h>
-#include <imgui_impl_opengl3.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include "app/app_window.h"
 #include "convert/sdf_baker.h"
 #include "convert/voxelize.h"
 #include "core/orbit_camera.h"
@@ -225,27 +224,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-  GLFWwindow *window = glfwCreateWindow(1280, 800, "italy", nullptr, nullptr);
-  if (!window) {
-    std::fprintf(stderr, "glfwCreateWindow failed\n");
-    glfwTerminate();
-    return 1;
-  }
-  glfwMakeContextCurrent(window);
-  glfwSwapInterval(1);
-
   IMGUI_CHECKVERSION();
-  ImGui::CreateContext();
-  ImGui::StyleColorsDark();
-  ImGui_ImplGlfw_InitForOpenGL(window, true);
-  ImGui_ImplOpenGL3_Init("#version 410");
 
   italy::OrbitCamera camera;
+  italy::OrbitCamera prevCamera = camera;
   MouseState mouse;
+  std::unique_ptr<italy::OptixRenderer> renderer;
+  // Starts true so Viewport's draw callback below performs the initial
+  // CLI-seeded rebuildScene() itself, on its own GL context, the first time
+  // it runs — same mechanism the Apply button uses, just pre-armed.
+  bool applyRequested = true;
 
   // Testing hooks, same spirit as ITALY_DUMP_FRAME: these toggles are UI-only
   // otherwise, so scripted before/after verification needs a way in that
@@ -262,130 +250,146 @@ int main(int argc, char **argv) {
     else std::fprintf(stderr, "italy: unknown ITALY_TONEMAP '%s'\n", v.c_str());
   }
 
-  std::unique_ptr<italy::OptixRenderer> renderer;
-  rebuildScene(state, renderer, camera);
-  italy::OrbitCamera prevCamera = camera;
+  std::vector<std::unique_ptr<italy::AppWindow>> windows;
 
-  while (!glfwWindowShouldClose(window)) {
+  // Viewport is built first, with shareContext=nullptr, making it the root
+  // of the shared GL object namespace: it's the window that owns/samples
+  // OptixRenderer's GL texture, so "context of record for the renderer" and
+  // "shared-group root" are deliberately the same window.
+  windows.push_back(std::make_unique<italy::AppWindow>(
+      "Viewport", 980, 580, nullptr, [&](italy::AppWindow &self) {
+        // Apply-button subtlety: rebuildScene() constructs a fresh
+        // OptixRenderer (owns the GL texture + CUDA-GL PBO interop), which
+        // must happen with Viewport's context current. The Apply button
+        // lives in Controls' draw callback (a different context), so it only
+        // raises applyRequested; this callback — already running under its
+        // own context, per AppWindow::frame() — does the actual rebuild.
+        if (applyRequested) {
+          rebuildScene(state, renderer, camera);
+          prevCamera = camera;
+          applyRequested = false;
+        }
+
+        double x, y;
+        glfwGetCursorPos(self.window(), &x, &y);
+        const float dx = static_cast<float>(x - mouse.lastX);
+        const float dy = static_cast<float>(y - mouse.lastY);
+        mouse.lastX = x;
+        mouse.lastY = y;
+
+        const ImGuiIO &io = ImGui::GetIO();
+        if (!io.WantCaptureMouse) {
+          const bool leftDown = glfwGetMouseButton(self.window(), GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+          const bool middleDown = glfwGetMouseButton(self.window(), GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+          if (leftDown) camera.orbit(dx, dy);
+          if (middleDown) camera.pan(dx, dy);
+          camera.zoom(io.MouseWheel);
+        }
+
+        if (cameraChanged(camera, prevCamera)) {
+          renderer->resetAccumulation();
+          prevCamera = camera;
+        }
+        renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure, state.denoise,
+                          state.tonemap);
+
+        const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
+        const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
+        if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= dumpThreshold) {
+          dumpFrameIfRequested(*renderer, self.window());
+          // dumpFrameIfRequested only closes Viewport; close every window so
+          // the scripted ITALY_DUMP_FRAME flow still exits the process, same
+          // external behavior as when there was only one OS window.
+          for (auto &w : windows)
+            glfwSetWindowShouldClose(w->window(), GLFW_TRUE);
+        }
+
+        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())),
+                     ImVec2(static_cast<float>(renderer->width()), static_cast<float>(renderer->height())),
+                     ImVec2(0, 1), ImVec2(1, 0));
+      }));
+
+  windows.push_back(std::make_unique<italy::AppWindow>(
+      "Italy R/S", 420, 800, windows.front()->window(), [&](italy::AppWindow &) {
+        ImGui::TextWrapped("%s", state.statusLine.c_str());
+        ImGui::Text("Lighting: %s", state.haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
+        ImGui::Separator();
+
+        ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
+
+        bool apply = ImGui::Button("Load / Apply");
+
+        if (state.haveMesh) {
+          ImGui::Text("Representation");
+          apply |= ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
+          ImGui::SameLine();
+          apply |= ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
+          ImGui::SameLine();
+          apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
+          if (state.representation != Representation::Mesh)
+            ImGui::SliderInt("Resolution", &state.resolution, 8, 256);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("HDRI");
+        apply |= ImGui::RadioButton("None", reinterpret_cast<int *>(&state.envChoice), 0);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Overcast", reinterpret_cast<int *>(&state.envChoice), 1);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Midnight", reinterpret_cast<int *>(&state.envChoice), 2);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Noon", reinterpret_cast<int *>(&state.envChoice), 3);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Custom", reinterpret_cast<int *>(&state.envChoice), 4);
+        if (state.envChoice == EnvChoice::Custom)
+          ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
+
+        // Note: RadioButton edits above already trigger `apply` on click,
+        // same as the button — representation/HDRI changes need a full scene
+        // rebuild either way, so there's no cheaper "preview" path to offer
+        // here. This callback runs under Controls' own ImGui/GL context, so
+        // it can't call rebuildScene() itself (see the Apply-button comment
+        // in Viewport's draw callback above) — it only raises the flag.
+        if (apply)
+          applyRequested = true;
+
+        ImGui::Separator();
+        ImGui::SliderFloat("Exposure", &state.exposure, 0.1f, 8.0f);
+        ImGui::SliderInt("Samples/launch", &state.samplesPerLaunch, 1, 16);
+        ImGui::Checkbox("Denoiser", &state.denoise);
+
+        ImGui::Text("Tonemap");
+        ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.tonemap), 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.tonemap), 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.tonemap), 2);
+        ImGui::SameLine();
+        ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.tonemap), 3);
+        ImGui::SameLine();
+        ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.tonemap), 4);
+
+        ImGui::Separator();
+        const glm::vec3 pos = camera.position();
+        ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
+        ImGui::Text("Subframe: %u", renderer->subframeIndex());
+        ImGui::Text("Drag left-click to orbit, middle-click to pan, scroll to zoom.");
+      }));
+
+  // App quits only once all windows are closed. Destroying the shared-context
+  // root window (Viewport) doesn't invalidate the GL object namespace for
+  // windows that shared with it (GL spec guarantee), so Controls stays fully
+  // functional — just inert, with nothing driving the renderer — if Viewport
+  // is closed first. Accepted v1 behavior: no "reopen a closed panel"
+  // mechanism exists yet.
+  while (!windows.empty()) {
     glfwPollEvents();
-
-    double x, y;
-    glfwGetCursorPos(window, &x, &y);
-    const float dx = static_cast<float>(x - mouse.lastX);
-    const float dy = static_cast<float>(y - mouse.lastY);
-    mouse.lastX = x;
-    mouse.lastY = y;
-
-    const ImGuiIO &io = ImGui::GetIO();
-    if (!io.WantCaptureMouse) {
-      const bool leftDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-      const bool middleDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
-      if (leftDown) camera.orbit(dx, dy);
-      if (middleDown) camera.pan(dx, dy);
-      camera.zoom(io.MouseWheel);
-    }
-
-    if (cameraChanged(camera, prevCamera)) {
-      renderer->resetAccumulation();
-      prevCamera = camera;
-    }
-    renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure, state.denoise,
-                      state.tonemap);
-
-    const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
-    const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
-    if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= dumpThreshold)
-      dumpFrameIfRequested(*renderer, window);
-
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    ImGui::NewFrame();
-
-    ImGui::Begin("italy");
-    ImGui::TextWrapped("%s", state.statusLine.c_str());
-    ImGui::Text("Lighting: %s", state.haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
-    ImGui::Separator();
-
-    ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
-
-    bool apply = ImGui::Button("Load / Apply");
-
-    if (state.haveMesh) {
-      ImGui::Text("Representation");
-      apply |= ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
-      ImGui::SameLine();
-      apply |= ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
-      ImGui::SameLine();
-      apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
-      if (state.representation != Representation::Mesh)
-        ImGui::SliderInt("Resolution", &state.resolution, 8, 256);
-    }
-
-    ImGui::Separator();
-    ImGui::Text("HDRI");
-    apply |= ImGui::RadioButton("None", reinterpret_cast<int *>(&state.envChoice), 0);
-    ImGui::SameLine();
-    apply |= ImGui::RadioButton("Overcast", reinterpret_cast<int *>(&state.envChoice), 1);
-    ImGui::SameLine();
-    apply |= ImGui::RadioButton("Midnight", reinterpret_cast<int *>(&state.envChoice), 2);
-    ImGui::SameLine();
-    apply |= ImGui::RadioButton("Noon", reinterpret_cast<int *>(&state.envChoice), 3);
-    ImGui::SameLine();
-    apply |= ImGui::RadioButton("Custom", reinterpret_cast<int *>(&state.envChoice), 4);
-    if (state.envChoice == EnvChoice::Custom)
-      ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
-
-    // Note: RadioButton edits above already trigger `apply` on click, same
-    // as the button — representation/HDRI changes need a full scene rebuild
-    // either way, so there's no cheaper "preview" path to offer here.
-    if (apply)
-      rebuildScene(state, renderer, camera);
-
-    ImGui::Separator();
-    ImGui::SliderFloat("Exposure", &state.exposure, 0.1f, 8.0f);
-    ImGui::SliderInt("Samples/launch", &state.samplesPerLaunch, 1, 16);
-    ImGui::Checkbox("Denoiser", &state.denoise);
-
-    ImGui::Text("Tonemap");
-    ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.tonemap), 0);
-    ImGui::SameLine();
-    ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.tonemap), 1);
-    ImGui::SameLine();
-    ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.tonemap), 2);
-    ImGui::SameLine();
-    ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.tonemap), 3);
-    ImGui::SameLine();
-    ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.tonemap), 4);
-
-    ImGui::Separator();
-    const glm::vec3 pos = camera.position();
-    ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
-    ImGui::Text("Subframe: %u", renderer->subframeIndex());
-    ImGui::Text("Drag left-click to orbit, middle-click to pan, scroll to zoom.");
-    ImGui::End();
-
-    ImGui::SetNextWindowSize(ImVec2(980, 580), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Viewport");
-    ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())),
-                 ImVec2(static_cast<float>(renderer->width()), static_cast<float>(renderer->height())), ImVec2(0, 1),
-                 ImVec2(1, 0));
-    ImGui::End();
-
-    ImGui::Render();
-    int displayW, displayH;
-    glfwGetFramebufferSize(window, &displayW, &displayH);
-    glViewport(0, 0, displayW, displayH);
-    glClearColor(0.08f, 0.08f, 0.1f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-    glfwSwapBuffers(window);
+    for (auto &w : windows)
+      if (!w->shouldClose())
+        w->frame();
+    std::erase_if(windows, [](const std::unique_ptr<italy::AppWindow> &w) { return w->shouldClose(); });
   }
 
-  ImGui_ImplOpenGL3_Shutdown();
-  ImGui_ImplGlfw_Shutdown();
-  ImGui::DestroyContext();
-  glfwDestroyWindow(window);
   glfwTerminate();
   return 0;
 }

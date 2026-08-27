@@ -1,9 +1,10 @@
 @/home/joe/projects/monkey-boy/CLAUDE.md.snippet
 
-# italy
+# italy-rs
 
-Native volumetric pathtracing editor/renderer. See `README.md` for setup and
-the full design plan referenced there for architecture and phased scope.
+Native volumetric pathtracing editor/renderer. See `humans.md` for
+prerequisites, build/run instructions, and phase status; it also links the
+full design plan for architecture and phased scope.
 
 Standalone project — not part of `s-rank`, no wiring into its dashboard,
 `agents.toon`, or GPU-mutex scripts. It happens to share this machine's one
