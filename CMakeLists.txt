@@ -76,28 +76,35 @@ set(ITALY_CUDA_ARCH "89" CACHE STRING "Target GPU compute capability for the Opt
 # OptiX device programs are consumed at runtime by optixModuleCreate as
 # OptiX-IR text, not linked like normal objects — a direct nvcc invocation is
 # simpler than fighting CMake's native CUDA_ARCHITECTURES object pipeline for
-# this one file. The result is read from disk at startup (see
+# these files. The result is read from disk at startup (see
 # render_config.h.in) rather than embedded via bin2c: this is a dev tool with
 # a fixed, known build-tree layout, so that's a fine simplification for now.
-set(PATHTRACER_CU "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer.cu")
-set(PATHTRACER_OPTIXIR "${CMAKE_BINARY_DIR}/optix_programs/pathtracer.optixir")
-add_custom_command(
-  OUTPUT ${PATHTRACER_OPTIXIR}
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs"
-  COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
-          --optix-ir
-          -arch=sm_${ITALY_CUDA_ARCH}
-          -std=c++17
-          -I "${OPTIX_INCLUDE_DIR}"
-          -I "${OPTIX_ROOT}/SDK"
-          -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
-          -o ${PATHTRACER_OPTIXIR}
-          ${PATHTRACER_CU}
-  DEPENDS ${PATHTRACER_CU} "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer_params.h"
-  COMMENT "Compiling OptiX device program pathtracer.cu -> OptiX-IR"
-  VERBATIM
-)
-add_custom_target(italy_optixir DEPENDS ${PATHTRACER_OPTIXIR})
+function(italy_compile_optixir cu_file out_var)
+  get_filename_component(name ${cu_file} NAME_WE)
+  set(output "${CMAKE_BINARY_DIR}/optix_programs/${name}.optixir")
+  add_custom_command(
+    OUTPUT ${output}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs"
+    COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
+            --optix-ir
+            -arch=sm_${ITALY_CUDA_ARCH}
+            -std=c++17
+            -I "${OPTIX_INCLUDE_DIR}"
+            -I "${OPTIX_ROOT}/SDK"
+            -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            -o ${output}
+            ${cu_file}
+    DEPENDS ${cu_file} "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer_params.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/sdf_bake_params.h"
+    COMMENT "Compiling OptiX device program ${name}.cu -> OptiX-IR"
+    VERBATIM
+  )
+  add_custom_target(italy_optixir_${name} DEPENDS ${output})
+  set(${out_var} ${output} PARENT_SCOPE)
+endfunction()
+
+italy_compile_optixir("${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer.cu" PATHTRACER_OPTIXIR)
+italy_compile_optixir("${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/sdf_bake.cu" SDF_BAKE_OPTIXIR)
 
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/src/render/render_config.h.in
@@ -111,8 +118,9 @@ add_executable(italy
   src/render/optix_renderer.cpp
   src/io/gltf_loader.cpp
   src/convert/voxelize.cpp
+  src/convert/sdf_baker.cpp
 )
-add_dependencies(italy italy_optixir)
+add_dependencies(italy italy_optixir_pathtracer italy_optixir_sdf_bake)
 target_include_directories(italy PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
 target_link_libraries(italy PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
 

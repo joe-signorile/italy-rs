@@ -71,6 +71,19 @@ To voxelize that mesh instead of rendering it as textured triangles:
 `--voxel` is given with no `=N`). Voxel color is baked from the source
 texture/material at conversion time, not sampled live.
 
+To bake a signed distance field instead:
+
+```
+./build/italy path/to/asset.glb --sdf=56
+```
+
+`56` is cells along the longest axis, same convention as `--voxel`. If both
+flags are given, `--sdf` wins. The source mesh should be closed/watertight —
+sign is determined by ray-parity counting, which isn't reliable on an open
+mesh. See `src/convert/sdf_baker.h` for how baking works and its known
+approximation (no true closest-point query exists in OptiX, so distance is
+estimated via minimum hit distance over many random directions).
+
 ### Tests
 
 ```
@@ -148,5 +161,37 @@ blocky silhouette matching the smooth original), and a visual check on the
 272k-triangle textured device model (buttons/grille/seams still legible after
 voxelization, with correctly baked colors).
 
-Not yet done: SDF resampling, HDRI lighting, SPPM caustics, AgX tonemapping,
-UI controls, denoiser. See the plan doc for the full phase list.
+Phase 5 done: mesh -> dense signed distance field, baked by a second,
+self-contained OptiX pipeline (`src/convert/sdf_baker.cpp` + `sdf_bake.cu`)
+that reuses the mesh's own BVH: unsigned distance is the minimum hit
+distance over many independent random directions per cell (OptiX has no
+native closest-point query), sign is a ray-parity majority vote across
+several directions. Rendered as a single `MATERIAL_SDF` custom-AABB
+primitive (the whole grid's bbox) that `__intersection__sdf` sphere-traces
+through, sampling the field with manual trilinear interpolation; shading
+normal is the field's central-difference gradient.
+
+Getting a clean render took a real debugging pass — worth recording since
+the symptom was misleading. The first attempt showed structured diagonal
+banding on the small test asset and a fully black front/side on the
+device-bottom.glb asset. Three plausible-looking causes were tried and each
+had *no effect whatsoever* on the artifact: switching the distance estimator
+from a fixed Fibonacci-sphere direction set to per-cell-jittered to fully
+independent random directions; adding linear-interpolation refinement for
+sphere-tracing overshoot (this did fix a real bug in itself, tracked
+separately below); and switching sign determination from a single fixed ray
+to a 5-direction majority vote. The actual cause was shadow acne: sphere
+tracing only locates the surface to within an epsilon tolerance (unlike
+triangle/voxel geometry, which is exact), and the shared NEE/bounce-ray
+`1e-3f` origin offset wasn't reliably larger than that tolerance, so
+shadow/bounce rays were self-intersecting the surface they'd just come from.
+Nudging the shading point outward along its normal by a fraction of a voxel
+before tracing any secondary ray (`pathtracer.cu`'s `MATERIAL_SDF` branch)
+fixed both symptoms completely on both assets. The refinement fix found
+along the way was real too: the overshoot-correction formula was being
+applied even on ordinary (non-overshoot) termination, where it *extrapolated
+past* the current sample instead of using it — fixed by only interpolating
+when the sampled distance actually goes negative.
+
+Not yet done: HDRI lighting, SPPM caustics, AgX tonemapping, UI controls,
+denoiser. See the plan doc for the full phase list.

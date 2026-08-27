@@ -3,3 +3,4 @@
 #pragma once
 
 inline constexpr const char *kPathTracerOptixIRPath = "@PATHTRACER_OPTIXIR@";
+inline constexpr const char *kSdfBakeOptixIRPath = "@SDF_BAKE_OPTIXIR@";

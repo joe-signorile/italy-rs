@@ -12,6 +12,7 @@
 
 #include <optix.h>
 
+#include "device_onb.h"
 #include "pathtracer_params.h"
 
 #include <sutil/cuda/helpers.h>
@@ -21,28 +22,6 @@
 extern "C" {
 __constant__ Params params;
 }
-
-// ----------------------------------------------------------------------------
-// Orthonormal basis for cosine-hemisphere sampling around a shading normal.
-// ----------------------------------------------------------------------------
-struct Onb {
-  __forceinline__ __device__ Onb(const float3 &normal) {
-    m_normal = normal;
-    if (fabsf(m_normal.x) > fabsf(m_normal.z)) {
-      m_binormal = make_float3(-m_normal.y, m_normal.x, 0.0f);
-    } else {
-      m_binormal = make_float3(0.0f, -m_normal.z, m_normal.y);
-    }
-    m_binormal = normalize(m_binormal);
-    m_tangent = cross(m_binormal, m_normal);
-  }
-
-  __forceinline__ __device__ float3 toWorld(const float3 &p) const {
-    return p.x * m_tangent + p.y * m_binormal + p.z * m_normal;
-  }
-
-  float3 m_tangent, m_binormal, m_normal;
-};
 
 static __forceinline__ __device__ void cosineSampleHemisphere(float u1, float u2, float3 &p) {
   const float r = sqrtf(u1);
@@ -218,29 +197,22 @@ extern "C" __global__ void __miss__radiance() {
 
 extern "C" __global__ void __miss__occlusion() { optixSetPayload_0(0u); }
 
-// Custom-primitive intersection for a voxel: a plain ray/AABB slab test.
-// OptiX's custom-primitive build input only consumes the AABB array to build
-// the BVH — it doesn't hand the box back to us, so the intersection program
-// re-reads the same AABB buffer via the SBT record. Reports which face was
-// entered (0..5) as attribute_0 so the closest-hit program can derive a flat
-// shading normal without a second geometry query.
-extern "C" __global__ void __intersection__voxel() {
-  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
-  const OptixAabb box = rt->voxelAabbs[optixGetPrimitiveIndex()];
-  const float o[3] = {optixGetObjectRayOrigin().x, optixGetObjectRayOrigin().y, optixGetObjectRayOrigin().z};
-  const float d[3] = {optixGetObjectRayDirection().x, optixGetObjectRayDirection().y, optixGetObjectRayDirection().z};
-  const float lo[3] = {box.minX, box.minY, box.minZ};
-  const float hi[3] = {box.maxX, box.maxY, box.maxZ};
-
-  float t0 = optixGetRayTmin();
-  float t1 = optixGetRayTmax();
-  int enterAxis = -1;
-  bool enterUpper = false;
+// Shared ray/AABB slab test — used by both the voxel intersection program
+// (box IS the primitive) and the SDF one (box just bounds where to start/
+// stop sphere tracing). Returns false for no overlap; otherwise t0/t1 are
+// the entry/exit parametric distances (clamped to the ray's own tmin/tmax)
+// and enterAxis/enterUpper identify which face t0 landed on (-1 if the ray
+// origin already starts inside the box, since there's no "entered" face).
+static __forceinline__ __device__ bool slabTest(const float o[3], const float d[3], const float lo[3],
+                                                  const float hi[3], float &t0, float &t1, int &enterAxis,
+                                                  bool &enterUpper) {
+  enterAxis = -1;
+  enterUpper = false;
   for (int axis = 0; axis < 3; ++axis) {
     const float invD = 1.0f / d[axis];
     float tNear = (lo[axis] - o[axis]) * invD;
     float tFar = (hi[axis] - o[axis]) * invD;
-    bool upper = tNear > tFar; // ray travels in -axis direction, entering via the "hi" face
+    const bool upper = tNear > tFar; // ray travels in -axis direction, entering via the "hi" face
     if (upper) {
       const float tmp = tNear;
       tNear = tFar;
@@ -254,13 +226,131 @@ extern "C" __global__ void __intersection__voxel() {
     if (tFar < t1)
       t1 = tFar;
     if (t0 > t1)
-      return; // no overlap
+      return false;
   }
+  return true;
+}
+
+// Custom-primitive intersection for a voxel: a plain ray/AABB slab test.
+// OptiX's custom-primitive build input only consumes the AABB array to build
+// the BVH — it doesn't hand the box back to us, so the intersection program
+// re-reads the same AABB buffer via the SBT record. Reports which face was
+// entered (0..5) as attribute_0 so the closest-hit program can derive a flat
+// shading normal without a second geometry query.
+extern "C" __global__ void __intersection__voxel() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const OptixAabb box = rt->voxelAabbs[optixGetPrimitiveIndex()];
+  const float3 rayO = optixGetObjectRayOrigin();
+  const float3 rayD = optixGetObjectRayDirection();
+  const float o[3] = {rayO.x, rayO.y, rayO.z};
+  const float d[3] = {rayD.x, rayD.y, rayD.z};
+  const float lo[3] = {box.minX, box.minY, box.minZ};
+  const float hi[3] = {box.maxX, box.maxY, box.maxZ};
+
+  float t0 = optixGetRayTmin();
+  float t1 = optixGetRayTmax();
+  int enterAxis;
+  bool enterUpper;
+  if (!slabTest(o, d, lo, hi, t0, t1, enterAxis, enterUpper))
+    return;
   if (enterAxis < 0)
     return; // ray origin starts inside the box — treat as a miss (rare, camera never starts inside a voxel here)
 
   const unsigned int face = static_cast<unsigned int>(enterAxis) * 2 + (enterUpper ? 1u : 0u);
   optixReportIntersection(t0, 0, face);
+}
+
+// Trilinear sample of the dense SDF grid, clamping at the border rather than
+// wrapping or asserting — sphere tracing occasionally evaluates points just
+// outside the grid due to floating-point slop at the bbox boundary.
+static __forceinline__ __device__ float sampleSdf(const HitGroupData *rt, float3 p) {
+  const float3 local = (p - rt->sdfOrigin) / rt->sdfVoxelSize - make_float3(0.5f, 0.5f, 0.5f);
+  const int x0 = max(0, min(rt->sdfNx - 2, static_cast<int>(floorf(local.x))));
+  const int y0 = max(0, min(rt->sdfNy - 2, static_cast<int>(floorf(local.y))));
+  const int z0 = max(0, min(rt->sdfNz - 2, static_cast<int>(floorf(local.z))));
+  const float fx = fminf(fmaxf(local.x - x0, 0.0f), 1.0f);
+  const float fy = fminf(fmaxf(local.y - y0, 0.0f), 1.0f);
+  const float fz = fminf(fmaxf(local.z - z0, 0.0f), 1.0f);
+
+  auto at = [&](int x, int y, int z) { return rt->sdfDistances[(z * rt->sdfNy + y) * rt->sdfNx + x]; };
+  const float c00 = at(x0, y0, z0) * (1 - fx) + at(x0 + 1, y0, z0) * fx;
+  const float c10 = at(x0, y0 + 1, z0) * (1 - fx) + at(x0 + 1, y0 + 1, z0) * fx;
+  const float c01 = at(x0, y0, z0 + 1) * (1 - fx) + at(x0 + 1, y0, z0 + 1) * fx;
+  const float c11 = at(x0, y0 + 1, z0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1, z0 + 1) * fx;
+  const float c0 = c00 * (1 - fy) + c10 * fy;
+  const float c1 = c01 * (1 - fy) + c11 * fy;
+  return c0 * (1 - fz) + c1 * fz;
+}
+
+// Sphere-traces from the SDF grid's bbox entry point to its exit point,
+// reporting a hit wherever |distance| drops below a small epsilon. The
+// bounding box itself is the one custom primitive; there's no per-cell AABB
+// array like the voxel path since this is a single continuous field, not a
+// sparse set of occupied cells.
+extern "C" __global__ void __intersection__sdf() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const float3 boundsMax = rt->sdfOrigin + make_float3(rt->sdfNx, rt->sdfNy, rt->sdfNz) * rt->sdfVoxelSize;
+  const float3 rayO = optixGetObjectRayOrigin();
+  const float3 rayD = optixGetObjectRayDirection();
+  const float o[3] = {rayO.x, rayO.y, rayO.z};
+  const float d[3] = {rayD.x, rayD.y, rayD.z};
+  const float lo[3] = {rt->sdfOrigin.x, rt->sdfOrigin.y, rt->sdfOrigin.z};
+  const float hi[3] = {boundsMax.x, boundsMax.y, boundsMax.z};
+
+  float t0 = optixGetRayTmin();
+  float t1 = optixGetRayTmax();
+  int enterAxis;
+  bool enterUpper;
+  if (!slabTest(o, d, lo, hi, t0, t1, enterAxis, enterUpper))
+    return;
+
+  const float epsilon = rt->sdfVoxelSize * 0.1f;
+  const float minStep = rt->sdfVoxelSize * 0.05f;
+  float t = t0;
+  float prevT = t0;
+  float prevDist = sampleSdf(rt, rayO + t0 * rayD);
+  if (prevDist < epsilon) {
+    optixReportIntersection(t0, 0);
+    return;
+  }
+  t += fmaxf(prevDist, minStep);
+  for (int i = 1; i < 256 && t <= t1; ++i) {
+    const float dist = sampleSdf(rt, rayO + t * rayD);
+    if (dist < epsilon) {
+      // Normal termination (dist still slightly positive, just under
+      // epsilon) needs no correction — t is already a good estimate. Only
+      // a genuine overshoot (dist went negative — the distance estimate
+      // isn't a guaranteed-exact lower bound, see sdf_bake.cu) needs
+      // interpolating back toward the zero-crossing between the last two
+      // samples; applying that same interpolation formula unconditionally
+      // was the bug here — for dist still positive it *extrapolates past*
+      // the current sample instead of using it, which put shading points
+      // measurably off-surface and showed up as normal-gradient noise once
+      // sdfGradientNormal differentiated the field there.
+      float tHit = t;
+      if (dist < 0.0f) {
+        const float denom = prevDist - dist;
+        if (fabsf(denom) > 1e-6f)
+          tHit = prevT + (t - prevT) * (prevDist / denom);
+      }
+      optixReportIntersection(fmaxf(tHit, t0), 0);
+      return;
+    }
+    prevT = t;
+    prevDist = dist;
+    t += fmaxf(dist, minStep);
+  }
+}
+
+// Central-difference gradient of the (trilinearly sampled, so C0-continuous)
+// SDF at the hit point — a standard, cheap way to get a shading normal from
+// an implicit surface without an analytic derivative.
+static __forceinline__ __device__ float3 sdfGradientNormal(const HitGroupData *rt, float3 p) {
+  const float h = rt->sdfVoxelSize * 0.5f;
+  const float dx = sampleSdf(rt, p + make_float3(h, 0, 0)) - sampleSdf(rt, p - make_float3(h, 0, 0));
+  const float dy = sampleSdf(rt, p + make_float3(0, h, 0)) - sampleSdf(rt, p - make_float3(0, h, 0));
+  const float dz = sampleSdf(rt, p + make_float3(0, 0, h)) - sampleSdf(rt, p - make_float3(0, 0, h));
+  return normalize(make_float3(dx, dy, dz));
 }
 
 // -X,+X,-Y,+Y,-Z,+Z, indexed by __intersection__voxel's face attribute.
@@ -307,7 +397,7 @@ extern "C" __global__ void __closesthit__radiance() {
   HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
 
   const float3 rayDir = optixGetWorldRayDirection();
-  const float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
+  float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
 
   // GLB-mesh triangles carry their own per-vertex normals/UVs (better shading
   // than the flat face normal computeShadingNormal() gives the fixed
@@ -331,6 +421,18 @@ extern "C" __global__ void __closesthit__radiance() {
     const float3 faceN = voxelFaceNormal(optixGetAttribute_0());
     N = faceforward(faceN, -rayDir, faceN);
     albedo = rt->voxelColors[optixGetPrimitiveIndex()];
+  } else if (rt->materialType == MATERIAL_SDF) {
+    const float3 gradN = sdfGradientNormal(rt, P);
+    N = faceforward(gradN, -rayDir, gradN);
+    // albedo already defaulted to rt->albedo above — a single flat tint.
+    // Sphere tracing only locates the surface to within `epsilon` (see
+    // __intersection__sdf), unlike triangle/voxel geometry which is exact —
+    // the shared 1e-3f NEE/bounce-ray offset below isn't reliably larger
+    // than that uncertainty, so shadow/bounce rays were self-intersecting
+    // the SDF surface they just came from ("shadow acne": most of the
+    // surface reads as falsely self-occluded). Nudge the shading point
+    // outward along the normal by a safe margin before any ray leaves it.
+    P = P + N * (rt->sdfVoxelSize * 0.25f);
   } else {
     N = computeShadingNormal(rayDir);
   }
@@ -363,7 +465,7 @@ extern "C" __global__ void __closesthit__radiance() {
     }
     done = 1;
   } else if (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE ||
-             rt->materialType == MATERIAL_VOXEL) {
+             rt->materialType == MATERIAL_VOXEL || rt->materialType == MATERIAL_SDF) {
     // Next-event estimation toward the quad light.
     const QuadLight &light = params.light;
     const float z1 = sutil::rnd(seed);

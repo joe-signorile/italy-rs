@@ -16,6 +16,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include "convert/sdf_baker.h"
 #include "convert/voxelize.h"
 #include "core/orbit_camera.h"
 #include "io/gltf_loader.h"
@@ -85,18 +86,26 @@ int main(int argc, char **argv) {
   // that instead. Same "CLI flag, not UI yet" reasoning as GLB loading.
   italy::VoxelGrid voxelGrid;
   bool haveVoxels = false;
+  // Phase 5: `--sdf[=N]` bakes a signed distance field instead (mutually
+  // exclusive with --voxel; if both are given, --sdf wins — matches
+  // OptixRenderer::buildScene's own sdf-before-voxels-before-mesh priority).
+  italy::SdfGrid sdfGrid;
+  bool haveSdf = false;
   if (haveMesh) {
     for (int i = 2; i < argc; ++i) {
       const std::string arg = argv[i];
+      const size_t eq = arg.find('=');
+      const int resolution = eq != std::string::npos ? std::atoi(arg.c_str() + eq + 1) : 64;
       if (arg.rfind("--voxel", 0) == 0) {
-        int resolution = 64;
-        const size_t eq = arg.find('=');
-        if (eq != std::string::npos)
-          resolution = std::atoi(arg.c_str() + eq + 1);
         voxelGrid = italy::voxelizeMesh(meshAsset, resolution);
         haveVoxels = true;
         std::fprintf(stderr, "italy: voxelized at resolution %d -> %zu occupied cells\n", resolution,
                      voxelGrid.cells.size());
+      } else if (arg.rfind("--sdf", 0) == 0) {
+        sdfGrid = italy::bakeSdf(meshAsset, resolution);
+        haveSdf = true;
+        std::fprintf(stderr, "italy: baked SDF at resolution %d -> %dx%dx%d grid\n", resolution, sdfGrid.nx,
+                     sdfGrid.ny, sdfGrid.nz);
       }
     }
   }
@@ -132,7 +141,9 @@ int main(int argc, char **argv) {
   // (reallocating the accum buffer/PBO/texture) lands with the UI controls
   // phase.
   italy::SceneSource source;
-  if (haveVoxels)
+  if (haveSdf)
+    source.sdf = &sdfGrid;
+  else if (haveVoxels)
     source.voxels = &voxelGrid;
   else if (haveMesh)
     source.mesh = &meshAsset;
@@ -174,7 +185,9 @@ int main(int argc, char **argv) {
     ImGui::NewFrame();
 
     ImGui::Begin("italy");
-    if (haveVoxels)
+    if (haveSdf)
+      ImGui::Text("Loaded: %s -> SDF (%dx%dx%d grid)", argv[1], sdfGrid.nx, sdfGrid.ny, sdfGrid.nz);
+    else if (haveVoxels)
       ImGui::Text("Loaded: %s -> voxelized (%zu occupied cells)", argv[1], voxelGrid.cells.size());
     else if (haveMesh)
       ImGui::Text("Loaded: %s (%zu tris%s)", argv[1], meshAsset.positions.size() / 3,

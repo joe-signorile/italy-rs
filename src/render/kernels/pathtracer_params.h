@@ -19,6 +19,13 @@ enum MaterialType : unsigned int {
   // color, shading normal comes from which of the 6 box faces was entered
   // (see __intersection__voxel) — phase-4 voxel-resampled meshes.
   MATERIAL_VOXEL = 5,
+  // Diffuse BRDF, single custom-AABB primitive covering the whole SDF grid's
+  // bounding box; __intersection__sdf sphere-traces through a trilinearly
+  // sampled distance field, shading normal is the field's gradient — phase-5
+  // SDF-resampled meshes. Albedo is a single flat tint (the source mesh's
+  // baseColorFactor) — no per-surface-point color field is baked, unlike the
+  // voxel path; see sdf_baker.h for why.
+  MATERIAL_SDF = 6,
 };
 
 // A single rectangular area light — enough for phase 2's bring-up scene.
@@ -76,4 +83,14 @@ struct HitGroupData {
   // voxel's baked color.
   OptixAabb *voxelAabbs = nullptr;
   float3 *voxelColors = nullptr;
+
+  // Only used when materialType == MATERIAL_SDF: a dense flattened
+  // (z*ny+y)*nx+x grid of signed distances, sphere-traced/gradient-shaded by
+  // __intersection__sdf and __closesthit__radiance directly (no OptixAabb
+  // array needed — there's exactly one primitive, the grid's own bbox,
+  // computed from these fields).
+  float *sdfDistances = nullptr;
+  float3 sdfOrigin{};
+  float sdfVoxelSize = 1.0f;
+  int sdfNx = 0, sdfNy = 0, sdfNz = 0;
 };

@@ -51,7 +51,7 @@ void contextLogCallback(unsigned int level, const char *tag, const char *message
   std::fprintf(stderr, "[optix][%u][%s] %s\n", level, tag, message);
 }
 
-enum class GeometryKind { Triangle, Sphere, Voxel };
+enum class GeometryKind { Triangle, Sphere, Voxel, Sdf };
 
 // One static-geometry object in the scene: a GAS (built once) plus the
 // material record it contributes to the SBT. `kind` selects which hit-group
@@ -78,6 +78,7 @@ struct OptixRenderer::Impl {
   OptixProgramGroup hitTrianglePG = nullptr;
   OptixProgramGroup hitSpherePG = nullptr;
   OptixProgramGroup hitVoxelPG = nullptr;
+  OptixProgramGroup hitSdfPG = nullptr;
 
   OptixPipeline pipeline = nullptr;
 
@@ -113,6 +114,10 @@ struct OptixRenderer::Impl {
   CUdeviceptr voxelAabbBuffer = 0;
   CUdeviceptr voxelColorBuffer = 0;
 
+  // Device buffer backing a MATERIAL_SDF object's dense distance field —
+  // freed in destroy().
+  CUdeviceptr sdfDistanceBuffer = 0;
+
   ~Impl() { destroy(); }
 
   void destroy() {
@@ -128,6 +133,8 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(voxelAabbBuffer));
     if (voxelColorBuffer)
       cudaFree(reinterpret_cast<void *>(voxelColorBuffer));
+    if (sdfDistanceBuffer)
+      cudaFree(reinterpret_cast<void *>(sdfDistanceBuffer));
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
@@ -149,6 +156,8 @@ struct OptixRenderer::Impl {
       GLBufferFns::get().glDeleteBuffers(1, &pbo);
     if (pipeline)
       optixPipelineDestroy(pipeline);
+    if (hitSdfPG)
+      optixProgramGroupDestroy(hitSdfPG);
     if (hitVoxelPG)
       optixProgramGroupDestroy(hitVoxelPG);
     if (hitSpherePG)
@@ -248,11 +257,19 @@ struct OptixRenderer::Impl {
     hitVoxelDesc.hitgroup.moduleIS = module;
     hitVoxelDesc.hitgroup.entryFunctionNameIS = "__intersection__voxel";
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitVoxelDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitVoxelPG));
+
+    OptixProgramGroupDesc hitSdfDesc{};
+    hitSdfDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitSdfDesc.hitgroup.moduleCH = module;
+    hitSdfDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+    hitSdfDesc.hitgroup.moduleIS = module;
+    hitSdfDesc.hitgroup.entryFunctionNameIS = "__intersection__sdf";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitSdfDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitSdfPG));
   }
 
   void buildPipeline() {
     OptixProgramGroup groups[] = {raygenPG,      missRadiancePG, missOcclusionPG,
-                                   hitTrianglePG, hitSpherePG,    hitVoxelPG};
+                                   hitTrianglePG, hitSpherePG,    hitVoxelPG, hitSdfPG};
     OptixPipelineLinkOptions linkOptions{};
     const uint32_t maxTraceDepth = 2; // raygen -> radiance hit -> occlusion shadow ray
     linkOptions.maxTraceDepth = maxTraceDepth;
@@ -497,6 +514,56 @@ struct OptixRenderer::Impl {
     return obj;
   }
 
+  // Single custom primitive covering the whole SDF grid's bounding box —
+  // unlike voxels there's no sparse-cell array, just one continuous field
+  // that __intersection__sdf sphere-traces through.
+  SceneObject buildSdfObject(const SdfGrid &grid) {
+    SceneObject obj;
+    obj.kind = GeometryKind::Sdf;
+    obj.material.materialType = MATERIAL_SDF;
+    obj.material.albedo = toFloat3(grid.tintColor);
+    obj.material.sdfOrigin = toFloat3(grid.origin);
+    obj.material.sdfVoxelSize = grid.voxelSize;
+    obj.material.sdfNx = grid.nx;
+    obj.material.sdfNy = grid.ny;
+    obj.material.sdfNz = grid.nz;
+
+    const size_t bytes = grid.distances.size() * sizeof(float);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&sdfDistanceBuffer), bytes));
+    CUDA_CHECK(
+        cudaMemcpy(reinterpret_cast<void *>(sdfDistanceBuffer), grid.distances.data(), bytes, cudaMemcpyHostToDevice));
+    obj.material.sdfDistances = reinterpret_cast<float *>(sdfDistanceBuffer);
+
+    const glm::vec3 boundsMax = grid.boundsMax();
+    OptixAabb aabb{grid.origin.x, grid.origin.y, grid.origin.z, boundsMax.x, boundsMax.y, boundsMax.z};
+    CUdeviceptr aabbBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&aabbBuffer), sizeof(OptixAabb)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(aabbBuffer), &aabb, sizeof(OptixAabb), cudaMemcpyHostToDevice));
+
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    input.customPrimitiveArray.aabbBuffers = &aabbBuffer;
+    input.customPrimitiveArray.numPrimitives = 1;
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.customPrimitiveArray.flags = flags;
+    input.customPrimitiveArray.numSbtRecords = 1;
+
+    OptixAccelBuildOptions accelOptions{};
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+    OptixAccelBufferSizes sizes{};
+    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
+    CUdeviceptr tempBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
+    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
+                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    cudaFree(reinterpret_cast<void *>(aabbBuffer)); // only fed the build, not read at intersection time (unlike voxels)
+    return obj;
+  }
+
   void buildFixedTestScene() {
     HitGroupData groundMat{};
     groundMat.materialType = MATERIAL_DIFFUSE;
@@ -564,8 +631,18 @@ struct OptixRenderer::Impl {
     addBoundsKeyLight(boundsCenter, boundsRadius);
   }
 
+  void buildSdfScene(const SdfGrid &grid) {
+    objects.push_back(buildSdfObject(grid));
+    const glm::vec3 mx = grid.boundsMax();
+    boundsCenter = (grid.origin + mx) * 0.5f;
+    boundsRadius = std::max(glm::length(mx - grid.origin) * 0.5f, 1e-3f);
+    addBoundsKeyLight(boundsCenter, boundsRadius);
+  }
+
   void buildScene(const SceneSource &source) {
-    if (source.voxels)
+    if (source.sdf)
+      buildSdfScene(*source.sdf);
+    else if (source.voxels)
       buildVoxelScene(*source.voxels);
     else if (source.mesh)
       buildMeshScene(*source.mesh);
@@ -642,6 +719,9 @@ struct OptixRenderer::Impl {
         break;
       case GeometryKind::Voxel:
         pg = hitVoxelPG;
+        break;
+      case GeometryKind::Sdf:
+        pg = hitSdfPG;
         break;
       default:
         pg = hitTrianglePG;
