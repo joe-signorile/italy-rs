@@ -96,6 +96,7 @@ function(italy_compile_optixir cu_file out_var)
             ${cu_file}
     DEPENDS ${cu_file} "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer_params.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/sdf_bake_params.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/device_onb.h"
     COMMENT "Compiling OptiX device program ${name}.cu -> OptiX-IR"
     VERBATIM
   )
@@ -119,6 +120,7 @@ add_executable(italy
   src/io/gltf_loader.cpp
   src/convert/voxelize.cpp
   src/convert/sdf_baker.cpp
+  src/render/environment.cpp
 )
 add_dependencies(italy italy_optixir_pathtracer italy_optixir_sdf_bake)
 target_include_directories(italy PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)

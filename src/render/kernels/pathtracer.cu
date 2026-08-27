@@ -59,6 +59,85 @@ static __forceinline__ __device__ float schlickFresnel(float cosTheta, float ior
 }
 
 // ----------------------------------------------------------------------------
+// HDRI/environment lighting (phase 6): equirectangular image, importance
+// sampled via a piecewise-constant 2D distribution (PBRT-style: a marginal
+// CDF over rows, a conditional CDF over columns within the sampled row).
+// Direction<->(u,v) convention, used consistently by sampling, pdf
+// evaluation, and radiance lookup alike:
+//   theta = acos(dir.y) in [0,pi], v = theta/pi     (v=0 at +Y, v=1 at -Y)
+//   phi   = atan2(dir.z, dir.x) in [-pi,pi], u = (phi+pi)/(2pi)
+// Solid-angle pdf conversion: dOmega = sin(theta) dtheta dphi, and
+// dtheta = pi*dv, dphi = 2pi*du, so pdf_solidangle = pdf_uv / (2 pi^2 sinTheta).
+// ----------------------------------------------------------------------------
+
+// PBRT-style binary search: cdf has n+1 entries (cdf[0]=0, cdf[n]=1); returns
+// i in [0,n-1] such that cdf[i] <= u < cdf[i+1].
+static __forceinline__ __device__ int findInterval(const float *cdf, int n, float u) {
+  int first = 0, len = n;
+  while (len > 0) {
+    const int half = len >> 1;
+    const int middle = first + half;
+    if (cdf[middle + 1] <= u) {
+      first = middle + 1;
+      len -= half + 1;
+    } else {
+      len = half;
+    }
+  }
+  return min(max(first, 0), n - 1);
+}
+
+static __forceinline__ __device__ float3 lookupEnvironmentRadiance(float3 dir) {
+  const float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
+  const float phi = atan2f(dir.z, dir.x);
+  const float u = (phi + M_PIf) / (2.0f * M_PIf);
+  const float v = theta / M_PIf;
+  const float4 texel = tex2D<float4>(params.envTex, u, v);
+  return make_float3(texel.x, texel.y, texel.z);
+}
+
+static __forceinline__ __device__ float evalEnvironmentPdf(float3 dir) {
+  const float theta = acosf(fminf(fmaxf(dir.y, -1.0f), 1.0f));
+  const float phi = atan2f(dir.z, dir.x);
+  const float u = (phi + M_PIf) / (2.0f * M_PIf);
+  const float v = theta / M_PIf;
+  const int h = params.envHeight, w = params.envWidth;
+  const int row = min(max(static_cast<int>(v * h), 0), h - 1);
+  const int col = min(max(static_cast<int>(u * w), 0), w - 1);
+  const float rowPdf = (params.envMarginalCdf[row + 1] - params.envMarginalCdf[row]) * h;
+  const float *rowCdf = params.envConditionalCdf + row * (w + 1);
+  const float colPdf = (rowCdf[col + 1] - rowCdf[col]) * w;
+  const float sinTheta = sinf(theta);
+  return sinTheta > 1e-6f ? (rowPdf * colPdf) / (2.0f * M_PIf * M_PIf * sinTheta) : 0.0f;
+}
+
+// Importance-samples a direction favoring bright regions of the environment;
+// pdfOut is in solid-angle measure, matching evalEnvironmentPdf's convention
+// (needed since the two are compared directly in the MIS weight).
+static __forceinline__ __device__ float3 sampleEnvironment(float u1, float u2, float &pdfOut) {
+  const int h = params.envHeight, w = params.envWidth;
+  const int row = findInterval(params.envMarginalCdf, h, u1);
+  const float rowCdfLo = params.envMarginalCdf[row], rowCdfHi = params.envMarginalCdf[row + 1];
+  const float rowPdf = (rowCdfHi - rowCdfLo) * h;
+  const float dv = rowCdfHi > rowCdfLo ? (u1 - rowCdfLo) / (rowCdfHi - rowCdfLo) : 0.5f;
+  const float v = (row + dv) / h;
+
+  const float *rowCdf = params.envConditionalCdf + row * (w + 1);
+  const int col = findInterval(rowCdf, w, u2);
+  const float colCdfLo = rowCdf[col], colCdfHi = rowCdf[col + 1];
+  const float colPdf = (colCdfHi - colCdfLo) * w;
+  const float du = colCdfHi > colCdfLo ? (u2 - colCdfLo) / (colCdfHi - colCdfLo) : 0.5f;
+  const float u = (col + du) / w;
+
+  const float theta = v * M_PIf;
+  const float phi = u * 2.0f * M_PIf - M_PIf;
+  const float sinTheta = sinf(theta);
+  pdfOut = sinTheta > 1e-6f ? (rowPdf * colPdf) / (2.0f * M_PIf * M_PIf * sinTheta) : 0.0f;
+
+  return make_float3(sinTheta * cosf(phi), cosf(theta), sinTheta * sinf(phi));
+}
+
+// ----------------------------------------------------------------------------
 // Payload: p0-2 attenuation, p3 seed, p4 depth, p5 prevBsdfPdf (bit-cast
 // float; negative means the previous bounce was a delta/specular BSDF, so a
 // direct light hit gets full weight rather than an MIS split), p6-8 emitted,
@@ -186,9 +265,24 @@ extern "C" __global__ void __raygen__rg() {
 
 extern "C" __global__ void __miss__radiance() {
   MissData *rt = reinterpret_cast<MissData *>(optixGetSbtDataPointer());
-  optixSetPayload_6(__float_as_uint(rt->bgColor.x));
-  optixSetPayload_7(__float_as_uint(rt->bgColor.y));
-  optixSetPayload_8(__float_as_uint(rt->bgColor.z));
+  float3 color;
+  float weight = 1.0f;
+  if (params.envTex) {
+    const float3 dir = normalize(optixGetWorldRayDirection());
+    color = lookupEnvironmentRadiance(dir);
+    // Same MIS treatment as MATERIAL_LIGHT: full weight for the primary ray
+    // or a specular predecessor (prevBsdfPdf < 0, NEE couldn't have sampled
+    // that exact direction), power-heuristic split otherwise since a
+    // diffuse bounce's NEE already sampled the environment directly too.
+    const float prevBsdfPdf = __uint_as_float(optixGetPayload_5());
+    if (prevBsdfPdf >= 0.0f)
+      weight = powerHeuristic(prevBsdfPdf, evalEnvironmentPdf(dir));
+  } else {
+    color = rt->bgColor;
+  }
+  optixSetPayload_6(__float_as_uint(color.x * weight));
+  optixSetPayload_7(__float_as_uint(color.y * weight));
+  optixSetPayload_8(__float_as_uint(color.z * weight));
   optixSetPayload_9(__float_as_uint(0.0f));
   optixSetPayload_10(__float_as_uint(0.0f));
   optixSetPayload_11(__float_as_uint(0.0f));
@@ -466,31 +560,48 @@ extern "C" __global__ void __closesthit__radiance() {
     done = 1;
   } else if (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE ||
              rt->materialType == MATERIAL_VOXEL || rt->materialType == MATERIAL_SDF) {
-    // Next-event estimation toward the quad light.
-    const QuadLight &light = params.light;
-    const float z1 = sutil::rnd(seed);
-    const float z2 = sutil::rnd(seed);
-    const float3 lightPos = light.corner + light.v1 * z1 + light.v2 * z2;
-    const float3 toLight = lightPos - P;
-    const float dist = length(toLight);
-    const float3 L = toLight / dist;
-    const float nDl = dot(N, L);
-    const float lnDl = -dot(light.normal, L);
-    if (nDl > 0.0f && lnDl > 0.0f) {
-      const bool occluded = traceOcclusion(params.handle, P, L, 1e-3f, dist - 2e-3f);
-      if (!occluded) {
-        const float area = length(cross(light.v1, light.v2));
-        const float pdfLight = (dist * dist) / (lnDl * area);
-        const float pdfBsdf = nDl / M_PIf;
-        const float weight = powerHeuristic(pdfLight, pdfBsdf);
-        // No albedo factor here: the raygen loop computes
-        // result += prd.radiance * prd.attenuation, and `attenuation` is
-        // updated to include *this* bounce's albedo a few lines below,
-        // before that payload is written out. Multiplying albedo in here
-        // too would double it — this bit us for the entire lifetime of
-        // phases 2-4 (every diffuse/textured/voxel NEE sample was too dark
-        // by an extra factor of albedo) until caught in review.
-        radiance = (light.emission / M_PIf) * nDl * weight / fmaxf(pdfLight, 1e-6f);
+    // Next-event estimation: toward the environment if one is loaded
+    // (params.envTex != 0), else toward the quad light — the two aren't
+    // combined, see Params::envTex's doc comment. Neither branch multiplies
+    // by albedo directly: the raygen loop computes
+    // result += prd.radiance * prd.attenuation, and `attenuation` is
+    // updated to include *this* bounce's albedo a few lines below, before
+    // that payload is written out. Multiplying albedo in here too would
+    // double it — this bit us for the entire lifetime of phases 2-4 (every
+    // diffuse/textured/voxel NEE sample was too dark by an extra factor of
+    // albedo) until caught in review.
+    if (params.envTex) {
+      float envPdf;
+      const float3 dir = sampleEnvironment(sutil::rnd(seed), sutil::rnd(seed), envPdf);
+      const float nDl = dot(N, dir);
+      if (nDl > 0.0f && envPdf > 0.0f) {
+        const bool occluded = traceOcclusion(params.handle, P, dir, 1e-3f, 1e16f);
+        if (!occluded) {
+          const float3 envRadiance = lookupEnvironmentRadiance(dir);
+          const float pdfBsdf = nDl / M_PIf;
+          const float weight = powerHeuristic(envPdf, pdfBsdf);
+          radiance = (envRadiance / M_PIf) * nDl * weight / fmaxf(envPdf, 1e-6f);
+        }
+      }
+    } else {
+      const QuadLight &light = params.light;
+      const float z1 = sutil::rnd(seed);
+      const float z2 = sutil::rnd(seed);
+      const float3 lightPos = light.corner + light.v1 * z1 + light.v2 * z2;
+      const float3 toLight = lightPos - P;
+      const float dist = length(toLight);
+      const float3 L = toLight / dist;
+      const float nDl = dot(N, L);
+      const float lnDl = -dot(light.normal, L);
+      if (nDl > 0.0f && lnDl > 0.0f) {
+        const bool occluded = traceOcclusion(params.handle, P, L, 1e-3f, dist - 2e-3f);
+        if (!occluded) {
+          const float area = length(cross(light.v1, light.v2));
+          const float pdfLight = (dist * dist) / (lnDl * area);
+          const float pdfBsdf = nDl / M_PIf;
+          const float weight = powerHeuristic(pdfLight, pdfBsdf);
+          radiance = (light.emission / M_PIf) * nDl * weight / fmaxf(pdfLight, 1e-6f);
+        }
       }
     }
 

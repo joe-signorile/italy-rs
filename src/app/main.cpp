@@ -20,6 +20,7 @@
 #include "convert/voxelize.h"
 #include "core/orbit_camera.h"
 #include "io/gltf_loader.h"
+#include "render/environment.h"
 #include "render/optix_renderer.h"
 
 namespace {
@@ -70,7 +71,7 @@ int main(int argc, char **argv) {
   // that lets ingestion be exercised/verified now.
   italy::MeshAsset meshAsset;
   bool haveMesh = false;
-  if (argc > 1) {
+  if (argc > 1 && std::string(argv[1]).rfind("--", 0) != 0) {
     std::string err;
     if (italy::loadGlb(argv[1], meshAsset, err)) {
       haveMesh = true;
@@ -106,6 +107,45 @@ int main(int argc, char **argv) {
         haveSdf = true;
         std::fprintf(stderr, "italy: baked SDF at resolution %d -> %dx%dx%d grid\n", resolution, sdfGrid.nx,
                      sdfGrid.ny, sdfGrid.nz);
+      }
+    }
+  }
+
+  // Phase 6: `--env=<overcast|midnight|noon>` selects a bundled HDRI preset;
+  // `--hdri=<path>` loads an arbitrary .hdr file. Applies regardless of
+  // which geometry mode is active (including the fixed test scene — a good
+  // way to see materials like glass/mirror against real environment
+  // lighting), so it's scanned independently of haveMesh.
+  italy::EnvironmentMap environment;
+  bool haveEnvironment = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    const size_t eq = arg.find('=');
+    if (eq == std::string::npos)
+      continue;
+    const std::string key = arg.substr(0, eq);
+    const std::string value = arg.substr(eq + 1);
+    std::string hdriPath;
+    if (key == "--env") {
+      if (value == "overcast")
+        hdriPath = "assets/hdri/overcast_day.hdr";
+      else if (value == "midnight")
+        hdriPath = "assets/hdri/midnight.hdr";
+      else if (value == "noon")
+        hdriPath = "assets/hdri/noon.hdr";
+      else
+        std::fprintf(stderr, "italy: unknown --env preset '%s' (try overcast, midnight, noon)\n", value.c_str());
+    } else if (key == "--hdri") {
+      hdriPath = value;
+    }
+    if (!hdriPath.empty()) {
+      std::string err;
+      if (italy::loadEnvironmentMap(hdriPath, environment, err)) {
+        haveEnvironment = true;
+        std::fprintf(stderr, "italy: loaded environment %s (%dx%d)\n", hdriPath.c_str(), environment.width,
+                     environment.height);
+      } else {
+        std::fprintf(stderr, "italy: failed to load environment %s: %s\n", hdriPath.c_str(), err.c_str());
       }
     }
   }
@@ -147,6 +187,8 @@ int main(int argc, char **argv) {
     source.voxels = &voxelGrid;
   else if (haveMesh)
     source.mesh = &meshAsset;
+  if (haveEnvironment)
+    source.environment = &environment;
   italy::OptixRenderer renderer(960, 540, source);
   if (haveMesh)
     camera.frame(renderer.sceneBoundsCenter(), renderer.sceneBoundsRadius());
@@ -194,6 +236,7 @@ int main(int argc, char **argv) {
                    meshAsset.hasBaseColorTexture ? ", textured" : "");
     else
       ImGui::Text("No GLB given on the command line — showing the built-in test scene.");
+    ImGui::Text("Lighting: %s", haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
     ImGui::Separator();
     const glm::vec3 pos = camera.position();
     ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);

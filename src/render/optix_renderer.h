@@ -15,16 +15,21 @@
 #include "convert/voxel_grid.h"
 #include "core/orbit_camera.h"
 #include "io/mesh_asset.h"
+#include "render/environment.h"
 
 namespace italy {
 
 // Exactly one of mesh/voxels/sdf should be set; none set means the fixed
 // bring-up scene. A tagged struct rather than overloaded constructors, since
 // a bare pointer overload set would be ambiguous for the nullptr default.
+// `environment` is orthogonal to the other three (a lighting choice, not a
+// geometry one) — when set, it replaces the synthetic quad light those
+// other three would otherwise get, for whichever geometry is active.
 struct SceneSource {
   const MeshAsset *mesh = nullptr;
   const VoxelGrid *voxels = nullptr;
   const SdfGrid *sdf = nullptr;
+  const EnvironmentMap *environment = nullptr;
 };
 
 class OptixRenderer {
@@ -33,9 +38,10 @@ public:
   // scene from phase 2. source.mesh set: renders that loaded GLB mesh (as
   // MATERIAL_TEXTURED_DIFFUSE triangles). source.voxels set: renders that
   // voxelized mesh (as MATERIAL_VOXEL custom AABB primitives). source.sdf
-  // set: sphere-traces the baked distance field (MATERIAL_SDF). Either way,
-  // a synthetic quad light sized to the bounding box substitutes for real
-  // scene lighting until HDRI support lands.
+  // set: sphere-traces the baked distance field (MATERIAL_SDF). Whichever of
+  // those three is picked, it's lit either by source.environment (HDRI,
+  // importance sampled) if given, or otherwise by a synthetic quad light
+  // sized to the bounding box.
   OptixRenderer(int width, int height, const SceneSource &source = {});
   ~OptixRenderer();
 

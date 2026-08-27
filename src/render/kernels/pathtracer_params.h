@@ -28,10 +28,11 @@ enum MaterialType : unsigned int {
   MATERIAL_SDF = 6,
 };
 
-// A single rectangular area light — enough for phase 2's bring-up scene.
-// Multiple/arbitrary lights are future work (see HDRI/environment lighting
-// phase, which supersedes single-light NEE with environment importance
-// sampling).
+// A single rectangular area light — the phase 2..5 default. Superseded by
+// environment/HDRI lighting when one is loaded (see Params::envTex below):
+// the two aren't blended together, envTex!=0 means "ignore `light`, this
+// scene has no quad light object at all." Multiple/arbitrary point/area
+// lights alongside an environment are future work.
 struct QuadLight {
   float3 corner;
   float3 v1, v2; // edge vectors from corner
@@ -51,6 +52,23 @@ struct Params {
 
   QuadLight light;
   OptixTraversableHandle handle;
+
+  // HDRI/environment lighting (phase 6). envTex == 0 means "no environment
+  // loaded" — miss shader falls back to MissData::bgColor and NEE falls back
+  // to the quad light above, so scenes built before this phase render
+  // identically to how they always did.
+  //
+  // No in-class initializers here (unlike HitGroupData below): Params is
+  // declared `__constant__` in pathtracer.cu, and nvcc rejects non-trivial
+  // default member initializers on `__constant__` variables ("dynamic
+  // initialization is not supported"). optix_renderer.cpp's `Params
+  // params{};` value-initialization zeroes these the same way it already
+  // does for every other field here.
+  cudaTextureObject_t envTex;
+  float *envMarginalCdf;    // height+1
+  float *envConditionalCdf; // height*(width+1), row-major
+  int envWidth;
+  int envHeight;
 };
 
 struct RayGenData {};

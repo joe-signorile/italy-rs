@@ -118,6 +118,17 @@ struct OptixRenderer::Impl {
   // freed in destroy().
   CUdeviceptr sdfDistanceBuffer = 0;
 
+  // Environment/HDRI lighting (phase 6) — freed in destroy(). hasEnvironment
+  // gates whether buildFixedTestScene/buildMeshScene/etc add a quad light at
+  // all (see addBoundsKeyLight): the two lighting modes aren't blended.
+  bool hasEnvironment = false;
+  cudaArray_t envArray = nullptr;
+  cudaTextureObject_t envTexObj = 0;
+  CUdeviceptr envMarginalCdfBuffer = 0;
+  CUdeviceptr envConditionalCdfBuffer = 0;
+  int envWidth = 0;
+  int envHeight = 0;
+
   ~Impl() { destroy(); }
 
   void destroy() {
@@ -135,6 +146,14 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(voxelColorBuffer));
     if (sdfDistanceBuffer)
       cudaFree(reinterpret_cast<void *>(sdfDistanceBuffer));
+    if (envTexObj)
+      cudaDestroyTextureObject(envTexObj);
+    if (envArray)
+      cudaFreeArray(envArray);
+    if (envMarginalCdfBuffer)
+      cudaFree(reinterpret_cast<void *>(envMarginalCdfBuffer));
+    if (envConditionalCdfBuffer)
+      cudaFree(reinterpret_cast<void *>(envConditionalCdfBuffer));
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
@@ -373,10 +392,13 @@ struct OptixRenderer::Impl {
 
   // Adds a rectangular emissive object at the given corner/edges, both as
   // real (camera-visible) geometry and as the analytic params.light used for
-  // NEE — shared by the fixed bring-up scene and the GLB-mesh scene, which
-  // both need *something* to light the object (no HDRI/environment lighting
-  // until phase 6).
+  // NEE — shared by the fixed bring-up scene and the GLB-mesh/voxel/sdf
+  // scenes, which all need *something* to light the object when there's no
+  // environment map active (the two lighting modes aren't blended: an
+  // environment supersedes the quad light entirely, see Params::envTex).
   void addLightQuad(float3 corner, float3 v1, float3 v2, float3 emission) {
+    if (hasEnvironment)
+      return;
     light.corner = corner;
     light.v1 = v1;
     light.v2 = v2;
@@ -639,7 +661,53 @@ struct OptixRenderer::Impl {
     addBoundsKeyLight(boundsCenter, boundsRadius);
   }
 
+  // Uploads the environment map's pixels (as a bilinear-filtered float
+  // texture — HDR data is already linear radiance, no sRGB conversion) and
+  // its importance-sampling CDFs as plain device buffers (manual binary
+  // search on the device, same "flat buffer, no texture-hardware tricks"
+  // choice as the SDF grid — simpler and plenty fast at these sizes).
+  void buildEnvironment(const EnvironmentMap &env) {
+    hasEnvironment = true;
+    envWidth = env.width;
+    envHeight = env.height;
+
+    std::vector<float4> rgba(static_cast<size_t>(env.width) * env.height);
+    for (size_t i = 0; i < rgba.size(); ++i)
+      rgba[i] = make_float4(env.pixels[i * 3 + 0], env.pixels[i * 3 + 1], env.pixels[i * 3 + 2], 1.0f);
+
+    const cudaChannelFormatDesc desc = cudaCreateChannelDesc<float4>();
+    CUDA_CHECK(cudaMallocArray(&envArray, &desc, env.width, env.height));
+    CUDA_CHECK(cudaMemcpy2DToArray(envArray, 0, 0, rgba.data(), env.width * sizeof(float4), env.width * sizeof(float4),
+                                    env.height, cudaMemcpyHostToDevice));
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = envArray;
+    cudaTextureDesc texDesc{};
+    texDesc.addressMode[0] = cudaAddressModeWrap;  // u: wraps around the horizon
+    texDesc.addressMode[1] = cudaAddressModeClamp; // v: clamp at the poles
+    texDesc.filterMode = cudaFilterModeLinear;
+    texDesc.readMode = cudaReadModeElementType; // already linear float radiance, no normalization/sRGB
+    texDesc.normalizedCoords = 1;
+    CUDA_CHECK(cudaCreateTextureObject(&envTexObj, &resDesc, &texDesc, nullptr));
+
+    const size_t marginalBytes = env.marginalCdf.size() * sizeof(float);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&envMarginalCdfBuffer), marginalBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(envMarginalCdfBuffer), env.marginalCdf.data(), marginalBytes,
+                           cudaMemcpyHostToDevice));
+
+    const size_t conditionalBytes = env.conditionalCdf.size() * sizeof(float);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&envConditionalCdfBuffer), conditionalBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(envConditionalCdfBuffer), env.conditionalCdf.data(),
+                           conditionalBytes, cudaMemcpyHostToDevice));
+  }
+
   void buildScene(const SceneSource &source) {
+    // Must happen before any of the geometry-building calls below: they
+    // consult hasEnvironment (via addLightQuad) to decide whether to add a
+    // synthetic quad light.
+    if (source.environment)
+      buildEnvironment(*source.environment);
+
     if (source.sdf)
       buildSdfScene(*source.sdf);
     else if (source.voxels)
@@ -809,6 +877,13 @@ void OptixRenderer::render(const OrbitCamera &camera) {
   params.W = toFloat3(forward);
   params.light = impl_->light;
   params.handle = impl_->iasHandle;
+  if (impl_->hasEnvironment) {
+    params.envTex = impl_->envTexObj;
+    params.envMarginalCdf = reinterpret_cast<float *>(impl_->envMarginalCdfBuffer);
+    params.envConditionalCdf = reinterpret_cast<float *>(impl_->envConditionalCdfBuffer);
+    params.envWidth = impl_->envWidth;
+    params.envHeight = impl_->envHeight;
+  }
 
   CUDA_CHECK(cudaGraphicsMapResources(1, &impl_->cudaPbo, impl_->stream));
   size_t mappedSize = 0;
