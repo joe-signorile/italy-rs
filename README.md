@@ -84,6 +84,25 @@ mesh. See `src/convert/sdf_baker.h` for how baking works and its known
 approximation (no true closest-point query exists in OptiX, so distance is
 estimated via minimum hit distance over many random directions).
 
+To light the scene with an HDRI instead of the built-in quad light (applies
+to any of the above, including the built-in test scene — a good way to see
+glass/mirror materials against real environment lighting):
+
+```
+./build/italy path/to/asset.glb --env=overcast   # or midnight, noon
+./build/italy path/to/asset.glb --hdri=path/to/custom.hdr
+```
+
+All of the above (GLB path, representation, HDRI preset) are also live
+ImGui controls once the window is open — the CLI flags just seed the same
+state and are mainly useful for scripted verification now. The window also
+has live sliders/toggles that don't need a rebuild: exposure,
+samples-per-launch, the OptiX AI denoiser, and the tonemap operator (AgX
+default; Reinhard/ACES/Hable/Clamp are debugging aids for comparison).
+
+Scripted testing hooks for the two toggles that are otherwise UI-only:
+`ITALY_FORCE_DENOISE=1` and `ITALY_TONEMAP=<agx|reinhard|aces|hable|clamp>`.
+
 ### Tests
 
 ```
@@ -193,5 +212,76 @@ applied even on ordinary (non-overshoot) termination, where it *extrapolated
 past* the current sample instead of using it — fixed by only interpolating
 when the sampled distance actually goes negative.
 
-Not yet done: HDRI lighting, SPPM caustics, AgX tonemapping, UI controls,
-denoiser. See the plan doc for the full phase list.
+Phase 6 done: HDRI/environment lighting (`src/render/environment.{h,cpp}`)
+— `.hdr` loading via `stb_image`, importance-sampled via a PBRT-style
+piecewise-constant 2D distribution (marginal CDF over rows, conditional CDF
+per row), wired into both the miss shader and NEE. An environment
+supersedes the quad light entirely when loaded, never blended with it.
+Three real CC0 Poly Haven HDRIs (1k res) bundled under `assets/hdri/` as
+the overcast/midnight/noon presets. Verified by rendering the fixed test
+scene's mirror/glass materials under all three and confirming physically
+distinct, plausible lighting — including a sharp sun disk correctly
+captured in the noon preset's mirror reflection (proof the importance
+sampling actually finds small bright features rather than losing them to
+noise) — plus a pixel-identical regression check with no environment.
+
+Phase 7 done: caustics via a global-radius progressive photon map (the
+original Hachisuka/Ogaki/Jensen 2008 PPM formulation — one shared radius
+shrunk each pass via `R_{i+1} = R_i * sqrt((i+alpha)/(i+1))`, not the later
+per-visible-point Stochastic PPM refinement; a deliberate scope reduction,
+see `pathtracer_params.h`). Photons are emitted from the quad light, bounce
+through specular surfaces, and deposit only once they've had at least one
+specular bounce (direct light is already handled by NEE — storing/gathering
+non-caustic photons would just double-count it). Gather is a "long ray
+through a sphere, any-hit accumulates" range query against an OptiX BVH
+built over the deposited photons each pass — reusing ray-tracing hardware
+for a non-primary-ray query, the same trick SDF baking uses. Verified: a
+clear, progressively-sharpening caustic focus spot under the glass sphere.
+
+Phase 9 done: live ImGui controls (GLB load, mesh/voxel/SDF representation
+with a resolution slider, HDRI preset, exposure, samples-per-launch)
+replacing the CLI-only workflow. CLI args now just seed the same
+`AppState` the UI edits; both funnel through one `rebuildScene()` so they
+can't drift apart. Representation/HDRI changes are one explicit "Apply"
+rebuild rather than incremental scene patching (`OptixRenderer` has no
+partial-rebuild API, and voxelizing/SDF-baking isn't cheap enough to redo
+per slider-tick anyway).
+
+Phase 10 done: the OptiX AI denoiser (color-only for now, no albedo/normal
+guide layers — a real quality upgrade left as a natural follow-up). The
+main launch writes the HDR accumulator only; a separate `optixDenoiserInvoke`
+call denoises it into its own buffer (denoising in place would corrupt the
+running progressive average used by future frames); a third raygen-only
+launch (`__raygen__tonemap`, its own minimal SBT — reuses the existing
+pipeline instead of a new CUDA compilation unit) reads the denoised result
+into the display buffer. Verified with a forced on/off comparison at 4
+samples/pixel: heavy noise without it, clean-but-still-detailed with it.
+
+Phase 8 done: selectable tonemap operator (AgX default; Reinhard/ACES/
+Hable/Clamp as alternates), replacing the bare `clamp(0,1)` + sRGB encode
+every render used through phase 7. AgX is the widely-circulated community
+GLSL approximation of Blender's AgX view transform (inset matrix -> log2
+remap -> 6th-order polynomial contrast fit -> outset matrix), the same
+approach Godot 4.3+/Bevy ship instead of pulling in OpenColorIO for one
+transform — reproduced from memory of that fit, not diffed against
+Blender's reference OCIO config byte-for-byte (no Blender install available
+here), so verification is behavioral rather than pixel-exact: rendered the
+fixed test scene under all 5 operators and confirmed AgX shows its
+well-known signature look (lifted shadows instead of crushed blacks,
+desaturated reds, soft highlight rolloff instead of hard clipping),
+distinct from the other four, which are also each visibly distinct from
+one another.
+
+Along the way, a full clean rebuild (after this repo's directory was
+renamed `italy` -> `italy-rs`) surfaced a real off-by-one in the voxelizer
+that incremental builds had apparently been masking with a stale test
+binary: a triangle vertex sitting exactly on the mesh's far bounding-box
+edge computed a cell index one past the last valid one, silently adding a
+phantom extra layer. Fixed by clamping cell indices to `[0, resolution-1]`;
+the test's own assertion threshold turned out to be separately wrong too
+(mathematically unsatisfiable for a correct shell at low resolution) and
+was replaced with a resolution-derived bound.
+
+All 10 planned MVP phases are now done. See the plan doc for the full
+phase list and out-of-scope items (Gaussian-splat resampling, full VCM/
+ReSTIR caustics, Metal backend — all explicitly deferred, not forgotten).
