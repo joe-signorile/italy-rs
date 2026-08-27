@@ -263,8 +263,26 @@ extern "C" __global__ void __raygen__rg() {
   // Exposure is applied only to the display output, not the stored
   // accumulator — so dragging the exposure slider doesn't need an
   // accumulation reset, it just changes how the same HDR average is
-  // displayed this frame.
-  params.frameBuffer[pixel] = sutil::make_color(accum * params.exposure);
+  // displayed this frame. Skipped entirely when the denoiser is active:
+  // optix_renderer.cpp denoises accumBuffer and runs __raygen__tonemap on
+  // the result instead, so writing a tonemap of the *noisy* accum here
+  // would just be wasted work, immediately overwritten.
+  if (!params.denoiserEnabled)
+    params.frameBuffer[pixel] = sutil::make_color(accum * params.exposure);
+}
+
+// Phase 10: reads the denoiser's output (already-converged-looking HDR)
+// instead of the raw progressive accumulator, and does nothing else — no
+// ray tracing, just the same tonemap step __raygen__rg applies inline when
+// the denoiser is off. A raygen program rather than a plain CUDA kernel so
+// it can reuse the pipeline/module/SBT-launch machinery already built for
+// everything else in this file instead of standing up a separate CUDA
+// compilation path for one trivial per-pixel op.
+extern "C" __global__ void __raygen__tonemap() {
+  const uint3 idx = optixGetLaunchIndex();
+  const unsigned int pixel = idx.y * params.width + idx.x;
+  const float3 color = make_float3(params.denoisedBuffer[pixel]);
+  params.frameBuffer[pixel] = sutil::make_color(color * params.exposure);
 }
 
 extern "C" __global__ void __miss__radiance() {

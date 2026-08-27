@@ -95,6 +95,7 @@ struct AppState {
 
   float exposure = 1.0f;
   int samplesPerLaunch = 1;
+  bool denoise = false;
 
   std::string statusLine = "Showing the built-in test scene.";
 };
@@ -245,6 +246,12 @@ int main(int argc, char **argv) {
   italy::OrbitCamera camera;
   MouseState mouse;
 
+  // Testing hook, same spirit as ITALY_DUMP_FRAME: the denoiser toggle is
+  // UI-only otherwise, so scripted before/after verification needs a way in
+  // that doesn't require actually clicking the checkbox.
+  if (std::getenv("ITALY_FORCE_DENOISE"))
+    state.denoise = true;
+
   std::unique_ptr<italy::OptixRenderer> renderer;
   rebuildScene(state, renderer, camera);
   italy::OrbitCamera prevCamera = camera;
@@ -272,9 +279,11 @@ int main(int argc, char **argv) {
       renderer->resetAccumulation();
       prevCamera = camera;
     }
-    renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure);
+    renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure, state.denoise);
 
-    if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= 128)
+    const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
+    const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
+    if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= dumpThreshold)
       dumpFrameIfRequested(*renderer, window);
 
     ImGui_ImplOpenGL3_NewFrame();
@@ -324,6 +333,7 @@ int main(int argc, char **argv) {
     ImGui::Separator();
     ImGui::SliderFloat("Exposure", &state.exposure, 0.1f, 8.0f);
     ImGui::SliderInt("Samples/launch", &state.samplesPerLaunch, 1, 16);
+    ImGui::Checkbox("Denoiser", &state.denoise);
 
     ImGui::Separator();
     const glm::vec3 pos = camera.position();

@@ -59,6 +59,14 @@ struct Params {
   unsigned int samplesPerLaunch;
   float exposure; // linear multiplier applied just before tonemapping (phase 9 UI control)
 
+  // Phase 10 denoiser: when nonzero, __raygen__rg skips its own
+  // frameBuffer write (the noisy tonemap would just be overwritten anyway)
+  // and optix_renderer.cpp instead denoises accumBuffer into denoisedBuffer,
+  // then runs __raygen__tonemap to read *that* into frameBuffer. denoisedBuffer
+  // is null and unused when denoiserEnabled is 0.
+  unsigned int denoiserEnabled;
+  float4 *denoisedBuffer;
+
   float3 eye, U, V, W; // camera basis, W points along view direction (not normalized: encodes FOV)
 
   QuadLight light;

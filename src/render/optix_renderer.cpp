@@ -94,6 +94,20 @@ struct OptixRenderer::Impl {
   OptixProgramGroup gatherHitPG = nullptr;
   OptixProgramGroup gatherMissPG = nullptr;
 
+  // Phase 10 denoiser: __raygen__tonemap is a third raygen-only launch (its
+  // own minimal SBT, no miss/hitgroup records — it never calls optixTrace)
+  // that reads the denoiser's output into the display buffer. Same "reuse
+  // the existing module/pipeline instead of a new CUDA compilation unit"
+  // reasoning as photon emission's second SBT.
+  OptixProgramGroup tonemapRaygenPG = nullptr;
+  OptixShaderBindingTable tonemapSbt{};
+  OptixDenoiser denoiser = nullptr;
+  CUdeviceptr denoiserStateBuffer = 0;
+  size_t denoiserStateSize = 0;
+  CUdeviceptr denoiserScratchBuffer = 0;
+  size_t denoiserScratchSize = 0;
+  CUdeviceptr denoisedBuffer = 0; // float4 * width*height
+
   OptixPipeline pipeline = nullptr;
 
   std::vector<SceneObject> objects;
@@ -205,6 +219,18 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(photonSbt.missRecordBase));
     if (photonSbt.hitgroupRecordBase)
       cudaFree(reinterpret_cast<void *>(photonSbt.hitgroupRecordBase));
+    if (tonemapSbt.raygenRecord)
+      cudaFree(reinterpret_cast<void *>(tonemapSbt.raygenRecord));
+    if (tonemapSbt.missRecordBase)
+      cudaFree(reinterpret_cast<void *>(tonemapSbt.missRecordBase));
+    if (denoisedBuffer)
+      cudaFree(reinterpret_cast<void *>(denoisedBuffer));
+    if (denoiserStateBuffer)
+      cudaFree(reinterpret_cast<void *>(denoiserStateBuffer));
+    if (denoiserScratchBuffer)
+      cudaFree(reinterpret_cast<void *>(denoiserScratchBuffer));
+    if (denoiser)
+      optixDenoiserDestroy(denoiser);
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
@@ -226,6 +252,8 @@ struct OptixRenderer::Impl {
       GLBufferFns::get().glDeleteBuffers(1, &pbo);
     if (pipeline)
       optixPipelineDestroy(pipeline);
+    if (tonemapRaygenPG)
+      optixProgramGroupDestroy(tonemapRaygenPG);
     if (gatherMissPG)
       optixProgramGroupDestroy(gatherMissPG);
     if (gatherHitPG)
@@ -391,13 +419,21 @@ struct OptixRenderer::Impl {
     gatherMissDesc.miss.module = module;
     gatherMissDesc.miss.entryFunctionName = "__miss__gather";
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &gatherMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &gatherMissPG));
+
+    // Phase 10 denoiser: raygen-only, never calls optixTrace.
+    OptixProgramGroupDesc tonemapRaygenDesc{};
+    tonemapRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    tonemapRaygenDesc.raygen.module = module;
+    tonemapRaygenDesc.raygen.entryFunctionName = "__raygen__tonemap";
+    OPTIX_CHECK_LOG(
+        optixProgramGroupCreate(context, &tonemapRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE, &tonemapRaygenPG));
   }
 
   void buildPipeline() {
-    OptixProgramGroup groups[] = {raygenPG,       missRadiancePG,     missOcclusionPG,   hitTrianglePG,
-                                   hitSpherePG,    hitVoxelPG,         hitSdfPG,          photonRaygenPG,
+    OptixProgramGroup groups[] = {raygenPG,       missRadiancePG,      missOcclusionPG,   hitTrianglePG,
+                                   hitSpherePG,    hitVoxelPG,          hitSdfPG,          photonRaygenPG,
                                    photonMissPG,   photonHitTrianglePG, photonHitSpherePG, gatherHitPG,
-                                   gatherMissPG};
+                                   gatherMissPG,   tonemapRaygenPG};
     OptixPipelineLinkOptions linkOptions{};
     // raygen -> radiance hit -> occlusion shadow ray (2), or raygen ->
     // radiance hit -> gather query (2), or photon-raygen -> photon-hit (1,
@@ -1091,6 +1127,64 @@ struct OptixRenderer::Impl {
     sbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
   }
 
+  // Phase 10: the OptiX AI denoiser, color-only (no albedo/normal guide
+  // buffers — a real quality improvement but it means threading first-hit
+  // G-buffers out of the path tracer too, a natural upgrade rather than
+  // required for "wire in the denoiser"). hdrIntensity is left null in
+  // OptixDenoiserParams at invoke time (see render()), which the API
+  // documents as "autoexposure will be calculated automatically" — good
+  // enough for MVP, skips needing a separate optixDenoiserComputeIntensity
+  // pass.
+  void buildDenoiser(int width, int height) {
+    OptixDenoiserOptions options{}; // guideAlbedo=0, guideNormal=0, denoiseAlpha=COPY(0)
+    OPTIX_CHECK(optixDenoiserCreate(context, OPTIX_DENOISER_MODEL_KIND_HDR, &options, &denoiser));
+
+    OptixDenoiserSizes sizes{};
+    OPTIX_CHECK(optixDenoiserComputeMemoryResources(denoiser, static_cast<unsigned int>(width),
+                                                     static_cast<unsigned int>(height), &sizes));
+    denoiserStateSize = sizes.stateSizeInBytes;
+    denoiserScratchSize = sizes.withoutOverlapScratchSizeInBytes;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoiserStateBuffer), denoiserStateSize));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoiserScratchBuffer), denoiserScratchSize));
+    OPTIX_CHECK(optixDenoiserSetup(denoiser, stream, static_cast<unsigned int>(width),
+                                    static_cast<unsigned int>(height), denoiserStateBuffer, denoiserStateSize,
+                                    denoiserScratchBuffer, denoiserScratchSize));
+
+    CUDA_CHECK(
+        cudaMalloc(reinterpret_cast<void **>(&denoisedBuffer), static_cast<size_t>(width) * height * sizeof(float4)));
+  }
+
+  // Third SBT, same reasoning as photonSbt: __raygen__tonemap runs under its
+  // own launch, and needs a raygen record packed for tonemapRaygenPG rather
+  // than whatever's in radianceSbt's raygen slot. No miss/hitgroup records
+  // at all (not just "unused, harmless" like photonSbt's radiance-table
+  // reuse pattern elsewhere) — this raygen never calls optixTrace, so there
+  // is nothing for those tables to ever be consulted for.
+  void buildTonemapSbt() {
+    RayGenRecord rgRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(tonemapRaygenPG, &rgRecord));
+    CUdeviceptr d_rg;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
+    tonemapSbt.raygenRecord = d_rg;
+
+    // OptiX validates that missRecordBase is non-null even though this
+    // raygen never calls optixTrace and so can never actually reach a miss
+    // program — "no miss table at all" (missRecordCount=0, base=nullptr, as
+    // photonSbt's hitgroup table gets away with) isn't accepted for miss
+    // specifically. gatherMissPG (an empty no-op, see __miss__gather) is a
+    // convenient already-existing dummy target that's equally never invoked
+    // here in practice.
+    MissRecord missRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(gatherMissPG, &missRecord));
+    CUdeviceptr d_miss;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_miss), &missRecord, sizeof(missRecord), cudaMemcpyHostToDevice));
+    tonemapSbt.missRecordBase = d_miss;
+    tonemapSbt.missRecordStrideInBytes = sizeof(MissRecord);
+    tonemapSbt.missRecordCount = 1;
+  }
+
   void initGLInterop(int width, int height) {
     const auto &gl = GLBufferFns::get();
     gl.glGenBuffers(1, &pbo);
@@ -1113,7 +1207,9 @@ OptixRenderer::OptixRenderer(int width, int height, const SceneSource &source)
   impl_->buildPipeline();
   impl_->buildScene(source);
   impl_->buildSbt();
+  impl_->buildTonemapSbt();
   impl_->initGLInterop(width, height);
+  impl_->buildDenoiser(width, height);
 
   sceneBoundsCenter_ = impl_->boundsCenter;
   sceneBoundsRadius_ = impl_->boundsRadius;
@@ -1134,7 +1230,7 @@ OptixRenderer::~OptixRenderer() {
 
 void OptixRenderer::resetAccumulation() { subframeIndex_ = 0; }
 
-void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLaunch, float exposure) {
+void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLaunch, float exposure, bool denoise) {
   const glm::vec3 eye = camera.position();
   const glm::vec3 target = camera.target();
   const glm::vec3 forward = glm::normalize(target - eye);
@@ -1189,11 +1285,48 @@ void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLau
   void *devicePtr = nullptr;
   CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&devicePtr, &mappedSize, impl_->cudaPbo));
   params.frameBuffer = reinterpret_cast<uchar4 *>(devicePtr);
+  params.denoiserEnabled = denoise ? 1u : 0u;
+  params.denoisedBuffer = reinterpret_cast<float4 *>(impl_->denoisedBuffer);
 
   CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
                              cudaMemcpyHostToDevice, impl_->stream));
   OPTIX_CHECK(optixLaunch(impl_->pipeline, impl_->stream, impl_->paramsBuffer, sizeof(Params), &impl_->sbt, width_,
                            height_, 1));
+
+  if (denoise) {
+    // Color-only denoising (no albedo/normal guide layers — see
+    // buildDenoiser()'s comment), hdrIntensity left null so the denoiser
+    // computes autoexposure internally rather than needing a separate
+    // optixDenoiserComputeIntensity pass.
+    OptixDenoiserParams denoiserParams{};
+
+    OptixImage2D img{};
+    img.width = static_cast<unsigned int>(width_);
+    img.height = static_cast<unsigned int>(height_);
+    img.rowStrideInBytes = static_cast<unsigned int>(width_) * sizeof(float4);
+    img.pixelStrideInBytes = sizeof(float4);
+    img.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+
+    OptixImage2D inputImg = img;
+    inputImg.data = impl_->accumBuffer;
+    OptixImage2D outputImg = img;
+    outputImg.data = impl_->denoisedBuffer;
+
+    OptixDenoiserLayer layer{};
+    layer.input = inputImg;
+    layer.output = outputImg;
+    OptixDenoiserGuideLayer guideLayer{}; // all zero: no albedo/normal/flow guides
+
+    OPTIX_CHECK(optixDenoiserInvoke(impl_->denoiser, impl_->stream, &denoiserParams, impl_->denoiserStateBuffer,
+                                     impl_->denoiserStateSize, &guideLayer, &layer, 1, 0, 0,
+                                     impl_->denoiserScratchBuffer, impl_->denoiserScratchSize));
+
+    // params on the device already has the right frameBuffer/denoisedBuffer/
+    // exposure for this — no need to re-upload before this second launch.
+    OPTIX_CHECK(optixLaunch(impl_->pipeline, impl_->stream, impl_->paramsBuffer, sizeof(Params), &impl_->tonemapSbt,
+                             width_, height_, 1));
+  }
+
   CUDA_CHECK(cudaGraphicsUnmapResources(1, &impl_->cudaPbo, impl_->stream));
   CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
 

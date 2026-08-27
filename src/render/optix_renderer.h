@@ -54,7 +54,11 @@ public:
   // trades per-frame cost for faster convergence; exposure only affects the
   // displayed tonemap, not the stored HDR accumulator (see pathtracer.cu),
   // so it's free to change every frame without resetting accumulation.
-  void render(const OrbitCamera &camera, unsigned int samplesPerLaunch = 1, float exposure = 1.0f);
+  // denoise runs the OptiX AI denoiser over the accumulated HDR buffer
+  // before tonemapping — same free-to-toggle-any-frame property as
+  // exposure, since it never touches the stored accumulator either.
+  void render(const OrbitCamera &camera, unsigned int samplesPerLaunch = 1, float exposure = 1.0f,
+              bool denoise = false);
 
   void resetAccumulation();
 
