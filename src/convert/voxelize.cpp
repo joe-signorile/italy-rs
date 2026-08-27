@@ -184,8 +184,19 @@ VoxelGrid voxelizeMesh(const MeshAsset &mesh, int resolution) {
 
     const glm::vec3 triMin = glm::min(glm::min(p0, p1), p2);
     const glm::vec3 triMax = glm::max(glm::max(p0, p1), p2);
-    const glm::ivec3 cellMin = glm::ivec3(glm::floor((triMin - grid.origin) / grid.voxelSize));
-    const glm::ivec3 cellMax = glm::ivec3(glm::floor((triMax - grid.origin) / grid.voxelSize));
+    // Clamped to [0, resolution-1]: a vertex sitting exactly on the mesh's
+    // far bounding-box edge (common for axis-aligned geometry, not rare for
+    // real meshes either) computes floor(extent/voxelSize) == resolution
+    // exactly — one past the last valid cell index — which without this
+    // clamp silently added a full phantom extra layer of cells on whichever
+    // axis hit the boundary. Caught by voxelize_test's hollow-cube case,
+    // where every vertex sits on a boundary on all three axes.
+    const glm::ivec3 cellMin =
+        glm::clamp(glm::ivec3(glm::floor((triMin - grid.origin) / grid.voxelSize)), glm::ivec3(0),
+                   glm::ivec3(resolution - 1));
+    const glm::ivec3 cellMax =
+        glm::clamp(glm::ivec3(glm::floor((triMax - grid.origin) / grid.voxelSize)), glm::ivec3(0),
+                   glm::ivec3(resolution - 1));
     const glm::vec3 color = triangleColor(mesh, base);
 
     for (int z = cellMin.z; z <= cellMax.z; ++z) {

@@ -38,14 +38,24 @@ MeshAsset makeUnitCubeShell() {
 } // namespace
 
 int main() {
+  const int resolution = 8;
   const MeshAsset cube = makeUnitCubeShell();
-  const auto grid = voxelizeMesh(cube, /*resolution=*/8);
+  const auto grid = voxelizeMesh(cube, resolution);
 
-  // 1) Non-trivial occupancy: not empty, and nowhere near a full solid fill
-  //    (this is a shell voxelizer, not a solid-fill one).
+  // 1) Non-trivial occupancy: not empty, and no more than a hollow shell's
+  //    worth of cells (this is a shell voxelizer, not a solid-fill one). A
+  //    single-voxel-thick shell has at most 6*resolution^2 occupied cells
+  //    (6 faces, each at most resolution x resolution — edges/corners are
+  //    shared, so real occupancy is always a bit less, never more). Not
+  //    "less than half the grid": at resolution 8 a correct thin shell is
+  //    already 296 of 512 cells (58%) simply because the grid is coarse
+  //    relative to the shell thickness — "half" only looks like a
+  //    reasonable ceiling at resolutions high enough that shell volume is
+  //    small relative to total volume, and silently stops meaning what it
+  //    was meant to at low ones.
+  const size_t maxShellCells = static_cast<size_t>(6 * resolution * resolution);
   assert(!grid.cells.empty());
-  assert(grid.cells.size() < static_cast<size_t>(8 * 8 * 8) / 2);
-  std::printf("occupied cells: %zu (of %d total)\n", grid.cells.size(), 8 * 8 * 8);
+  assert(grid.cells.size() <= maxShellCells);
 
   // 2) A cell at the cube's corner should be occupied...
   bool foundCorner = false;
