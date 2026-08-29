@@ -527,12 +527,6 @@ extern "C" __global__ void __miss__radiance() {
 
 extern "C" __global__ void __miss__occlusion() { optixSetPayload_0(0u); }
 
-// Gather queries (missSBTIndex 2, see the gather trace in
-// __closesthit__radiance) intentionally do nothing on a miss: "no photons
-// within radius" needs no payload change, since the accumulator (payload
-// registers 6-8) was already zero-initialized by the caller.
-extern "C" __global__ void __miss__gather() {}
-
 // Shared ray/AABB slab test — used by both the voxel intersection program
 // (box IS the primitive) and the SDF one (box just bounds where to start/
 // stop sphere tracing). Returns false for no overlap; otherwise t0/t1 are
@@ -731,6 +725,124 @@ static __forceinline__ __device__ float3 sdfGradientNormal(const HitGroupData *r
   const float dy = sampleSdf(rt, p + make_float3(0, h, 0)) - sampleSdf(rt, p - make_float3(0, h, 0));
   const float dz = sampleSdf(rt, p + make_float3(0, 0, h)) - sampleSdf(rt, p - make_float3(0, 0, h));
   return normalize(make_float3(dx, dy, dz));
+}
+
+// ----------------------------------------------------------------------------
+// Roadmap phase 3: Gaussian splats. Each splat is a custom-primitive
+// ellipsoid (3-sigma bound of its Gaussian, see convert/gsplat_bounds.h on
+// the host side) with its own local-to-world rotation and per-axis scale.
+// __intersection__gsplat finds where the ray crosses that ellipsoid;
+// __anyhit__gsplat then stochastically accepts or rejects the candidate
+// against the splat's actual Gaussian density (not just its bounding
+// ellipsoid), so overlapping/translucent splats composite correctly without
+// a depth sort — see MATERIAL_GSPLAT's doc comment in pathtracer_params.h.
+// ----------------------------------------------------------------------------
+
+// Must match kSigmaExtent in convert/gsplat_bounds.h — not shared via a
+// header (that one is host-only C++/glm), same "device-side stays
+// device-side" split every other cross-boundary constant here uses.
+#define GSPLAT_SIGMA_EXTENT 3.0f
+
+static __forceinline__ __device__ float4 quatConjugate(float4 q) { return make_float4(-q.x, -q.y, -q.z, q.w); }
+
+// Standard quaternion-vector rotation via the "double cross product" form
+// (Fabian Giesen's optimized formula) — avoids building a 3x3 matrix for a
+// single rotate.
+static __forceinline__ __device__ float3 quatRotate(float4 q, float3 v) {
+  const float3 qv = make_float3(q.x, q.y, q.z);
+  const float3 t = 2.0f * cross(qv, v);
+  return v + q.w * t + cross(qv, t);
+}
+
+// Transforms a world-space offset from a splat's center into "sigma units":
+// the splat's local frame (rotated by its orientation), then divided
+// component-wise by its per-axis standard deviation. The 3-sigma ellipsoid
+// surface is exactly the unit-radius-GSPLAT_SIGMA_EXTENT sphere in this
+// space, and the Gaussian density at any point is a simple function of its
+// squared length here — used by both the intersector (ellipsoid test) and
+// the any-hit (density evaluation) so the two can never disagree.
+static __forceinline__ __device__ float3 splatLocalSigma(float4 rotation, float3 scale, float3 worldOffset) {
+  return quatRotate(quatConjugate(rotation), worldOffset) / scale;
+}
+
+// Ray/ellipsoid test: transform the ray into the splat's sigma-space (where
+// the ellipsoid is a sphere of radius GSPLAT_SIGMA_EXTENT) and solve the
+// usual quadratic. Scaling the ray direction along with the origin keeps t
+// meaning "distance along the original world-space ray" throughout — t is
+// just a scalar multiplier on an affine parameterization, so evaluating the
+// equation in rescaled coordinates doesn't change what t means.
+extern "C" __global__ void __intersection__gsplat() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const unsigned int i = optixGetPrimitiveIndex();
+  const float3 center = rt->splatPositions[i];
+  const float3 scale = rt->splatScales[i];
+  const float4 rotation = rt->splatRotations[i];
+
+  const float3 rayO = optixGetObjectRayOrigin() - center;
+  const float3 rayD = optixGetObjectRayDirection();
+  const float3 so = splatLocalSigma(rotation, scale, rayO);
+  const float3 sd = quatRotate(quatConjugate(rotation), rayD) / scale;
+
+  const float a = dot(sd, sd);
+  const float b = dot(so, sd);
+  const float c = dot(so, so) - GSPLAT_SIGMA_EXTENT * GSPLAT_SIGMA_EXTENT;
+  const float disc = b * b - a * c;
+  if (disc < 0.0f)
+    return;
+
+  const float sqrtDisc = sqrtf(disc);
+  const float tNear = (-b - sqrtDisc) / a;
+  const float tFar = (-b + sqrtDisc) / a;
+  const float tmin = optixGetRayTmin();
+  const float tmax = optixGetRayTmax();
+
+  if (tNear > tmin && tNear < tmax)
+    optixReportIntersection(tNear, 0);
+  else if (tFar > tmin && tFar < tmax)
+    optixReportIntersection(tFar, 0);
+}
+
+// Stochastic alpha test: evaluate the actual (not just bounding-ellipsoid)
+// Gaussian density at the candidate hit point, multiply by the splat's
+// opacity, and accept the hit with that probability — otherwise ignore it
+// and let the ray continue through. Unbiased in expectation over many
+// samples/subframes, and needs no per-pixel depth sort of overlapping
+// splats (doctrine: unbiased transport is kept for beauty, not realism).
+//
+// Only ever reached by the camera/bounce radiance ray: traceOcclusion()
+// issues shadow rays with OPTIX_RAY_FLAG_DISABLE_ANYHIT (see its own
+// comment), so a splat's *shadow* is its full opaque bounding ellipsoid —
+// matching how every other geometry type's occlusion test in this renderer
+// is binary, not alpha-aware. optixGetPayload_3() is therefore always the
+// radiance ray's PerRayData seed here (see PerRayData's payload-slot doc
+// comment) — never a different ray type's payload.
+extern "C" __global__ void __anyhit__gsplat() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const unsigned int i = optixGetPrimitiveIndex();
+  const float3 center = rt->splatPositions[i];
+  const float3 scale = rt->splatScales[i];
+  const float4 rotation = rt->splatRotations[i];
+
+  const float3 hitP = optixGetWorldRayOrigin() + optixGetRayTmax() * optixGetWorldRayDirection();
+  const float3 sigma = splatLocalSigma(rotation, scale, hitP - center);
+  const float density = expf(-0.5f * dot(sigma, sigma));
+  const float alpha = rt->splatOpacity[i] * density;
+
+  unsigned int seed = optixGetPayload_3();
+  const bool accept = sutil::rnd(seed) < alpha;
+  optixSetPayload_3(seed);
+  if (!accept)
+    optixIgnoreIntersection();
+}
+
+// Ellipsoid gradient normal at the hit point, i.e. the standard implicit-
+// surface normal for f(p) = |sigma(p)| - GSPLAT_SIGMA_EXTENT: proportional to
+// R * D^-2 * R^T * (p - center), which in the sigma-space this file already
+// computes is just "the sigma coordinate, divided by scale once more, then
+// rotated back to world."
+static __forceinline__ __device__ float3 splatEllipsoidNormal(float4 rotation, float3 scale, float3 sigma) {
+  const float3 gradLocal = sigma / scale;
+  return normalize(quatRotate(rotation, gradLocal));
 }
 
 // ----------------------------------------------------------------------------
@@ -1062,6 +1174,16 @@ extern "C" __global__ void __closesthit__radiance() {
     // surface reads as falsely self-occluded). Nudge the shading point
     // outward along the normal by a safe margin before any ray leaves it.
     P = P + N * (rt->sdfVoxelSize * 0.25f);
+  } else if (rt->materialType == MATERIAL_GSPLAT) {
+    const unsigned int prim = optixGetPrimitiveIndex();
+    const float3 center = rt->splatPositions[prim];
+    const float3 scale = rt->splatScales[prim];
+    const float4 rotation = rt->splatRotations[prim];
+    const float3 sigma = splatLocalSigma(rotation, scale, P - center);
+    const float3 gradN = splatEllipsoidNormal(rotation, scale, sigma);
+    N = faceforward(gradN, -rayDir, gradN);
+    albedo = rt->splatColors[prim];
+    shading.diffuse = albedo;
   } else {
     Ng = geometricNormalFor(rt, P, rayDir);
     N = faceforward(Ng, -rayDir, Ng);
@@ -1105,7 +1227,8 @@ extern "C" __global__ void __closesthit__radiance() {
     }
     done = 1;
   } else if ((rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE ||
-              rt->materialType == MATERIAL_VOXEL || rt->materialType == MATERIAL_SDF) &&
+              rt->materialType == MATERIAL_VOXEL || rt->materialType == MATERIAL_SDF ||
+              rt->materialType == MATERIAL_GSPLAT) &&
              !(transmission > 0.0f && sutil::rnd(seed) < transmission)) {
     // Stochastic transmission: a material with transmission in (0,1) is a
     // probability-weighted mix of this reflectance path and the dielectric
@@ -1165,47 +1288,61 @@ extern "C" __global__ void __closesthit__radiance() {
       }
     }
 
-    // Caustics: gather nearby deposited photons (see phase-7 comment on
-    // Params::photonHandle) and add their contribution alongside NEE — same
-    // "radiance" channel, so it gets the same attenuation multiply in the
-    // raygen loop. No-op when there's no photon map for this scene.
-    if (params.photonHandle) {
-      unsigned int g0 = __float_as_uint(N.x), g1 = __float_as_uint(N.y), g2 = __float_as_uint(N.z);
-      // The gather reconstructs a diffuse-lobe estimate, so it wants the
-      // diffuse albedo, not the base colour: a metal has no diffuse lobe and
-      // must not pick up caustic photons through one.
-      unsigned int g3 = __float_as_uint(shading.diffuse.x), g4 = __float_as_uint(shading.diffuse.y),
-                   g5 = __float_as_uint(shading.diffuse.z);
-      unsigned int g6 = 0u, g7 = 0u, g8 = 0u;
-      // Any fixed direction correctly finds every sphere containing P, as
-      // long as tmax covers the largest possible chord through one of
-      // them (the diameter) — see optix_renderer.cpp's photon-BVH comment
-      // for the derivation. N is a convenient already-unit-length choice.
-      const float tmax = 2.02f * params.photonGatherRadius;
-      optixTrace(params.photonHandle, P, N, 0.0f, tmax, 0.0f, OptixVisibilityMask(1), OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
-                 params.gatherHitSbtOffset, 1, 2, g0, g1, g2, g3, g4, g5, g6, g7, g8);
-      const float3 gathered = make_float3(__uint_as_float(g6), __uint_as_float(g7), __uint_as_float(g8));
-      const float diskArea = M_PIf * params.photonGatherRadius * params.photonGatherRadius;
-      // Divide by the gather disk's area and nothing else. Each photon's
-      // `power` was *already* divided by photonBatchSize at emission time
-      // (see __raygen__photon), which is where the "flux per photon"
-      // normalization belongs; dividing by it a second time here scaled the
-      // whole caustic term down by another factor of 65536, making it
-      // numerically present but invisible. That is what the 200x
-      // ITALY_DEBUG_CAUSTICS_ONLY boost below was compensating for.
-      // Bias from the shrinking radius, and noise from a single pass's
-      // photon count, both average out via the same subframe accumulation
-      // that already smooths NEE noise.
-      radiance += gathered / diskArea;
-      // Debug aid: build with `-DITALY_DEBUG_CAUSTICS_ONLY` (not part of the
-      // normal CMake build) to replace radiance with *only* the caustic
-      // term, to check the gather finds a spatially coherent caustic
-      // independent of how it reads against direct lighting. No brightness
-      // boost any more — with the double-divide above fixed, the term is
-      // now at its true scale and legible on its own.
-#ifdef ITALY_DEBUG_CAUSTICS_ONLY
-      radiance = gathered / diskArea;
-#endif
+    // VCM Step 1: BDPT connections to stored light-subpath vertices (see
+    // Params::lightVertices' doc comment) — replaces the old phase-7
+    // single-bounce caustic photon gather entirely. Restricted to
+    // MATERIAL_DIFFUSE/MATERIAL_TEXTURED_DIFFUSE eye vertices: voxel/SDF/
+    // gsplat scenes stay eye-path-only NEE per the VCM plan's explicit scope
+    // boundary (none of them have per-primitive BSDF-pdf machinery to
+    // connect through). No-op when there are no stored vertices this frame
+    // (lightVertexCount == 0), same "photonHandle == 0" convention the old
+    // pipeline used.
+    if (params.lightVertexCount > 0 &&
+        (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE)) {
+      float3 connected = make_float3(0.0f);
+      for (unsigned int i = 0; i < params.lightVertexCount; ++i) {
+        const LightVertex &lv = params.lightVertices[i];
+        const float3 toVertex = lv.position - P;
+        const float dist2 = dot(toVertex, toVertex);
+        if (dist2 < 1e-8f)
+          continue;
+        const float dist = sqrtf(dist2);
+        const float3 dir = toVertex / dist;
+        const float cosLight = dot(lv.normal, -dir);
+        if (cosLight <= 0.0f)
+          continue;
+        // evalBsdf() already folds in NdotL (cosEye) and returns zero when
+        // either side of the surface faces away — no separate cosEye check
+        // needed here.
+        float3 fCosEye;
+        float pdfEyeUnused;
+        evalBsdf(shading, N, V, dir, fCosEye, pdfEyeUnused);
+        if (fCosEye.x + fCosEye.y + fCosEye.z <= 0.0f)
+          continue;
+        if (traceOcclusion(params.handle, P, dir, 1e-3f, dist - 2e-3f))
+          continue;
+        // claudia: Lambertian-diffuse-only light side for Step 1 — see
+        // LightVertex::albedo's doc comment. Same formula shape as the old
+        // single-bounce caustic gather (f_receiver/pi * power * cosTheta),
+        // generalized to a two-sided BSDF*BSDF*geometry-term connection: the
+        // gather's disk-area density estimate is replaced by an exact
+        // 1/distance^2 term since this is a direct point-to-point
+        // connection, not a radius-based estimate.
+        //
+        // No MIS weight against NEE/BSDF sampling here (weight is
+        // implicitly 1): a stored vertex sits at least one diffuse bounce
+        // away from the light (__closesthit__lightSubpath never deposits at
+        // the light itself), so neither this eye vertex's own NEE nor its
+        // BSDF-sampled continuation can reproduce this exact path — nothing
+        // to double-count against, so an unweighted addition stays
+        // unbiased, the same reasoning the old caustic gather relied on. A
+        // full Veach-style recursive MIS weight across every (s,t) split
+        // needs the dVCM/dVC pdf-history bookkeeping the VCM plan
+        // introduces alongside merging in Step 2 — deliberately not built
+        // early, so there's no phantom half-finished weight term here.
+        connected += fCosEye * (lv.albedo / M_PIf) * (cosLight / dist2) * lv.throughput;
+      }
+      radiance += connected;
     }
 
     // Sample the next bounce from the same BSDF the NEE above evaluated, so
@@ -1294,50 +1431,25 @@ extern "C" __global__ void __closesthit__radiance() {
   optixSetPayload_18(static_cast<unsigned int>(done));
 }
 
-// Any-hit half of the "ray-traced range query" trick used to gather nearby
-// photons: any-hit runs once per candidate primitive along the ray *without*
-// stopping traversal (optixIgnoreIntersection keeps it going), so as long as
-// the ray is long enough to guarantee crossing every candidate photon-sphere
-// it starts inside (see __closesthit__radiance's tmax comment), this visits
-// every photon within photonGatherRadius of the query point exactly once.
-// Payload: p0-2 query shading normal, p3-5 query albedo (both set by the
-// caller before tracing), p6-8 running sum (read-modify-write here).
-extern "C" __global__ void __anyhit__gather() {
-  const Photon &p = params.photons[optixGetPrimitiveIndex()];
-  const float3 N = make_float3(__uint_as_float(optixGetPayload_0()), __uint_as_float(optixGetPayload_1()),
-                                __uint_as_float(optixGetPayload_2()));
-  const float cosTheta = dot(N, -p.direction);
-  if (cosTheta > 0.0f) {
-    const float3 albedo = make_float3(__uint_as_float(optixGetPayload_3()), __uint_as_float(optixGetPayload_4()),
-                                       __uint_as_float(optixGetPayload_5()));
-    const float3 sum = make_float3(__uint_as_float(optixGetPayload_6()), __uint_as_float(optixGetPayload_7()),
-                                    __uint_as_float(optixGetPayload_8())) +
-                        (albedo / M_PIf) * p.power * cosTheta;
-    optixSetPayload_6(__float_as_uint(sum.x));
-    optixSetPayload_7(__float_as_uint(sum.y));
-    optixSetPayload_8(__float_as_uint(sum.z));
-  }
-  optixIgnoreIntersection();
-}
-
 // ----------------------------------------------------------------------------
-// Photon emission/tracing (phase 7 caustics). Iterative bounce loop in
-// raygen, same shape as __raygen__rg/trace() above, but with a much smaller
-// dedicated payload — this is a separate, simpler walk (emit from the light,
-// follow specular bounces, deposit at the first diffuse hit, done) rather
-// than a variant of the camera path. Scoped to MATERIAL_DIFFUSE/MIRROR/
-// GLASS/LIGHT only (the fixed bring-up scene) — see optix_renderer.cpp's
-// buildPhotonPipeline() for why mesh/voxel/sdf scenes don't get a photon map
-// at all.
+// VCM Step 1: light-subpath emission/tracing (see
+// /home/joe/.claude/plans/what-is-the-next-wise-flurry.md and
+// Params::lightVertices' doc comment). Iterative bounce loop in raygen, same
+// shape as __raygen__rg/trace() above but with a much smaller dedicated
+// payload — emit from the light, walk through delta (mirror/glass/mirror-
+// like-metallic) bounces without depositing, deposit a LightVertex at every
+// non-delta (diffuse) bounce and *keep walking* from there (unlike the old
+// phase-7 photon pass, which stopped at the first diffuse hit). Scoped to
+// MATERIAL_DIFFUSE/MIRROR/GLASS/TEXTURED_DIFFUSE/LIGHT only — voxel/SDF/
+// gsplat scenes stay eye-path-only NEE, unchanged, per the VCM plan's
+// explicit scope boundary (none of them have per-primitive BSDF-pdf
+// machinery to walk a light subpath through).
 //
-// Payload: p0 seed, p1-3 power, p4-6 next direction, p7 causticEligible
-// (0/1 — becomes 1 after the first specular bounce; only photons that pass
-// through at least one specular surface get deposited, since direct
-// light->diffuse paths are already handled by NEE), p8 done, p9-11 next
-// origin.
+// Payload: p0 seed, p1-3 throughput, p4-6 next direction, p7 done, p8-10
+// next origin.
 // ----------------------------------------------------------------------------
 
-extern "C" __global__ void __closesthit__photon() {
+extern "C" __global__ void __closesthit__lightSubpath() {
   HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
   const float3 rayDir = optixGetWorldRayDirection();
   const float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
@@ -1345,43 +1457,35 @@ extern "C" __global__ void __closesthit__photon() {
   const float3 N = faceforward(Ng, -rayDir, Ng);
 
   unsigned int seed = optixGetPayload_0();
-  float3 power = make_float3(__uint_as_float(optixGetPayload_1()), __uint_as_float(optixGetPayload_2()),
-                              __uint_as_float(optixGetPayload_3()));
-  unsigned int causticEligible = optixGetPayload_7();
+  float3 throughput = make_float3(__uint_as_float(optixGetPayload_1()), __uint_as_float(optixGetPayload_2()),
+                                    __uint_as_float(optixGetPayload_3()));
 
   float3 nextDirection = rayDir;
   unsigned int done = 1u;
 
   if (rt->materialType == MATERIAL_MIRROR) {
     nextDirection = reflect(rayDir, N);
-    power = power * rt->albedo;
-    causticEligible = 1u;
-    done = 0u;
+    throughput = throughput * rt->albedo;
+    done = 0u; // delta bounce: never a connectable vertex, see kCausticMirrorMetallic/Roughness's doc comment
   } else if (rt->materialType == MATERIAL_GLASS) {
     // Same sidedness and absorption as __closesthit__radiance's glass branch
-    // — photons have to refract out of the sphere correctly, and lose the
-    // same energy on the way through, or the caustic they focus lands in the
-    // wrong place with the wrong colour.
+    // — the light subpath has to refract out of the sphere correctly, and
+    // lose the same energy on the way through, or a connection through it
+    // lands with the wrong colour.
     const bool entering = rt->sphereRadius > 0.0f ? (optixGetHitKind() == SPHERE_HIT_FROM_OUTSIDE)
                                                    : (dot(rayDir, Ng) < 0.0f);
     if (!entering)
-      power = power * make_float3(expf(-rt->extinction.x * optixGetRayTmax()),
-                                   expf(-rt->extinction.y * optixGetRayTmax()),
-                                   expf(-rt->extinction.z * optixGetRayTmax()));
+      throughput = throughput * make_float3(expf(-rt->extinction.x * optixGetRayTmax()),
+                                             expf(-rt->extinction.y * optixGetRayTmax()),
+                                             expf(-rt->extinction.z * optixGetRayTmax()));
     const float eta = entering ? (1.0f / rt->ior) : rt->ior;
     const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
     const float fresnel = schlickFresnel(cosTheta, rt->ior);
     float3 refracted;
     const bool canRefract = refractRay(rayDir, N, eta, refracted);
     nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
-    causticEligible = 1u;
     done = 0u;
   } else if (rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
-    // Lifts the gate MATERIAL_TEXTURED_DIFFUSE's doc comment used to
-    // describe: a loaded mesh can now seed a caustic two ways — a real
-    // KHR_materials_transmission surface refracting like glass, or a
-    // near-zero-roughness/high-metallic surface (chrome trim) acting as a
-    // mirror. Everything else deposits, same as MATERIAL_DIFFUSE below.
     const unsigned int prim = optixGetPrimitiveIndex();
     const unsigned int matIdx = rt->triangleMaterial ? rt->triangleMaterial[prim] : 0u;
     const GpuMaterial &mat = rt->materials[matIdx];
@@ -1394,69 +1498,83 @@ extern "C" __global__ void __closesthit__photon() {
       const bool entering = dot(rayDir, Ng) < 0.0f;
       const float3 extinction = attenuationToExtinction(mat.attenuationColor, mat.attenuationDistance);
       if (!entering)
-        power = power * make_float3(expf(-extinction.x * optixGetRayTmax()), expf(-extinction.y * optixGetRayTmax()),
-                                     expf(-extinction.z * optixGetRayTmax()));
+        throughput = throughput * make_float3(expf(-extinction.x * optixGetRayTmax()),
+                                               expf(-extinction.y * optixGetRayTmax()),
+                                               expf(-extinction.z * optixGetRayTmax()));
       const float eta = entering ? (1.0f / mat.ior) : mat.ior;
       const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
       const float fresnel = schlickFresnel(cosTheta, mat.ior);
       float3 refracted;
       const bool canRefract = refractRay(rayDir, N, eta, refracted);
       nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
-      causticEligible = 1u;
-      done = 0u;
+      done = 0u; // delta transmissive bounce: not connectable, same as MATERIAL_GLASS
     } else if (mat.metallic > kCausticMirrorMetallic && mat.roughness < kCausticMirrorRoughness) {
       nextDirection = reflect(rayDir, N);
-      power = power * mat.baseColorFactor;
-      causticEligible = 1u;
-      done = 0u;
-    } else if (causticEligible) {
-      const unsigned int idx = atomicAdd(params.photonCounter, 1u);
-      if (idx < params.photonCapacity) {
-        params.photons[idx].position = P;
-        params.photons[idx].direction = rayDir;
-        params.photons[idx].power = power;
+      throughput = throughput * mat.baseColorFactor;
+      done = 0u; // mirror-like: not connectable either, same threshold __closesthit__radiance's connection loop implies
+    } else {
+      // claudia: Lambertian-diffuse-only for Step 1 — see LightVertex::
+      // albedo's doc comment. Deposit using the diffuse albedo (base colour
+      // scaled by 1-metallic, the same split __closesthit__radiance's
+      // ShadingMaterial uses), then continue the walk with a cosine-weighted
+      // diffuse bounce — for a Lambert lobe, f*cos/pdf collapses to exactly
+      // the albedo, so that's the whole throughput update.
+      const float3 diffuseAlbedo = mat.baseColorFactor * (1.0f - mat.metallic);
+      const unsigned int idx = atomicAdd(params.lightVertexCounter, 1u);
+      if (idx < params.lightVertexCapacity) {
+        params.lightVertices[idx].position = P;
+        params.lightVertices[idx].normal = N;
+        params.lightVertices[idx].direction = rayDir;
+        params.lightVertices[idx].throughput = throughput;
+        params.lightVertices[idx].albedo = diffuseAlbedo;
       }
-      done = 1u;
+      float3 local;
+      cosineSampleHemisphere(sutil::rnd(seed), sutil::rnd(seed), local);
+      const Onb onb(N);
+      nextDirection = onb.toWorld(local);
+      throughput = throughput * diffuseAlbedo;
+      done = 0u;
     }
-  } else if (rt->materialType == MATERIAL_DIFFUSE && causticEligible) {
-    // Deposit and terminate — single-bounce caustics only (matches the
-    // "light through glass onto a table" verification scenario exactly;
-    // multi-bounce caustic chains are a natural but unneeded-for-MVP
-    // extension, same "obvious next step, not required now" spirit as the
-    // rest of this file's scope choices).
-    const unsigned int idx = atomicAdd(params.photonCounter, 1u);
-    if (idx < params.photonCapacity) {
-      params.photons[idx].position = P;
-      params.photons[idx].direction = rayDir;
-      params.photons[idx].power = power;
+  } else if (rt->materialType == MATERIAL_DIFFUSE) {
+    const unsigned int idx = atomicAdd(params.lightVertexCounter, 1u);
+    if (idx < params.lightVertexCapacity) {
+      params.lightVertices[idx].position = P;
+      params.lightVertices[idx].normal = N;
+      params.lightVertices[idx].direction = rayDir;
+      params.lightVertices[idx].throughput = throughput;
+      params.lightVertices[idx].albedo = rt->albedo;
     }
-    done = 1u;
+    float3 local;
+    cosineSampleHemisphere(sutil::rnd(seed), sutil::rnd(seed), local);
+    const Onb onb(N);
+    nextDirection = onb.toWorld(local);
+    throughput = throughput * rt->albedo;
+    done = 0u;
   }
-  // MATERIAL_DIFFUSE/MATERIAL_TEXTURED_DIFFUSE-without-causticEligible
-  // (direct light->diffuse, already covered by NEE), MATERIAL_VOXEL/
-  // MATERIAL_SDF (still flat-diffuse-only, no per-triangle material to test
-  // — out of scope for this pass), and MATERIAL_LIGHT (photon hit another
-  // light) all fall through to the done=1u/no-deposit default above.
+  // MATERIAL_LIGHT (the subpath hit another light — no vertex to deposit,
+  // nothing further to trace) and MATERIAL_VOXEL/MATERIAL_SDF/
+  // MATERIAL_GSPLAT (still eye-path-only, per the VCM plan's explicit scope
+  // boundary — no per-primitive BSDF-pdf machinery to walk a light subpath
+  // through) all fall through to the done=1u/no-deposit default above.
 
   optixSetPayload_0(seed);
-  optixSetPayload_1(__float_as_uint(power.x));
-  optixSetPayload_2(__float_as_uint(power.y));
-  optixSetPayload_3(__float_as_uint(power.z));
+  optixSetPayload_1(__float_as_uint(throughput.x));
+  optixSetPayload_2(__float_as_uint(throughput.y));
+  optixSetPayload_3(__float_as_uint(throughput.z));
   optixSetPayload_4(__float_as_uint(nextDirection.x));
   optixSetPayload_5(__float_as_uint(nextDirection.y));
   optixSetPayload_6(__float_as_uint(nextDirection.z));
-  optixSetPayload_7(causticEligible);
-  optixSetPayload_8(done);
-  optixSetPayload_9(__float_as_uint(P.x));
-  optixSetPayload_10(__float_as_uint(P.y));
-  optixSetPayload_11(__float_as_uint(P.z));
+  optixSetPayload_7(done);
+  optixSetPayload_8(__float_as_uint(P.x));
+  optixSetPayload_9(__float_as_uint(P.y));
+  optixSetPayload_10(__float_as_uint(P.z));
 }
 
-extern "C" __global__ void __miss__photon() { optixSetPayload_8(1u); /* done — escaped the scene */ }
+extern "C" __global__ void __miss__lightSubpath() { optixSetPayload_7(1u); /* done — escaped the scene */ }
 
-// Emits one photon from the quad light: uniform over its area, cosine-
-// weighted into the hemisphere above it. Total flux for a Lambertian area
-// emitter is Le * A * pi; spread evenly across this pass's photons.
+// Emits one light subpath from the quad light: uniform over its area,
+// cosine-weighted into the hemisphere above it. Total flux for a Lambertian
+// area emitter is Le * A * pi; spread evenly across this pass's subpaths.
 static __forceinline__ __device__ void emitFromQuadLight(unsigned int &seed, float3 &origin, float3 &direction,
                                                            float3 &power) {
   const QuadLight &light = params.light;
@@ -1467,21 +1585,21 @@ static __forceinline__ __device__ void emitFromQuadLight(unsigned int &seed, flo
   const Onb onb(light.normal);
   direction = onb.toWorld(local);
   const float area = length(cross(light.v1, light.v2));
-  power = (light.emission * area * M_PIf) / fmaxf(static_cast<float>(params.photonBatchSize), 1.0f);
+  power = (light.emission * area * M_PIf) / fmaxf(static_cast<float>(params.lightSubpathBatchSize), 1.0f);
 }
 
-// Emits one photon from the environment: importance-sample a direction the
-// same way NEE does (bright regions of the sky preferentially chosen), then
-// place the origin on a disk just outside the scene's bounding sphere,
-// facing into the scene along that direction — PBRT's standard
-// InfiniteAreaLight::Sample_Le construction. A photon "from the environment"
-// has no single point of origin, so the disk stands in for "everywhere
-// outside the scene that direction could have come from."
+// Emits one light subpath from the environment: importance-sample a
+// direction the same way NEE does (bright regions of the sky preferentially
+// chosen), then place the origin on a disk just outside the scene's bounding
+// sphere, facing into the scene along that direction — PBRT's standard
+// InfiniteAreaLight::Sample_Le construction. A subpath "from the
+// environment" has no single point of origin, so the disk stands in for
+// "everywhere outside the scene that direction could have come from."
 static __forceinline__ __device__ void emitFromEnvironment(unsigned int &seed, float3 &origin, float3 &direction,
                                                              float3 &power) {
   float pdfDir;
   // sampleEnvironment() returns the direction *toward* the light (the
-  // convention NEE uses); a photon needs to travel the other way.
+  // convention NEE uses); a light subpath needs to travel the other way.
   const float3 toLight = sampleEnvironment(sutil::rnd(seed), sutil::rnd(seed), pdfDir);
   direction = -toLight;
   const float3 radiance = lookupEnvironmentRadiance(toLight);
@@ -1495,46 +1613,60 @@ static __forceinline__ __device__ void emitFromEnvironment(unsigned int &seed, f
   // direction pdf (already in solid-angle measure), power = Le * diskArea *
   // (no cosine term — the disk is oriented perpendicular to the ray by
   // construction, unlike the quad light's cosine-weighted hemisphere) /
-  // pdfDir, spread over this pass's photon count the same way the quad
+  // pdfDir, spread over this pass's subpath count the same way the quad
   // light's flux is.
   const float diskArea = M_PIf * r * r;
-  power = pdfDir > 1e-8f ? (radiance * diskArea) / (pdfDir * fmaxf(static_cast<float>(params.photonBatchSize), 1.0f))
-                         : make_float3(0.0f);
+  power = pdfDir > 1e-8f
+              ? (radiance * diskArea) / (pdfDir * fmaxf(static_cast<float>(params.lightSubpathBatchSize), 1.0f))
+              : make_float3(0.0f);
 }
 
-extern "C" __global__ void __raygen__photon() {
+extern "C" __global__ void __raygen__lightSubpath() {
   const unsigned int idx = optixGetLaunchIndex().x;
   // Distinct seed stream from camera rays: same idx values are used by both
-  // (photon launch width vs. pixel count don't correspond to anything), and
-  // params.subframeIndex vs a would-be "photon pass index" would otherwise
-  // coincide too, so tea<> alone isn't enough — fold in a large odd
-  // constant to decorrelate the two RNG streams.
-  unsigned int seed = sutil::tea<4>(idx, params.totalPhotonsEmitted + 0x9e3779b9u);
+  // (light-subpath launch width vs. pixel count don't correspond to
+  // anything), and params.subframeIndex vs a would-be "light-subpath pass
+  // index" would otherwise coincide too, so tea<> alone isn't enough — fold
+  // in a large odd constant to decorrelate the two RNG streams.
+  unsigned int seed = sutil::tea<4>(idx, params.totalLightPathsEmitted + 0x9e3779b9u);
 
-  // The two lighting modes aren't blended (see Params::envTex) — photon
-  // emission follows whichever one NEE is using, so caustics are lit
-  // consistently with everything else in the scene.
+  // The two lighting modes aren't blended (see Params::envTex) — light
+  // subpaths follow whichever one NEE is using, so indirect/connected light
+  // is lit consistently with everything else in the scene.
   float3 origin, direction, power;
   if (params.envTex)
     emitFromEnvironment(seed, origin, direction, power);
   else
     emitFromQuadLight(seed, origin, direction, power);
 
-  unsigned int causticEligible = 0u;
-  for (int depth = 0; depth < 8; ++depth) {
+  // Extended from the old single-bounce-caustic walk's cap (8): every
+  // diffuse bounce now stores a connectable vertex instead of only
+  // depositing once after a specular chain, so a longer walk is what lets
+  // BDPT connections see multi-bounce indirect light the old SPPM pipeline
+  // structurally couldn't reach.
+  for (int depth = 0; depth < 12; ++depth) {
     unsigned int p0 = seed, p1 = __float_as_uint(power.x), p2 = __float_as_uint(power.y),
                  p3 = __float_as_uint(power.z), p4 = __float_as_uint(direction.x), p5 = __float_as_uint(direction.y),
-                 p6 = __float_as_uint(direction.z), p7 = causticEligible, p8 = 0u, p9 = __float_as_uint(origin.x),
-                 p10 = __float_as_uint(origin.y), p11 = __float_as_uint(origin.z);
+                 p6 = __float_as_uint(direction.z), p7 = 0u, p8 = __float_as_uint(origin.x),
+                 p9 = __float_as_uint(origin.y), p10 = __float_as_uint(origin.z);
     optixTrace(params.handle, origin, direction, 1e-3f, 1e16f, 0.0f, OptixVisibilityMask(1), OPTIX_RAY_FLAG_NONE, 0, 1,
-               0, p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11);
+               0, p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10);
     seed = p0;
     power = make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3));
     direction = make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6));
-    causticEligible = p7;
-    const unsigned int done = p8;
-    origin = make_float3(__uint_as_float(p9), __uint_as_float(p10), __uint_as_float(p11));
+    const unsigned int done = p7;
+    origin = make_float3(__uint_as_float(p8), __uint_as_float(p9), __uint_as_float(p10));
     if (done)
       break;
+
+    // Russian roulette after a few free bounces — same threshold/idiom
+    // __raygen__rg's eye path already uses, now that this walk can run long
+    // enough for unbounded throughput growth/shrinkage to matter.
+    if (depth >= 3) {
+      const float rrP = fmaxf(fmaxf(power.x, power.y), power.z);
+      if (sutil::rnd(seed) > rrP)
+        break;
+      power /= fmaxf(rrP, 1e-4f);
+    }
   }
 }

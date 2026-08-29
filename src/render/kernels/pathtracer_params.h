@@ -7,11 +7,22 @@
 #include <optix.h>
 
 // Threshold for treating a GGX metallic-roughness triangle as "mirror-like
-// enough" to carry a caustic photon bounce (see __closesthit__photon's
-// MATERIAL_TEXTURED_DIFFUSE branch in pathtracer.cu). Also used host-side by
-// optix_renderer.cpp to decide up front whether a loaded mesh has anything
-// that could seed a caustic at all — shared here so the two checks can't
-// drift apart.
+// enough" to carry a delta (specular) light-subpath bounce rather than a
+// connectable one — see __closesthit__lightSubpath's MATERIAL_TEXTURED_
+// DIFFUSE branch in pathtracer.cu. Also used host-side by optix_renderer.cpp
+// to decide up front whether a loaded mesh has anything that could seed a
+// light subpath at all — shared here so the two checks can't drift apart.
+//
+// VCM Step 1 (see /home/joe/.claude/plans/what-is-the-next-wise-flurry.md)
+// reads this the same threshold as before but with the opposite meaning at
+// the point of use: what used to gate "specular enough to deposit a caustic
+// photon after" now gates "specular enough that a light-subpath vertex must
+// NOT be stored/connected here at all" (delta BSDFs have no finite pdf, so
+// Georgiev's own VCM formulation excludes them from connection eligibility
+// the same way). The eye side (__closesthit__radiance's BDPT connection
+// loop) never needs to consult this threshold directly — it just never
+// finds a vertex to connect to at a delta surface, since none was ever
+// stored there.
 inline constexpr float kCausticMirrorMetallic = 0.9f;
 inline constexpr float kCausticMirrorRoughness = 0.1f;
 
@@ -33,11 +44,11 @@ enum MaterialType : unsigned int {
   // transmission/ior/attenuation* fields) refracts through the mesh the
   // same way MATERIAL_GLASS refracts through a solid sphere — see the
   // merged dielectric branch at the end of __closesthit__radiance and the
-  // matching branch in __closesthit__photon. A mirror-like metallic/rough
-  // combo (kCausticMirrorMetallic/kCausticMirrorRoughness above) gets the
-  // same caustic-eligibility treatment without needing transmission at all.
-  // Voxel/SDF scenes still can't (no per-primitive material to carry either
-  // property) — see enablePhotonMapping's comment in optix_renderer.cpp.
+  // matching branch in __closesthit__lightSubpath. A mirror-like
+  // metallic/rough combo (kCausticMirrorMetallic/kCausticMirrorRoughness
+  // above) gets the same delta-bounce treatment without needing transmission
+  // at all. Voxel/SDF scenes still can't (no per-primitive material to carry
+  // either property) — see enableLightSubpaths' comment in optix_renderer.cpp.
   MATERIAL_TEXTURED_DIFFUSE = 4,
   // Diffuse BRDF, custom-AABB voxel primitive; albedo is a per-voxel baked
   // color, shading normal comes from which of the 6 box faces was entered
@@ -50,6 +61,25 @@ enum MaterialType : unsigned int {
   // baseColorFactor) — no per-surface-point color field is baked, unlike the
   // voxel path; see sdf_baker.h for why.
   MATERIAL_SDF = 6,
+  // Custom-AABB-per-splat primitive (one 3-sigma ellipsoid bound per splat,
+  // see gsplat_bounds.h) — roadmap phase 3, imported 3D Gaussian Splatting
+  // `.ply` scenes (gsplat_ply_loader.h). __intersection__gsplat solves a
+  // ray/ellipsoid test per splat; __anyhit__gsplat then stochastically
+  // accepts or rejects that candidate against the splat's actual Gaussian
+  // density (russian-roulette alpha test, unbiased in expectation) so
+  // overlapping splats composite correctly with no depth sort. Diffuse BRDF
+  // only, like MATERIAL_VOXEL/MATERIAL_SDF — see HitGroupData::splatColors.
+  //
+  // realism: splat color (colorDC) is treated as a Lambertian diffuse
+  // albedo and relit by the scene's real light (HDRI/quad light), not
+  // rendered unlit as trained. A trained splat's color already bakes in its
+  // capture's original lighting, so this double-counts illumination — but
+  // this renderer has no unlit/emissive-facsimile material path, and an
+  // unlit splat would look flat and unshaded next to path-traced geometry
+  // under a different HDRI. Good enough for "import and light like
+  // everything else"; a dedicated unlit splat mode is future work if this
+  // reads badly in practice.
+  MATERIAL_GSPLAT = 7,
 };
 
 // A single rectangular area light — the phase 2..5 default. Superseded by
@@ -64,14 +94,32 @@ struct QuadLight {
   float3 emission;
 };
 
-// A single deposited caustic photon (see phase-7 comment on Params below).
-// `direction` is the direction the photon was traveling when it hit the
-// diffuse surface (needed by the gather step's cosine term), not a
-// reflection/half-vector — matches how radiance's NEE branch uses `L`.
-struct Photon {
+// One stored light-subpath vertex — VCM Step 1's replacement for the old
+// phase-7 `Photon` (see Params::lightVertices' doc comment below for the
+// pipeline this feeds). Deposited by __closesthit__lightSubpath at every
+// non-delta (diffuse) bounce of the light-subpath walk; mirror/glass/
+// mirror-like-metallic bounces never reach here at all (kCausticMirrorMetallic/
+// kCausticMirrorRoughness above gate that at the point of deposit), so every
+// vertex in this buffer is guaranteed connectable.
+struct LightVertex {
   float3 position;
+  float3 normal; // shading normal at the vertex — needed to evaluate the light-side BSDF at connection time
+  // Direction the subpath was traveling when it reached this vertex — same
+  // convention Photon::direction used (not a reflection/half-vector).
   float3 direction;
-  float3 power;
+  // Subpath throughput up to and including this vertex (renamed from
+  // Photon::power for clarity: it's the light-path analogue of RadiancePRD's
+  // `attenuation`, not a physical power/flux value on its own).
+  float3 throughput;
+  // claudia: Lambertian-diffuse-only for Step 1 — the BDPT connection eval
+  // in __closesthit__radiance treats every stored vertex as a pure Lambert
+  // BRDF (albedo/pi) regardless of what material it actually came from, so a
+  // MATERIAL_TEXTURED_DIFFUSE vertex's GGX specular lobe is silently dropped
+  // from the connection term (only its diffuse albedo is used, here and at
+  // storage time). Full glossy/dielectric light-side BSDF support is Step
+  // 3's job (see the VCM plan's sub-phase breakdown) — this field only ever
+  // needs to be a diffuse albedo until then.
+  float3 albedo;
 };
 
 struct Params {
@@ -104,9 +152,10 @@ struct Params {
   unsigned int denoiserEnabled;
   float4 *denoisedBuffer;
 
-  // Scene bounding sphere — used by environment-based photon emission
-  // (__raygen__photon) to place an emission origin outside the geometry when
-  // there's no quad light to emit from. Unrelated to the camera. No default
+  // Scene bounding sphere — used by environment-based light-subpath emission
+  // (__raygen__lightSubpath) to place an emission origin outside the
+  // geometry when there's no quad light to emit from. Unrelated to the
+  // camera. No default
   // member initializers: Params is a __constant__ global on the device side,
   // which CUDA requires to be trivially constructible — every field here is
   // set explicitly host-side before upload (see optix_renderer.cpp's
@@ -150,32 +199,39 @@ struct Params {
   int envWidth;
   int envHeight;
 
-  // Caustics (phase 7): a global-radius progressive photon map — the
-  // original Hachisuka/Ogaki/Jensen 2008 PPM formulation (one shared radius,
-  // shrunk each pass via R_{i+1} = R_i * sqrt((i+alpha)/(i+1))), not the
-  // later per-visible-point Stochastic PPM (2009) refinement — see
-  // buildPhotonPipeline()'s comment in optix_renderer.cpp for why. Only
-  // built for the fixed bring-up scene (the only one with specular objects
-  // to seed a caustic from); photonHandle == 0 means "no photon map,
-  // gather is a no-op," so every other scene renders exactly as it did
+  // VCM Step 1 — light-subpath storage + BDPT connections (see
+  // /home/joe/.claude/plans/what-is-the-next-wise-flurry.md). Replaces the
+  // old phase-7 single-bounce-photon/SPPM pipeline entirely:
+  // __raygen__lightSubpath emits from the light/environment, and
+  // __closesthit__lightSubpath appends a LightVertex to this plain array at
+  // *every* non-delta bounce (diffuse included, not just after a specular
+  // one). __closesthit__radiance iterates the array directly at every
+  // diffuse eye vertex and attempts a BDPT connection (traceOcclusion() +
+  // BSDF*BSDF*geometry-term contribution) to each stored vertex.
+  //
+  // Deliberately no acceleration structure over these vertices yet, and no
+  // `vertexMergeHandle`/dVCM-dVC-dVM accumulator fields — that's vertex
+  // *merging*, Step 2's job. Adding that machinery now, before it does
+  // anything, would leave a phantom half-finished weight term for no
+  // benefit; see the VCM plan's sub-phase breakdown.
+  //
+  // lightVertexCount == 0 means "no light subpaths this frame" (either the
+  // scene has nothing connectable, or the caller zero-weighted it for an
+  // A/B comparison — see RenderSettings::lightSubpaths) — the BDPT
+  // connection loop is then a no-op, same "photonHandle == 0" convention the
+  // old pipeline used, so every other scene renders exactly as it did
   // before this phase.
-  OptixTraversableHandle photonHandle;
-  Photon *photons;                // capacity photonCapacity; valid entries: min(*photonCounter, photonCapacity)
-  unsigned int *photonCounter;    // atomic append index, host resets to 0 before each photon-emission launch
-  unsigned int photonCapacity;
-  unsigned int photonBatchSize;   // photons emitted per pass — the photon raygen's launch width
-  float photonGatherRadius;
-  unsigned int totalPhotonsEmitted;
-  // The gather trace targets photonHandle directly (a bare GAS, no IAS/
-  // instance wrapping — there's only one build input, photons-as-spheres),
-  // so its SBT hit-group index is *only* the SBTOffset argument passed to
-  // that optixTrace call (no instance.sbtOffset to add, unlike every other
-  // trace call in this file which goes through params.handle's per-object
-  // instances). That argument therefore has to skip past the scene's own
-  // per-object hit-group records — hardcoding a literal here would silently
-  // collide with whichever scene object happens to land on that index, so
-  // the host computes and passes the right value (objects.size()) instead.
-  unsigned int gatherHitSbtOffset;
+  LightVertex *lightVertices;         // capacity lightVertexCapacity, written by the emission pass
+  unsigned int *lightVertexCounter;   // atomic append index, host resets to 0 before each emission launch
+  unsigned int lightVertexCapacity;
+  unsigned int lightSubpathBatchSize; // light subpaths emitted per pass — the light-subpath raygen's launch width
+  unsigned int totalLightPathsEmitted; // RNG-seed decorrelation counter, same role as the old totalPhotonsEmitted
+  // Vertices actually valid this frame: min(*lightVertexCounter, lightVertexCapacity)
+  // as read back host-side after the emission pass — the main eye-path
+  // launch reads this fixed scalar rather than dereferencing the (still
+  // being-appended-to, from its perspective already-finalized) counter
+  // itself, so every eye thread agrees on the same bound.
+  unsigned int lightVertexCount;
 };
 
 // One glTF material, device side. Texture handles are 0 when absent.
@@ -268,4 +324,17 @@ struct HitGroupData {
   float3 sdfOrigin{};
   float sdfVoxelSize = 1.0f;
   int sdfNx = 0, sdfNy = 0, sdfNz = 0;
+
+  // Only used when materialType == MATERIAL_GSPLAT, indexed by
+  // optixGetPrimitiveIndex() — one custom AABB per splat feeds the BVH build
+  // (see optix_renderer.cpp's buildSplatObject, freed after build, unlike
+  // voxelAabbs above: the intersection program re-derives the ellipsoid from
+  // position/scale/rotation directly rather than re-reading a box). scales
+  // are world-space per-local-axis standard deviations (post-exp); rotations
+  // are local-to-world quaternions (x,y,z,w); opacity is post-sigmoid.
+  float3 *splatPositions = nullptr;
+  float3 *splatScales = nullptr;
+  float4 *splatRotations = nullptr;
+  float *splatOpacity = nullptr;
+  float3 *splatColors = nullptr;
 };
