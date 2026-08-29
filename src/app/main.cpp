@@ -354,6 +354,22 @@ int main(int argc, char **argv) {
   // Testing hooks, same spirit as ITALY_DUMP_FRAME: these toggles are UI-only
   // otherwise, so scripted before/after verification needs a way in that
   // doesn't require actually clicking the checkbox/radio button.
+  // Temporary verification aid (VCM energy-check, see humans.md) — points
+  // the camera straight down at the fixed test scene's ground point directly
+  // under the quad light, so the image *center* pixel is exactly the point a
+  // closed-form irradiance prediction is computed for, with no camera-ray
+  // trig required to find it. Not a permanent feature; safe to delete once
+  // the energy check is re-run after any future change to that scene.
+  if (std::getenv("ITALY_DEBUG_LOOKDOWN")) {
+    // Retargets at a ground point in the far corner from every sphere (and
+    // its shadow/caustic footprint) — default yaw/pitch already gives a
+    // clean, unoccluded, low-GI-contamination view of it (confirmed by
+    // render: smooth monotonic irradiance gradient, no silhouette/penumbra
+    // edges nearby), unlike the point directly under the light, which sits
+    // close enough to the mirror/glass spheres for this scene's default
+    // orbit angles to clip one of them or land in a soft-shadow penumbra.
+    camera.frame(glm::vec3(-2.2f, -1.0f, -2.2f), 3.0f);
+  }
   if (std::getenv("ITALY_FORCE_DENOISE"))
     state.render.denoise = true;
   if (const char *fc = std::getenv("ITALY_FIREFLY_CLAMP"))
