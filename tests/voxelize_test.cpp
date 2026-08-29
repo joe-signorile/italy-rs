@@ -32,6 +32,14 @@ MeshAsset makeUnitCubeShell() {
   addQuad(mesh, {lo.x, hi.y, lo.z}, {hi.x, hi.y, lo.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}); // +Y
   mesh.boundsMin = lo;
   mesh.boundsMax = hi;
+  // MeshAsset::materialForTriangle() indexes materials[0] unconditionally as
+  // its fallback (every triangle here has no explicit triangleMaterial entry,
+  // so it always takes that fallback) — the invariant "materials is never
+  // empty" is normally guaranteed by loadGlb(), which always appends a
+  // default. This fixture builds a MeshAsset by hand and has to uphold the
+  // same invariant itself, or triangleColor()'s lookup in voxelize.cpp reads
+  // out of bounds.
+  mesh.materials.push_back(italy::MaterialAsset{});
   return mesh;
 }
 

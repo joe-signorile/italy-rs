@@ -21,7 +21,11 @@ public:
   // yaw/pitch so re-framing doesn't spin the view around.
   void frame(const glm::vec3 &center, float boundingRadius) {
     target_ = center;
-    distance_ = std::max(boundingRadius / std::tan(fovYRadians * 0.5f) * 1.4f, kMinDistance);
+    // 1.15, not 1.4. boundingRadius is the AABB half-diagonal, i.e. already
+    // the *circumscribed* sphere — for anything not roughly cubic (a bike, a
+    // bottle) that sphere is much larger than the object, so a further 40%
+    // margin on top left the subject small in frame.
+    distance_ = std::max(boundingRadius / std::tan(fovYRadians * 0.5f) * 1.15f, kMinDistance);
   }
 
   glm::mat4 viewMatrix() const;

@@ -78,7 +78,7 @@ fi
 log "OptiX SDK OK: ${OPTIX_ROOT}"
 
 # --- Build -----------------------------------------------------------
-# monkey-boy: no automatic CUDA-host-compiler fallback — humans.md notes
+# claudia: no automatic CUDA-host-compiler fallback — humans.md notes
 # g++-13 as a pinned fallback in case a newer default gcc breaks nvcc; if
 # the configure/build below fails on a host-compiler compat error, retry
 # with: cmake -B build -G Ninja -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13

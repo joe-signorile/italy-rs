@@ -86,7 +86,7 @@ AppWindow::AppWindow(const char *title, int width, int height, GLFWwindow *share
   ImGui::SetCurrentContext(imguiContext_);
 
   ImGui::StyleColorsDark();
-  // monkey-boy: window position/size are fixed defaults, not persisted
+  // claudia: window position/size are fixed defaults, not persisted
   // across restarts — an imgui.ini per OS window has no meaningful
   // intra-window layout left to save now that the OS window IS the panel.
   // Revisit if users find re-arranging windows every launch annoying.

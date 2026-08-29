@@ -4,7 +4,7 @@
 // glTex(Sub)Image2D — those we call directly, no loader needed); PBO
 // functions aren't part of that ABI on any platform.
 //
-// monkey-boy: hand-resolving 4 function pointers instead of pulling in a full
+// claudia: hand-resolving 4 function pointers instead of pulling in a full
 // loader (GLAD/GLEW) — upgrade to one if later phases need much more of
 // modern GL than this.
 #pragma once

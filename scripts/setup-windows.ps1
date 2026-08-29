@@ -61,7 +61,7 @@ if (-not (Test-Cmd nvcc)) {
 Write-Step "CUDA Toolkit OK: $((& nvcc --version | Select-Object -Last 1))"
 
 # --- MSVC (nvcc's Windows host compiler) -----------------------------------
-# monkey-boy: picks whatever `vswhere -latest` reports; doesn't handle
+# claudia: picks whatever `vswhere -latest` reports; doesn't handle
 # multiple side-by-side VS installs or ARM64 Windows.
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vcToolsId = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"

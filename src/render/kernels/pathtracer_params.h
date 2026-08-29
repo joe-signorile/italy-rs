@@ -11,9 +11,21 @@ enum MaterialType : unsigned int {
   MATERIAL_MIRROR = 1,
   MATERIAL_GLASS = 2,
   MATERIAL_LIGHT = 3,
-  // Diffuse BRDF (same NEE/MIS/bounce logic as MATERIAL_DIFFUSE) but the
-  // albedo comes from a texture sampled with the hit triangle's interpolated
-  // UV instead of a constant — used for phase-3 GLB-loaded meshes.
+  // Lambert diffuse + GGX metallic-roughness specular (see ShadingMaterial/
+  // evalBsdf/sampleBsdf in pathtracer.cu), textured per glTF material —
+  // originally phase-3's flat-textured-diffuse-only material, extended in
+  // the GGX pass. albedo/uvs/normals/tangents/materials/triangleMaterial on
+  // HitGroupData carry everything a triangle needs to look itself up.
+  //
+  // claudia: no transmission/dielectric variant — this is reflectance only,
+  // there's no glTF-sourced glass. __closesthit__photon's specular-bounce
+  // branch (the one that sets causticEligible) only recognizes
+  // MATERIAL_MIRROR/MATERIAL_GLASS, so a loaded mesh/voxel/SDF scene cannot
+  // seed a caustic no matter how photon emission is set up — confirmed
+  // before deciding not to lift the photon-mapping gate for these scenes
+  // (see enablePhotonMapping's comment in optix_renderer.cpp). Upgrade if a
+  // real asset ships a KHR_materials_transmission/volume material worth
+  // honoring.
   MATERIAL_TEXTURED_DIFFUSE = 4,
   // Diffuse BRDF, custom-AABB voxel primitive; albedo is a per-voxel baked
   // color, shading normal comes from which of the 6 box faces was entered
@@ -59,6 +71,12 @@ struct Params {
   unsigned int samplesPerLaunch;
   float exposure; // linear multiplier applied just before tonemapping (phase 9 UI control)
 
+  // realism: ceiling on any single path sample's radiance, in linear scene
+  // units, applied before accumulation (see clampFirefly in pathtracer.cu).
+  // Trades a little energy in the extreme highlights for the absence of
+  // permanent white specks. <= 0 disables. Doctrine rung 1 over rung 3.
+  float fireflyClamp;
+
   // Phase 8: which view transform applyTonemapAndQuantize() (pathtracer.cu)
   // uses to convert linear HDR into the displayed 8-bit sRGB image. Values
   // mirror italy::TonemapOperator (optix_renderer.h) by convention, not a
@@ -74,7 +92,31 @@ struct Params {
   unsigned int denoiserEnabled;
   float4 *denoisedBuffer;
 
-  float3 eye, U, V, W; // camera basis, W points along view direction (not normalized: encodes FOV)
+  // Scene bounding sphere — used by environment-based photon emission
+  // (__raygen__photon) to place an emission origin outside the geometry when
+  // there's no quad light to emit from. Unrelated to the camera. No default
+  // member initializers: Params is a __constant__ global on the device side,
+  // which CUDA requires to be trivially constructible — every field here is
+  // set explicitly host-side before upload (see optix_renderer.cpp's
+  // `Params params{};` then field-by-field assignment), same as every other
+  // field in this struct.
+  float3 sceneBoundsCenter;
+  float sceneBoundsRadius;
+
+  // Camera basis. W is the unit view axis; U and V carry the FOV scale, so
+  // d.x*U + d.y*V + W is the (unnormalized) ray through NDC point d.
+  float3 eye, U, V, W;
+
+  // Thin-lens depth of field. aperture is the lens radius in world units;
+  // 0 is a pinhole. focusDistance is measured along W, so the plane in focus
+  // is flat rather than spherical — which is what a real lens does.
+  float aperture;
+  float focusDistance;
+
+  // Rotation of the environment about +Y, radians. Folded into the single
+  // direction<->uv mapping shared by lookup, pdf evaluation and sampling, so
+  // the three cannot disagree (they are compared directly in the MIS weight).
+  float envRotation;
 
   QuadLight light;
   OptixTraversableHandle handle;
@@ -124,6 +166,20 @@ struct Params {
   unsigned int gatherHitSbtOffset;
 };
 
+// One glTF material, device side. Texture handles are 0 when absent.
+// Mirrors italy::MaterialAsset (io/mesh_asset.h) without inheriting its
+// std::vector/glm dependencies, the same "device-side types stay device-side"
+// split MaterialType and TonemapOperator already use.
+struct GpuMaterial {
+  float3 baseColorFactor;
+  float metallic;
+  float roughness;
+  float normalScale;
+  cudaTextureObject_t baseColorTex;         // sRGB-decoded in texture hardware
+  cudaTextureObject_t metallicRoughnessTex; // linear; glTF packs roughness in G, metallic in B
+  cudaTextureObject_t normalTex;            // linear, tangent-space
+};
+
 struct RayGenData {};
 
 struct MissData {
@@ -145,7 +201,13 @@ struct HitGroupData {
   // matches the CPU-side MeshAsset layout, no index buffer needed on device).
   float3 *normals = nullptr;
   float2 *uvs = nullptr;
-  cudaTextureObject_t baseColorTex = 0; // 0 => no texture, use albedo as a flat color
+  float4 *tangents = nullptr; // xyz tangent, w bitangent sign; for normal mapping
+  // A whole glTF scene is one GAS, so material identity is per triangle rather
+  // than per SBT record: one hit-group record cannot describe 169 meshes with
+  // different materials, and splitting into one record per primitive would
+  // rebuild the SBT around the asset's authoring structure for no gain.
+  unsigned int *triangleMaterial = nullptr;
+  GpuMaterial *materials = nullptr;
 
   // Only used when materialType == MATERIAL_VOXEL, indexed by
   // optixGetPrimitiveIndex(): the intersection program does its own ray/box
@@ -154,6 +216,24 @@ struct HitGroupData {
   // voxel's baked color.
   OptixAabb *voxelAabbs = nullptr;
   float3 *voxelColors = nullptr;
+
+  // Only used by GeometryKind::SolidSphere objects — the custom-primitive
+  // stand-in for a dielectric sphere. OptiX's *built-in* sphere primitive is
+  // documented hollow (Programming Guide 9.1, 9.6 "Back-face culling": "if a
+  // ray starts inside a sphere primitive ... it will not hit that
+  // primitive"), so a refracted ray inside one never gets an exit hit and
+  // the glass is a single interface rather than a solid. Dielectrics
+  // therefore get their own intersector, and a custom IS cannot call
+  // optixGetSphereData(), so the geometry has to travel through the SBT.
+  // sphereRadius > 0 is what marks a record as a solid sphere.
+  float3 sphereCenter{};
+  float sphereRadius = 0.0f;
+
+  // Beer-Lambert extinction, per channel, in units of 1/distance: an
+  // interior segment of length t is attenuated by exp(-extinction * t).
+  // This is what makes glass read as *glass* rather than as a clear shell —
+  // thick parts absorb more than thin ones. Zero = perfectly clear.
+  float3 extinction{};
 
   // Only used when materialType == MATERIAL_SDF: a dense flattened
   // (z*ny+y)*nx+x grid of signed distances, sphere-traced/gradient-shaded by

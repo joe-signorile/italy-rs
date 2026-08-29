@@ -17,10 +17,20 @@ bool loadEnvironmentMap(const std::string &path, EnvironmentMap &out, std::strin
     err = "failed to load HDR file: " + path;
     return false;
   }
+  std::vector<float> pixels(data, data + static_cast<size_t>(w) * h * 3);
+  stbi_image_free(data);
+
+  if (!buildEnvironmentCdf(w, h, pixels, out, err)) {
+    err = path + ": " + err;
+    return false;
+  }
+  return true;
+}
+
+bool buildEnvironmentCdf(int w, int h, const std::vector<float> &pixels, EnvironmentMap &out, std::string &err) {
+  out.pixels = pixels;
   out.width = w;
   out.height = h;
-  out.pixels.assign(data, data + static_cast<size_t>(w) * h * 3);
-  stbi_image_free(data);
 
   // Build the piecewise-constant 2D distribution, luminance-weighted (Rec.
   // 709 coefficients — the exact weighting only affects *where* NEE biases
@@ -54,7 +64,7 @@ bool loadEnvironmentMap(const std::string &path, EnvironmentMap &out, std::strin
     out.marginalCdf[y + 1] = out.marginalCdf[y] + rowIntegral[y];
   const float total = out.marginalCdf[h];
   if (total <= 0.0f) {
-    err = path + ": environment map is entirely black";
+    err = "environment map is entirely black";
     return false;
   }
   for (int y = 0; y <= h; ++y)

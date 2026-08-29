@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -41,13 +42,10 @@ bool cameraChanged(const italy::OrbitCamera &a, const italy::OrbitCamera &b) {
   return glm::dot(da, da) > 1e-10f || glm::dot(dt, dt) > 1e-10f;
 }
 
-// Debug/verification aid: set ITALY_DUMP_FRAME=path.png to write out the
-// accumulated render and exit — lets a render-correctness check happen
-// without eyeballing a live window.
-void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *window) {
-  const char *path = std::getenv("ITALY_DUMP_FRAME");
-  if (!path)
-    return;
+// Reads the renderer's GL texture back and writes it as a PNG. Shared by the
+// scripted ITALY_DUMP_FRAME hook and the UI's Render-to-PNG button, so the
+// image you export by hand is byte-identical to the one a script captures.
+bool writeFramePng(const italy::OptixRenderer &renderer, const char *path) {
   const int w = renderer.width();
   const int h = renderer.height();
   std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
@@ -60,8 +58,19 @@ void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *wind
   for (int row = 0; row < h; ++row)
     std::memcpy(&flipped[static_cast<size_t>(row) * w * 4], &pixels[static_cast<size_t>(h - 1 - row) * w * 4],
                 static_cast<size_t>(w) * 4);
-  stbi_write_png(path, w, h, 4, flipped.data(), w * 4);
-  std::fprintf(stderr, "italy: wrote debug frame to %s\n", path);
+  const bool ok = stbi_write_png(path, w, h, 4, flipped.data(), w * 4) != 0;
+  std::fprintf(stderr, "italy: %s %dx%d frame to %s\n", ok ? "wrote" : "FAILED to write", w, h, path);
+  return ok;
+}
+
+// Debug/verification aid: set ITALY_DUMP_FRAME=path.png to write out the
+// accumulated render and exit — lets a render-correctness check happen
+// without eyeballing a live window.
+void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *window) {
+  const char *path = std::getenv("ITALY_DUMP_FRAME");
+  if (!path)
+    return;
+  writeFramePng(renderer, path);
   glfwSetWindowShouldClose(window, GLFW_TRUE);
 }
 
@@ -70,6 +79,11 @@ void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *wind
 // to one — relying on the (already-guaranteed-by-the-standard-for-scoped-
 // enums-with-no-explicit-type) size/alignment match to work is the kind of
 // thing worth spelling out rather than leaving implicit.
+// Shared by the UI slider and the CLI parser so the two can't disagree about
+// what a legal resampling resolution is.
+constexpr int kMinResolution = 8;
+constexpr int kMaxResolution = 512;
+
 enum class Representation : int { Mesh, Voxel, Sdf };
 enum class EnvChoice : int { None, Overcast, Midnight, Noon, Custom };
 
@@ -88,14 +102,28 @@ struct AppState {
 
   char glbPathBuf[512] = "";
   Representation representation = Representation::Mesh;
-  int resolution = 64;
+  // 128, not 64. The SDF grid is sized from the mesh's actual extents rather
+  // than resolution^3, so raising this is close to free (measured on a 1.9M
+  // triangle asset: 6.5s at 64 vs 6.8s at 160) while 64 leaves any structure
+  // thinner than a cell — spokes, cables, thin brackets — to break up into
+  // floating fragments. Voxel occupancy is sparse, so it scales gently too.
+  int resolution = 128;
   EnvChoice envChoice = EnvChoice::None;
   char hdriPathBuf[512] = "";
+  bool groundPlane = true;
 
-  float exposure = 1.0f;
-  int samplesPerLaunch = 1;
-  bool denoise = false;
-  italy::TonemapOperator tonemap = italy::TonemapOperator::AgX;
+  italy::RenderSettings render;
+
+  // Render resolution. Changing it goes through the same all-or-nothing
+  // rebuildScene() as everything else, because OptixRenderer owns the
+  // accumulator, PBO, GL texture and denoiser and sizes all four at
+  // construction — one rebuild path beats a second, parallel resize path.
+  int renderWidth = 960;
+  int renderHeight = 540;
+
+  char exportPathBuf[512] = "render.png";
+  int exportSamples = 512;
+  bool exportPending = false; // set by the UI, serviced by the viewport callback
 
   std::string statusLine = "Showing the built-in test scene.";
 };
@@ -115,8 +143,9 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
     if (italy::loadGlb(state.glbPathBuf, state.meshAsset, err)) {
       state.haveMesh = true;
       state.statusLine = "Loaded " + std::string(state.glbPathBuf) + " (" +
-                          std::to_string(state.meshAsset.positions.size() / 3) + " tris" +
-                          (state.meshAsset.hasBaseColorTexture ? ", textured)" : ")");
+                          std::to_string(state.meshAsset.triangleCount()) + " tris, " +
+                          std::to_string(state.meshAsset.materials.size()) + " materials, " +
+                          std::to_string(state.meshAsset.textures.size()) + " textures)";
     } else {
       state.statusLine = "Failed to load " + std::string(state.glbPathBuf) + ": " + err;
     }
@@ -175,8 +204,9 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
     source.mesh = &state.meshAsset;
   if (state.haveEnvironment)
     source.environment = &state.environment;
+  source.groundPlane = state.groundPlane;
 
-  renderer = std::make_unique<italy::OptixRenderer>(960, 540, source);
+  renderer = std::make_unique<italy::OptixRenderer>(state.renderWidth, state.renderHeight, source);
   if (state.haveMesh)
     camera.frame(renderer->sceneBoundsCenter(), renderer->sceneBoundsRadius());
 }
@@ -196,14 +226,38 @@ int main(int argc, char **argv) {
     const size_t eq = arg.find('=');
     const std::string key = eq != std::string::npos ? arg.substr(0, eq) : arg;
     const std::string value = eq != std::string::npos ? arg.substr(eq + 1) : std::string();
+    // Resampling resolution is clamped, not trusted: --voxel=0 reached
+    // glm::clamp(v, 0, resolution - 1) with a negative upper bound, and
+    // absurdly large values allocate a dense SDF grid before anything can
+    // report a problem. Same bounds the UI slider enforces.
+    auto parseResolution = [&](const std::string &v) {
+      if (v.empty())
+        return state.resolution;
+      const int n = std::atoi(v.c_str());
+      if (n < kMinResolution || n > kMaxResolution) {
+        std::fprintf(stderr, "italy: resolution %d out of range [%d, %d], clamping\n", n, kMinResolution,
+                     kMaxResolution);
+      }
+      return std::clamp(n, kMinResolution, kMaxResolution);
+    };
+    auto parseDimension = [&](const std::string &v, int fallback, const char *what) {
+      const int n = std::atoi(v.c_str());
+      if (n < 64 || n > 8192) {
+        std::fprintf(stderr, "italy: %s %d out of range [64, 8192], keeping %d\n", what, n, fallback);
+        return fallback;
+      }
+      return n;
+    };
     if (key == "--voxel") {
       state.representation = Representation::Voxel;
-      if (!value.empty())
-        state.resolution = std::atoi(value.c_str());
+      state.resolution = parseResolution(value);
     } else if (key == "--sdf") {
       state.representation = Representation::Sdf;
-      if (!value.empty())
-        state.resolution = std::atoi(value.c_str());
+      state.resolution = parseResolution(value);
+    } else if (key == "--width") {
+      state.renderWidth = parseDimension(value, state.renderWidth, "--width");
+    } else if (key == "--height") {
+      state.renderHeight = parseDimension(value, state.renderHeight, "--height");
     } else if (key == "--env") {
       if (value == "overcast")
         state.envChoice = EnvChoice::Overcast;
@@ -239,14 +293,24 @@ int main(int argc, char **argv) {
   // otherwise, so scripted before/after verification needs a way in that
   // doesn't require actually clicking the checkbox/radio button.
   if (std::getenv("ITALY_FORCE_DENOISE"))
-    state.denoise = true;
+    state.render.denoise = true;
+  if (const char *fc = std::getenv("ITALY_FIREFLY_CLAMP"))
+    state.render.fireflyClamp = static_cast<float>(std::atof(fc));
+  if (std::getenv("ITALY_NO_GROUND"))
+    state.groundPlane = false;
+  if (const char *ap = std::getenv("ITALY_APERTURE"))
+    state.render.aperture = static_cast<float>(std::atof(ap));
+  if (const char *fd = std::getenv("ITALY_FOCUS_DISTANCE"))
+    state.render.focusDistance = static_cast<float>(std::atof(fd));
+  if (const char *er = std::getenv("ITALY_ENV_ROTATION"))
+    state.render.envRotation = static_cast<float>(std::atof(er));
   if (const char *tm = std::getenv("ITALY_TONEMAP")) {
     const std::string v = tm;
-    if (v == "agx") state.tonemap = italy::TonemapOperator::AgX;
-    else if (v == "reinhard") state.tonemap = italy::TonemapOperator::Reinhard;
-    else if (v == "aces") state.tonemap = italy::TonemapOperator::Aces;
-    else if (v == "hable") state.tonemap = italy::TonemapOperator::Hable;
-    else if (v == "clamp") state.tonemap = italy::TonemapOperator::Clamp;
+    if (v == "agx") state.render.tonemap = italy::TonemapOperator::AgX;
+    else if (v == "reinhard") state.render.tonemap = italy::TonemapOperator::Reinhard;
+    else if (v == "aces") state.render.tonemap = italy::TonemapOperator::Aces;
+    else if (v == "hable") state.render.tonemap = italy::TonemapOperator::Hable;
+    else if (v == "clamp") state.render.tonemap = italy::TonemapOperator::Clamp;
     else std::fprintf(stderr, "italy: unknown ITALY_TONEMAP '%s'\n", v.c_str());
   }
 
@@ -290,8 +354,21 @@ int main(int argc, char **argv) {
           renderer->resetAccumulation();
           prevCamera = camera;
         }
-        renderer->render(camera, static_cast<unsigned int>(state.samplesPerLaunch), state.exposure, state.denoise,
-                          state.tonemap);
+        renderer->render(camera, state.render);
+
+        // Render-to-PNG: hold the UI while accumulation catches up to the
+        // requested sample count, then write through the same path the
+        // scripted hook uses. Deliberately not a separate offline render —
+        // the accumulator already converges progressively, so "keep going
+        // until subframe N" is the whole feature.
+        if (state.exportPending) {
+          if (renderer->subframeIndex() >= static_cast<unsigned int>(state.exportSamples)) {
+            state.statusLine = writeFramePng(*renderer, state.exportPathBuf)
+                                   ? "Wrote " + std::string(state.exportPathBuf)
+                                   : "Failed to write " + std::string(state.exportPathBuf);
+            state.exportPending = false;
+          }
+        }
 
         const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
         const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
@@ -327,7 +404,7 @@ int main(int argc, char **argv) {
           ImGui::SameLine();
           apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
           if (state.representation != Representation::Mesh)
-            ImGui::SliderInt("Resolution", &state.resolution, 8, 256);
+            ImGui::SliderInt("Resolution", &state.resolution, kMinResolution, kMaxResolution);
         }
 
         ImGui::Separator();
@@ -344,6 +421,8 @@ int main(int argc, char **argv) {
         if (state.envChoice == EnvChoice::Custom)
           ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
 
+        apply |= ImGui::Checkbox("Ground plane", &state.groundPlane);
+
         // Note: RadioButton edits above already trigger `apply` on click,
         // same as the button — representation/HDRI changes need a full scene
         // rebuild either way, so there's no cheaper "preview" path to offer
@@ -354,20 +433,68 @@ int main(int argc, char **argv) {
           applyRequested = true;
 
         ImGui::Separator();
-        ImGui::SliderFloat("Exposure", &state.exposure, 0.1f, 8.0f);
-        ImGui::SliderInt("Samples/launch", &state.samplesPerLaunch, 1, 16);
-        ImGui::Checkbox("Denoiser", &state.denoise);
+        ImGui::SliderFloat("Exposure", &state.render.exposure, 0.1f, 8.0f);
+        int spl = static_cast<int>(state.render.samplesPerLaunch);
+        if (ImGui::SliderInt("Samples/launch", &spl, 1, 16))
+          state.render.samplesPerLaunch = static_cast<unsigned int>(spl);
+        ImGui::Checkbox("Denoiser", &state.render.denoise);
+
+        // Unlike exposure/tonemap/denoise above, everything from here down
+        // changes what is written into the accumulator rather than how it is
+        // displayed, so each one has to restart accumulation.
+        if (ImGui::SliderFloat("Firefly clamp", &state.render.fireflyClamp, 0.0f, 50.0f, "%.1f (0 = off)"))
+          renderer->resetAccumulation();
+
+        ImGui::Separator();
+        ImGui::Text("Lens");
+        // Aperture is a world-space radius, so a fixed slider range would be
+        // meaningless across scenes that differ in scale by orders of
+        // magnitude. Derive it from the scene the camera is actually framing.
+        const float apertureMax = renderer->sceneBoundsRadius() * 0.25f;
+        if (ImGui::SliderFloat("Aperture", &state.render.aperture, 0.0f, apertureMax, "%.4f (0 = pinhole)"))
+          renderer->resetAccumulation();
+        if (ImGui::SliderFloat("Focus distance", &state.render.focusDistance, 0.0f,
+                                renderer->sceneBoundsRadius() * 8.0f, "%.3f (0 = orbit target)"))
+          renderer->resetAccumulation();
+
+        if (state.haveEnvironment) {
+          ImGui::Separator();
+          if (ImGui::SliderAngle("Environment rotation", &state.render.envRotation, 0.0f, 360.0f))
+            renderer->resetAccumulation();
+        }
 
         ImGui::Text("Tonemap");
-        ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.tonemap), 0);
+        ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.render.tonemap), 0);
         ImGui::SameLine();
-        ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.tonemap), 1);
+        ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.render.tonemap), 1);
         ImGui::SameLine();
-        ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.tonemap), 2);
+        ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.render.tonemap), 2);
         ImGui::SameLine();
-        ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.tonemap), 3);
+        ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.render.tonemap), 3);
         ImGui::SameLine();
-        ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.tonemap), 4);
+        ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.render.tonemap), 4);
+
+        ImGui::Separator();
+        ImGui::Text("Output");
+        int dims[2] = {state.renderWidth, state.renderHeight};
+        if (ImGui::InputInt2("Render size", dims)) {
+          state.renderWidth = std::clamp(dims[0], 64, 8192);
+          state.renderHeight = std::clamp(dims[1], 64, 8192);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Resize"))
+          applyRequested = true; // same all-or-nothing rebuild as everything else
+
+        ImGui::InputText("PNG path", state.exportPathBuf, sizeof(state.exportPathBuf));
+        ImGui::SliderInt("Export samples", &state.exportSamples, 16, 4096);
+        if (state.exportPending) {
+          ImGui::Text("Rendering... subframe %u / %d", renderer->subframeIndex(), state.exportSamples);
+          if (ImGui::Button("Cancel export"))
+            state.exportPending = false;
+        } else if (ImGui::Button("Render to PNG")) {
+          renderer->resetAccumulation();
+          state.exportPending = true;
+        }
 
         ImGui::Separator();
         const glm::vec3 pos = camera.position();

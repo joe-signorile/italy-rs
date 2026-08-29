@@ -51,7 +51,12 @@ void contextLogCallback(unsigned int level, const char *tag, const char *message
   std::fprintf(stderr, "[optix][%u][%s] %s\n", level, tag, message);
 }
 
-enum class GeometryKind { Triangle, Sphere, Voxel, Sdf };
+// Sphere      = OptiX built-in sphere primitive. Hardware path, but hollow
+//               and back-face culled, so it can only carry opaque materials.
+// SolidSphere = custom-primitive sphere with our own intersector, which does
+//               report exit hits. Required for dielectrics — see
+//               __intersection__sphere_solid in pathtracer.cu.
+enum class GeometryKind { Triangle, Sphere, SolidSphere, Voxel, Sdf };
 
 // One static-geometry object in the scene: a GAS (built once) plus the
 // material record it contributes to the SBT. `kind` selects which hit-group
@@ -77,6 +82,7 @@ struct OptixRenderer::Impl {
   OptixProgramGroup missOcclusionPG = nullptr;
   OptixProgramGroup hitTrianglePG = nullptr;
   OptixProgramGroup hitSpherePG = nullptr;
+  OptixProgramGroup hitSolidSpherePG = nullptr;
   OptixProgramGroup hitVoxelPG = nullptr;
   OptixProgramGroup hitSdfPG = nullptr;
 
@@ -91,6 +97,7 @@ struct OptixRenderer::Impl {
   OptixProgramGroup photonMissPG = nullptr;
   OptixProgramGroup photonHitTrianglePG = nullptr;
   OptixProgramGroup photonHitSpherePG = nullptr;
+  OptixProgramGroup photonHitSolidSpherePG = nullptr;
   OptixProgramGroup gatherHitPG = nullptr;
   OptixProgramGroup gatherMissPG = nullptr;
 
@@ -131,11 +138,15 @@ struct OptixRenderer::Impl {
   float boundsRadius = 3.0f;
 
   // Device buffers backing a MATERIAL_TEXTURED_DIFFUSE object's per-vertex
-  // attributes and optional base-color texture — freed in destroy().
+  // attributes, per-triangle material index, and material/texture tables —
+  // freed in destroy().
   CUdeviceptr meshNormals = 0;
   CUdeviceptr meshUvs = 0;
-  cudaArray_t baseColorArray = nullptr;
-  cudaTextureObject_t baseColorTexObj = 0;
+  CUdeviceptr meshTangents = 0;
+  CUdeviceptr meshTriangleMaterial = 0;
+  CUdeviceptr meshMaterials = 0;
+  std::vector<cudaArray_t> textureArrays;
+  std::vector<cudaTextureObject_t> textureObjects;
 
   // Device buffers backing a MATERIAL_VOXEL object's per-primitive AABBs
   // (also feeds __intersection__voxel) and baked colors — freed in destroy().
@@ -150,6 +161,7 @@ struct OptixRenderer::Impl {
   // gates whether buildFixedTestScene/buildMeshScene/etc add a quad light at
   // all (see addBoundsKeyLight): the two lighting modes aren't blended.
   bool hasEnvironment = false;
+  bool wantGroundPlane = true;
   cudaArray_t envArray = nullptr;
   cudaTextureObject_t envTexObj = 0;
   CUdeviceptr envMarginalCdfBuffer = 0;
@@ -181,14 +193,22 @@ struct OptixRenderer::Impl {
   ~Impl() { destroy(); }
 
   void destroy() {
-    if (baseColorTexObj)
-      cudaDestroyTextureObject(baseColorTexObj);
-    if (baseColorArray)
-      cudaFreeArray(baseColorArray);
+    for (cudaTextureObject_t obj : textureObjects)
+      if (obj)
+        cudaDestroyTextureObject(obj);
+    for (cudaArray_t arr : textureArrays)
+      if (arr)
+        cudaFreeArray(arr);
     if (meshNormals)
       cudaFree(reinterpret_cast<void *>(meshNormals));
     if (meshUvs)
       cudaFree(reinterpret_cast<void *>(meshUvs));
+    if (meshTangents)
+      cudaFree(reinterpret_cast<void *>(meshTangents));
+    if (meshTriangleMaterial)
+      cudaFree(reinterpret_cast<void *>(meshTriangleMaterial));
+    if (meshMaterials)
+      cudaFree(reinterpret_cast<void *>(meshMaterials));
     if (voxelAabbBuffer)
       cudaFree(reinterpret_cast<void *>(voxelAabbBuffer));
     if (voxelColorBuffer)
@@ -258,6 +278,8 @@ struct OptixRenderer::Impl {
       optixProgramGroupDestroy(gatherMissPG);
     if (gatherHitPG)
       optixProgramGroupDestroy(gatherHitPG);
+    if (photonHitSolidSpherePG)
+      optixProgramGroupDestroy(photonHitSolidSpherePG);
     if (photonHitSpherePG)
       optixProgramGroupDestroy(photonHitSpherePG);
     if (photonHitTrianglePG)
@@ -270,6 +292,8 @@ struct OptixRenderer::Impl {
       optixProgramGroupDestroy(hitSdfPG);
     if (hitVoxelPG)
       optixProgramGroupDestroy(hitVoxelPG);
+    if (hitSolidSpherePG)
+      optixProgramGroupDestroy(hitSolidSpherePG);
     if (hitSpherePG)
       optixProgramGroupDestroy(hitSpherePG);
     if (hitTrianglePG)
@@ -358,6 +382,16 @@ struct OptixRenderer::Impl {
     hitSphereDesc.hitgroup.moduleIS = sphereModule;
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitSpherePG));
 
+    // Dielectrics: our own sphere intersector (the built-in one is hollow).
+    OptixProgramGroupDesc hitSolidSphereDesc{};
+    hitSolidSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitSolidSphereDesc.hitgroup.moduleCH = module;
+    hitSolidSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+    hitSolidSphereDesc.hitgroup.moduleIS = module;
+    hitSolidSphereDesc.hitgroup.entryFunctionNameIS = "__intersection__sphere_solid";
+    OPTIX_CHECK_LOG(
+        optixProgramGroupCreate(context, &hitSolidSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitSolidSpherePG));
+
     OptixProgramGroupDesc hitVoxelDesc{};
     hitVoxelDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
     hitVoxelDesc.hitgroup.moduleCH = module;
@@ -407,6 +441,15 @@ struct OptixRenderer::Impl {
     OPTIX_CHECK_LOG(
         optixProgramGroupCreate(context, &photonHitSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonHitSpherePG));
 
+    OptixProgramGroupDesc photonHitSolidSphereDesc{};
+    photonHitSolidSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    photonHitSolidSphereDesc.hitgroup.moduleCH = module;
+    photonHitSolidSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__photon";
+    photonHitSolidSphereDesc.hitgroup.moduleIS = module;
+    photonHitSolidSphereDesc.hitgroup.entryFunctionNameIS = "__intersection__sphere_solid";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &photonHitSolidSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &photonHitSolidSpherePG));
+
     OptixProgramGroupDesc gatherHitDesc{};
     gatherHitDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
     gatherHitDesc.hitgroup.moduleAH = module;
@@ -430,10 +473,11 @@ struct OptixRenderer::Impl {
   }
 
   void buildPipeline() {
-    OptixProgramGroup groups[] = {raygenPG,       missRadiancePG,      missOcclusionPG,   hitTrianglePG,
-                                   hitSpherePG,    hitVoxelPG,          hitSdfPG,          photonRaygenPG,
-                                   photonMissPG,   photonHitTrianglePG, photonHitSpherePG, gatherHitPG,
-                                   gatherMissPG,   tonemapRaygenPG};
+    OptixProgramGroup groups[] = {raygenPG,           missRadiancePG,      missOcclusionPG,   hitTrianglePG,
+                                   hitSpherePG,        hitSolidSpherePG,    hitVoxelPG,        hitSdfPG,
+                                   photonRaygenPG,     photonMissPG,        photonHitTrianglePG,
+                                   photonHitSpherePG,  photonHitSolidSpherePG, gatherHitPG,
+                                   gatherMissPG,       tonemapRaygenPG};
     OptixPipelineLinkOptions linkOptions{};
     // raygen -> radiance hit -> occlusion shadow ray (2), or raygen ->
     // radiance hit -> gather query (2), or photon-raygen -> photon-hit (1,
@@ -453,6 +497,48 @@ struct OptixRenderer::Impl {
     // (top-level IAS -> per-object GAS).
     OPTIX_CHECK(optixPipelineSetStackSize(pipeline, dcFromTraversal, dcFromState, contStack, 2));
   }
+
+  // Every acceleration structure in this renderer wants the same
+  // build/sync/free-temp dance; this is the one place it lives.
+  //
+  // PREFER_FAST_TRACE by default: each AS is built once at scene load and
+  // then traced for the rest of the session, so build time is irrelevant and
+  // traversal time is everything (doctrine rung 2). The photon GAS is the one
+  // exception — it is rebuilt every frame, so it passes FAST_BUILD instead.
+  //
+  // Callers whose closest-hit programs call optixGetTriangleVertexData or
+  // optixGetSphereData must pass ALLOW_RANDOM_VERTEX_ACCESS. That is a
+  // requirement, not a hint: without it those queries are undefined. It is
+  // also what makes the GAS retain a copy of the vertex data, which is why
+  // callers can free their input buffers as soon as this returns. It is only
+  // meaningful on triangle/sphere GAS builds — not custom primitives, not the
+  // IAS — so it is opt-in per call site rather than baked in here.
+  OptixTraversableHandle buildAccel(const OptixBuildInput &input, CUdeviceptr &outBuffer,
+                                     unsigned int buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE) {
+    OptixAccelBuildOptions accelOptions{};
+    accelOptions.buildFlags = buildFlags;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+
+    OptixAccelBufferSizes sizes{};
+    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
+
+    CUdeviceptr tempBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&outBuffer), sizes.outputSizeInBytes));
+
+    OptixTraversableHandle handle = 0;
+    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
+                                 outBuffer, sizes.outputSizeInBytes, &handle, nullptr, 0));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    return handle;
+  }
+
+  // Geometry whose shading normal is derived on the fly via
+  // optixGetTriangleVertexData / optixGetSphereData (see
+  // computeGeometricNormal in pathtracer.cu).
+  static constexpr unsigned int kTracedGeometryFlags =
+      OPTIX_BUILD_FLAG_PREFER_FAST_TRACE | OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS;
 
   CUdeviceptr uploadTriangles(const std::vector<float3> &verts) {
     CUdeviceptr d;
@@ -479,21 +565,7 @@ struct OptixRenderer::Impl {
     input.triangleArray.flags = flags;
     input.triangleArray.numSbtRecords = 1;
 
-    OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-
-    OptixAccelBufferSizes sizes{};
-    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
-
-    CUdeviceptr tempBuffer;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
-
-    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
-                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    obj.gas = buildAccel(input, obj.gasBuffer, kTracedGeometryFlags);
     cudaFree(reinterpret_cast<void *>(vertexBuffer));
     return obj;
   }
@@ -518,23 +590,41 @@ struct OptixRenderer::Impl {
     input.sphereArray.flags = flags;
     input.sphereArray.numSbtRecords = 1;
 
-    OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-
-    OptixAccelBufferSizes sizes{};
-    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
-
-    CUdeviceptr tempBuffer;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
-
-    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
-                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    obj.gas = buildAccel(input, obj.gasBuffer, kTracedGeometryFlags);
     cudaFree(reinterpret_cast<void *>(vertexBuffer));
     cudaFree(reinterpret_cast<void *>(radiusBuffer));
+    return obj;
+  }
+
+  // A dielectric sphere as a custom primitive: one AABB feeding the BVH, with
+  // the actual centre/radius carried in the SBT record for
+  // __intersection__sphere_solid to solve against. Same shape as
+  // buildSdfObject() — the AABB only ever feeds the build, so it is freed
+  // straight after, unlike the voxel path which re-reads its AABB array at
+  // intersection time.
+  SceneObject buildSolidSphereObject(float3 center, float radius, HitGroupData material) {
+    SceneObject obj;
+    obj.kind = GeometryKind::SolidSphere;
+    obj.material = material;
+    obj.material.sphereCenter = center;
+    obj.material.sphereRadius = radius;
+
+    OptixAabb aabb{center.x - radius, center.y - radius, center.z - radius,
+                   center.x + radius, center.y + radius, center.z + radius};
+    CUdeviceptr aabbBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&aabbBuffer), sizeof(OptixAabb)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(aabbBuffer), &aabb, sizeof(OptixAabb), cudaMemcpyHostToDevice));
+
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    input.customPrimitiveArray.aabbBuffers = &aabbBuffer;
+    input.customPrimitiveArray.numPrimitives = 1;
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.customPrimitiveArray.flags = flags;
+    input.customPrimitiveArray.numSbtRecords = 1;
+
+    obj.gas = buildAccel(input, obj.gasBuffer);
+    cudaFree(reinterpret_cast<void *>(aabbBuffer));
     return obj;
   }
 
@@ -560,53 +650,101 @@ struct OptixRenderer::Impl {
         {corner, corner + v1, corner + v1 + v2, corner, corner + v1 + v2, corner + v2}, lightMat));
   }
 
+  // Uploads one 8-bit RGBA texture. `srgb` must match how the data is meant
+  // to be read: base colour is sRGB-encoded and gets decoded in texture
+  // hardware for free, while metallic-roughness and normal maps are linear
+  // *data* — decoding those would bend every normal toward +Z and skew
+  // roughness, so the flag travels with the texture rather than being
+  // assumed here.
+  cudaTextureObject_t uploadTexture(const TextureAsset &tex, bool srgb) {
+    const cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
+    cudaArray_t array = nullptr;
+    CUDA_CHECK(cudaMallocArray(&array, &desc, tex.width, tex.height));
+    CUDA_CHECK(cudaMemcpy2DToArray(array, 0, 0, tex.pixelsRGBA.data(), tex.width * 4, tex.width * 4, tex.height,
+                                    cudaMemcpyHostToDevice));
+    textureArrays.push_back(array);
+
+    cudaResourceDesc resDesc{};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = array;
+    cudaTextureDesc texDesc{};
+    texDesc.addressMode[0] = cudaAddressModeWrap;
+    texDesc.addressMode[1] = cudaAddressModeWrap;
+    texDesc.filterMode = cudaFilterModeLinear;
+    texDesc.readMode = cudaReadModeNormalizedFloat;
+    texDesc.normalizedCoords = 1;
+    texDesc.sRGB = srgb ? 1 : 0;
+    cudaTextureObject_t obj = 0;
+    CUDA_CHECK(cudaCreateTextureObject(&obj, &resDesc, &texDesc, nullptr));
+    textureObjects.push_back(obj);
+    return obj;
+  }
+
+  template <typename T> CUdeviceptr uploadVector(const std::vector<T> &v) {
+    if (v.empty())
+      return 0;
+    CUdeviceptr d = 0;
+    const size_t bytes = v.size() * sizeof(T);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d), bytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d), v.data(), bytes, cudaMemcpyHostToDevice));
+    return d;
+  }
+
   SceneObject buildMeshObject(const MeshAsset &mesh) {
     SceneObject obj;
     obj.kind = GeometryKind::Triangle;
     obj.material.materialType = MATERIAL_TEXTURED_DIFFUSE;
-    obj.material.albedo = toFloat3(mesh.baseColorFactor);
 
     std::vector<float3> positions(mesh.positions.size());
     for (size_t i = 0; i < mesh.positions.size(); ++i)
       positions[i] = toFloat3(mesh.positions[i]);
 
-    const size_t normalBytes = mesh.normals.size() * sizeof(float3);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&meshNormals), normalBytes));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(meshNormals), mesh.normals.data(), normalBytes,
-                           cudaMemcpyHostToDevice));
+    std::vector<float3> normals(mesh.normals.size());
+    for (size_t i = 0; i < mesh.normals.size(); ++i)
+      normals[i] = toFloat3(mesh.normals[i]);
+    meshNormals = uploadVector(normals);
     obj.material.normals = reinterpret_cast<float3 *>(meshNormals);
 
-    if (!mesh.uvs.empty()) {
-      const size_t uvBytes = mesh.uvs.size() * sizeof(float2);
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&meshUvs), uvBytes));
-      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(meshUvs), mesh.uvs.data(), uvBytes, cudaMemcpyHostToDevice));
-      obj.material.uvs = reinterpret_cast<float2 *>(meshUvs);
-    }
+    std::vector<float2> uvs(mesh.uvs.size());
+    for (size_t i = 0; i < mesh.uvs.size(); ++i)
+      uvs[i] = make_float2(mesh.uvs[i].x, mesh.uvs[i].y);
+    meshUvs = uploadVector(uvs);
+    obj.material.uvs = reinterpret_cast<float2 *>(meshUvs);
 
-    if (mesh.hasBaseColorTexture) {
-      const cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
-      CUDA_CHECK(cudaMallocArray(&baseColorArray, &desc, mesh.baseColorTexture.width, mesh.baseColorTexture.height));
-      CUDA_CHECK(cudaMemcpy2DToArray(baseColorArray, 0, 0, mesh.baseColorTexture.pixelsRGBA.data(),
-                                      mesh.baseColorTexture.width * 4, mesh.baseColorTexture.width * 4,
-                                      mesh.baseColorTexture.height, cudaMemcpyHostToDevice));
-      cudaResourceDesc resDesc{};
-      resDesc.resType = cudaResourceTypeArray;
-      resDesc.res.array.array = baseColorArray;
-      cudaTextureDesc texDesc{};
-      texDesc.addressMode[0] = cudaAddressModeWrap;
-      texDesc.addressMode[1] = cudaAddressModeWrap;
-      texDesc.filterMode = cudaFilterModeLinear;
-      texDesc.readMode = cudaReadModeNormalizedFloat;
-      texDesc.normalizedCoords = 1;
-      // glTF baseColorTexture is sRGB-encoded (baseColorFactor is linear,
-      // only the texture needs decoding) — without this the path tracer's
-      // linear-space lighting math treats gamma-encoded bytes as if they
-      // were already linear, systematically darkening midtones. CUDA does
-      // the sRGB->linear conversion in texture hardware, so this is free.
-      texDesc.sRGB = 1;
-      CUDA_CHECK(cudaCreateTextureObject(&baseColorTexObj, &resDesc, &texDesc, nullptr));
-      obj.material.baseColorTex = baseColorTexObj;
+    std::vector<float4> tangents(mesh.tangents.size());
+    for (size_t i = 0; i < mesh.tangents.size(); ++i)
+      tangents[i] = make_float4(mesh.tangents[i].x, mesh.tangents[i].y, mesh.tangents[i].z, mesh.tangents[i].w);
+    meshTangents = uploadVector(tangents);
+    obj.material.tangents = reinterpret_cast<float4 *>(meshTangents);
+
+    meshTriangleMaterial = uploadVector(mesh.triangleMaterial);
+    obj.material.triangleMaterial = reinterpret_cast<unsigned int *>(meshTriangleMaterial);
+
+    // One texture object per TextureAsset, then materials reference them by
+    // index. The loader already de-duplicates images, so this uploads each
+    // one exactly once no matter how many materials share it.
+    std::vector<cudaTextureObject_t> texObjects(mesh.textures.size(), 0);
+    for (size_t i = 0; i < mesh.textures.size(); ++i)
+      if (mesh.textures[i].width > 0 && mesh.textures[i].height > 0)
+        texObjects[i] = uploadTexture(mesh.textures[i], mesh.textures[i].srgb);
+
+    auto texOrZero = [&](int index) -> cudaTextureObject_t {
+      return index >= 0 && index < static_cast<int>(texObjects.size()) ? texObjects[index] : 0;
+    };
+    std::vector<GpuMaterial> gpuMaterials(mesh.materials.size());
+    for (size_t i = 0; i < mesh.materials.size(); ++i) {
+      const MaterialAsset &m = mesh.materials[i];
+      GpuMaterial &g = gpuMaterials[i];
+      g.baseColorFactor = toFloat3(m.baseColorFactor);
+      g.metallic = m.metallic;
+      g.roughness = m.roughness;
+      g.normalScale = m.normalScale;
+      g.baseColorTex = texOrZero(m.baseColorTexture);
+      g.metallicRoughnessTex = texOrZero(m.metallicRoughnessTexture);
+      g.normalTex = texOrZero(m.normalTexture);
     }
+    meshMaterials = uploadVector(gpuMaterials);
+    obj.material.materials = reinterpret_cast<GpuMaterial *>(meshMaterials);
 
     CUdeviceptr vertexBuffer = uploadTriangles(positions);
     OptixBuildInput input{};
@@ -619,18 +757,10 @@ struct OptixRenderer::Impl {
     input.triangleArray.flags = flags;
     input.triangleArray.numSbtRecords = 1;
 
-    OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-    OptixAccelBufferSizes sizes{};
-    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
-    CUdeviceptr tempBuffer;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
-    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
-                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    // Random vertex access as well: __closesthit__photon derives its normal
+    // via optixGetTriangleVertexData, and photon mapping now runs for
+    // loaded-mesh scenes.
+    obj.gas = buildAccel(input, obj.gasBuffer, kTracedGeometryFlags);
     cudaFree(reinterpret_cast<void *>(vertexBuffer));
     return obj;
   }
@@ -669,18 +799,8 @@ struct OptixRenderer::Impl {
     input.customPrimitiveArray.flags = flags;
     input.customPrimitiveArray.numSbtRecords = 1;
 
-    OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-    OptixAccelBufferSizes sizes{};
-    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
-    CUdeviceptr tempBuffer;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
-    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
-                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    // Custom primitives: no built-in vertex data to query, so plain fast-trace.
+    obj.gas = buildAccel(input, obj.gasBuffer);
     return obj;
   }
 
@@ -718,18 +838,7 @@ struct OptixRenderer::Impl {
     input.customPrimitiveArray.flags = flags;
     input.customPrimitiveArray.numSbtRecords = 1;
 
-    OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-    OptixAccelBufferSizes sizes{};
-    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
-    CUdeviceptr tempBuffer;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&obj.gasBuffer), sizes.outputSizeInBytes));
-    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
-                                 obj.gasBuffer, sizes.outputSizeInBytes, &obj.gas, nullptr, 0));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    obj.gas = buildAccel(input, obj.gasBuffer);
     cudaFree(reinterpret_cast<void *>(aabbBuffer)); // only fed the build, not read at intersection time (unlike voxels)
     return obj;
   }
@@ -766,19 +875,86 @@ struct OptixRenderer::Impl {
     glassMat.materialType = MATERIAL_GLASS;
     glassMat.albedo = make_float3(1.0f, 1.0f, 1.0f);
     glassMat.ior = 1.5f;
+    // Absorption per unit distance, so the 1.2-wide centre of the sphere
+    // reads distinctly deeper than its thin rim. Red is absorbed hardest,
+    // giving the cool blue-green of thick cast glass. Tuned by eye, which is
+    // the sanctioned way here — this is an artist control (doctrine rung 1),
+    // not a measured material.
+    glassMat.extinction = make_float3(0.85f, 0.32f, 0.22f);
     // Floating above the plane (not resting on it) on purpose: refracted
     // rays need room to converge before hitting a receiving surface, or the
     // caustic never has a chance to focus — standard practice for a
     // glass-caustic demo scene, not a physical-plausibility slip.
-    objects.push_back(buildSphereObject(make_float3(1.4f, 0.5f, -0.6f), 0.6f, glassMat));
+    objects.push_back(buildSolidSphereObject(make_float3(1.4f, 0.5f, -0.6f), 0.6f, glassMat));
 
     boundsCenter = glm::vec3(0.0f, 0.2f, 0.0f);
     boundsRadius = 3.0f;
 
     // Caustics only make sense here: this is the only scene with specular
-    // (mirror/glass) objects to seed one from. Requires the quad light
-    // (addLightQuad already skipped it if hasEnvironment is set).
-    enablePhotonMapping = !hasEnvironment;
+    // (mirror/glass) objects to seed one from — mesh/voxel/SDF scenes are
+    // always MATERIAL_TEXTURED_DIFFUSE/VOXEL/SDF, none of which
+    // __closesthit__photon treats as specular, so they cannot produce a
+    // caustic no matter how the light is set up (their only current material
+    // model is GGX metallic-roughness reflectance, not glass/mirror
+    // transmission — a real gltF dielectric/transmission material is future
+    // work, see the marker on MATERIAL_TEXTURED_DIFFUSE's doc comment).
+    //
+    // No longer gated on !hasEnvironment: caustics used to be turned off
+    // outright the moment any HDRI was loaded, even for this scene, which
+    // does have real specular geometry to seed one from either way — photon
+    // emission just needed to learn to sample the environment instead of
+    // the quad light (see emitFromEnvironment in pathtracer.cu), the same
+    // way NEE already treats the two lighting modes as alternatives, not as
+    // a reason to drop a feature.
+    enablePhotonMapping = true;
+  }
+
+  // A neutral plane just under the object, so it has something to cast a
+  // contact shadow onto and bounce light off. Sized from the bounding sphere
+  // so it reads as "ground" rather than "a slab" at any asset scale, and
+  // dropped a hair below the actual minimum so coplanar bottom faces don't
+  // z-fight with it.
+  //
+  // 1.4x radius, not the 6x this originally shipped at. This first shipped
+  // sized as "the ground for the whole scene" (6x), which put its hard,
+  // perfectly flat silhouette edge well inside the frame at the camera
+  // distances OrbitCamera::frame actually uses (~1.15x boundsRadius) — under
+  // an HDRI, which already bakes in its own ground and horizon, that edge
+  // read as a visibly synthetic seam rather than as ground, and under the
+  // noon preset's harsh sun it blew out to pure white and ate most of the
+  // frame (confirmed by rendering under ITALY_TONEMAP=clamp). 1.4x is sized
+  // to be a *contact-shadow catcher*, not a scene floor: just enough plane
+  // for the object's own shadow to land on, small enough that its edge stays
+  // near the object instead of cutting across the middle of the frame.
+  void addGroundPlane(const glm::vec3 &center, float radius, float floorY) {
+    // Also skipped under an environment map, same reasoning as
+    // addLightQuad(): an HDRI already bakes in its own ground, horizon, and
+    // GI-driven contact darkening under the object. A separate flat grey
+    // plane can only disagree with it — measured, not assumed: it read as a
+    // visibly synthetic hard-edged card, wrong hue against a warm desert
+    // HDRI, that got no better by resizing or darkening it (tried both).
+    // Real fix would be a proper alpha shadow-catcher (render receive-shadow
+    // difference only, composite over the env) — future work, not this
+    // pass's scope. Kept for the no-environment quad-light case, where
+    // there is no ground at all otherwise.
+    if (!wantGroundPlane || hasEnvironment)
+      return;
+    const float r = radius * 1.4f;
+    const float y = floorY - radius * 1e-3f;
+    HitGroupData mat{};
+    mat.materialType = MATERIAL_DIFFUSE;
+    // Mid-grey: bright enough to catch bounce light and show a shadow, dark
+    // enough not to blow out under a daylight HDRI. Still can clip under a
+    // very bright preset (noon) at default exposure — that's exposure's job
+    // to tame, same as it would be for a real ground plane in direct sun.
+    mat.albedo = make_float3(0.45f, 0.45f, 0.45f);
+    const float3 c = toFloat3(center);
+    objects.push_back(buildTriangleObject(
+        {
+            make_float3(c.x - r, y, c.z - r), make_float3(c.x + r, y, c.z - r), make_float3(c.x + r, y, c.z + r),
+            make_float3(c.x - r, y, c.z - r), make_float3(c.x + r, y, c.z + r), make_float3(c.x - r, y, c.z + r),
+        },
+        mat));
   }
 
   // Key light sized/positioned relative to a bounding sphere so it's sensible
@@ -795,6 +971,7 @@ struct OptixRenderer::Impl {
     objects.push_back(buildMeshObject(mesh));
     boundsCenter = mesh.boundsCenter();
     boundsRadius = std::max(mesh.boundsRadius(), 1e-3f);
+    addGroundPlane(boundsCenter, boundsRadius, mesh.boundsMin.y);
     addBoundsKeyLight(boundsCenter, boundsRadius);
   }
 
@@ -807,6 +984,7 @@ struct OptixRenderer::Impl {
     }
     boundsCenter = (mn + mx) * 0.5f;
     boundsRadius = std::max(glm::length(mx - mn) * 0.5f, 1e-3f);
+    addGroundPlane(boundsCenter, boundsRadius, mn.y);
     addBoundsKeyLight(boundsCenter, boundsRadius);
   }
 
@@ -815,6 +993,7 @@ struct OptixRenderer::Impl {
     const glm::vec3 mx = grid.boundsMax();
     boundsCenter = (grid.origin + mx) * 0.5f;
     boundsRadius = std::max(glm::length(mx - grid.origin) * 0.5f, 1e-3f);
+    addGroundPlane(boundsCenter, boundsRadius, grid.origin.y);
     addBoundsKeyLight(boundsCenter, boundsRadius);
   }
 
@@ -862,6 +1041,7 @@ struct OptixRenderer::Impl {
     // Must happen before any of the geometry-building calls below: they
     // consult hasEnvironment (via addLightQuad) to decide whether to add a
     // synthetic quad light.
+    wantGroundPlane = source.groundPlane;
     if (source.environment)
       buildEnvironment(*source.environment);
 
@@ -914,8 +1094,16 @@ struct OptixRenderer::Impl {
     std::vector<HitGroupRecord> hitRecords(objects.size());
     for (size_t i = 0; i < objects.size(); ++i) {
       // Fixed test scene only ever has triangle/sphere objects (see
-      // enablePhotonMapping) — no voxel/sdf case to handle here.
-      OptixProgramGroup pg = objects[i].kind == GeometryKind::Sphere ? photonHitSpherePG : photonHitTrianglePG;
+      // enablePhotonMapping) — no voxel/sdf case to handle here. The solid
+      // sphere does need its own entry: it is a custom primitive, so packing
+      // it against the triangle program group would leave it with no
+      // intersection program at all and the glass would vanish from the
+      // photon pass — taking the caustic with it.
+      OptixProgramGroup pg = photonHitTrianglePG;
+      if (objects[i].kind == GeometryKind::Sphere)
+        pg = photonHitSpherePG;
+      else if (objects[i].kind == GeometryKind::SolidSphere)
+        pg = photonHitSolidSpherePG;
       OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
       hitRecords[i].data = objects[i].material;
     }
@@ -999,18 +1187,9 @@ struct OptixRenderer::Impl {
       input.sphereArray.flags = flags;
       input.sphereArray.numSbtRecords = 1;
 
-      OptixAccelBuildOptions accelOptions{};
-      accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-      accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-      OptixAccelBufferSizes sizes{};
-      OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
-      CUdeviceptr tempBuffer;
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonGasBuffer), sizes.outputSizeInBytes));
-      OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, tempBuffer, sizes.tempSizeInBytes,
-                                   photonGasBuffer, sizes.outputSizeInBytes, &photonGasHandle, nullptr, 0));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      cudaFree(reinterpret_cast<void *>(tempBuffer));
+      // The one AS here that is rebuilt every single frame, so it is the one
+      // that wants a cheap build over a fast traversal.
+      photonGasHandle = buildAccel(input, photonGasBuffer, OPTIX_BUILD_FLAG_PREFER_FAST_BUILD);
     } else {
       photonGasHandle = 0; // no caustic photons yet this run — gather becomes a no-op (see photonHandle==0 check)
     }
@@ -1050,19 +1229,7 @@ struct OptixRenderer::Impl {
     iasInput.instanceArray.instances = instanceBuffer;
     iasInput.instanceArray.numInstances = static_cast<unsigned int>(instances.size());
 
-    OptixAccelBuildOptions accelOptions{};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_NONE;
-    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-
-    OptixAccelBufferSizes sizes{};
-    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &iasInput, 1, &sizes));
-    CUdeviceptr tempBuffer;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&tempBuffer), sizes.tempSizeInBytes));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&iasBuffer), sizes.outputSizeInBytes));
-    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &iasInput, 1, tempBuffer, sizes.tempSizeInBytes,
-                                 iasBuffer, sizes.outputSizeInBytes, &iasHandle, nullptr, 0));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(reinterpret_cast<void *>(tempBuffer));
+    iasHandle = buildAccel(iasInput, iasBuffer);
     cudaFree(reinterpret_cast<void *>(instanceBuffer));
   }
 
@@ -1098,6 +1265,9 @@ struct OptixRenderer::Impl {
       switch (objects[i].kind) {
       case GeometryKind::Sphere:
         pg = hitSpherePG;
+        break;
+      case GeometryKind::SolidSphere:
+        pg = hitSolidSpherePG;
         break;
       case GeometryKind::Voxel:
         pg = hitVoxelPG;
@@ -1230,8 +1400,7 @@ OptixRenderer::~OptixRenderer() {
 
 void OptixRenderer::resetAccumulation() { subframeIndex_ = 0; }
 
-void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLaunch, float exposure, bool denoise,
-                            TonemapOperator tonemap) {
+void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &settings) {
   const glm::vec3 eye = camera.position();
   const glm::vec3 target = camera.target();
   const glm::vec3 forward = glm::normalize(target - eye);
@@ -1246,9 +1415,18 @@ void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLau
   params.accumBuffer = reinterpret_cast<float4 *>(impl_->accumBuffer);
   params.width = static_cast<unsigned int>(width_);
   params.height = static_cast<unsigned int>(height_);
-  params.samplesPerLaunch = samplesPerLaunch;
-  params.exposure = exposure;
-  params.tonemapOperator = static_cast<unsigned int>(tonemap);
+  params.samplesPerLaunch = settings.samplesPerLaunch;
+  params.exposure = settings.exposure;
+  params.tonemapOperator = static_cast<unsigned int>(settings.tonemap);
+  params.fireflyClamp = settings.fireflyClamp;
+  params.aperture = settings.aperture;
+  // Default the focal plane to the orbit target, so the thing you framed is
+  // the thing in focus without touching a second control.
+  params.focusDistance =
+      settings.focusDistance > 0.0f ? settings.focusDistance : glm::length(target - eye);
+  params.envRotation = settings.envRotation;
+  params.sceneBoundsCenter = toFloat3(impl_->boundsCenter);
+  params.sceneBoundsRadius = impl_->boundsRadius;
   params.eye = toFloat3(eye);
   params.U = toFloat3(right * tanHalfFov * aspect);
   params.V = toFloat3(up * tanHalfFov);
@@ -1274,12 +1452,21 @@ void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLau
     params.photonCounter = reinterpret_cast<unsigned int *>(impl_->photonCounterBuffer);
     params.photonCapacity = Impl::kPhotonCapacity;
     params.photonBatchSize = Impl::kPhotonBatchSize;
+    // Must be set *before* this upload, not after: __raygen__photon seeds its
+    // RNG from totalPhotonsEmitted, so it is read by the emission launch that
+    // tracePhotonPass() issues below. Assigning it afterwards (as this did)
+    // meant the emission launch always saw the value-initialized 0, so every
+    // pass re-emitted the identical 65536 photons to the identical positions
+    // and the "progressive" photon map never progressed — only the gather
+    // radius shrank, over a frozen photon set. The tell was the per-pass
+    // deposited-count log printing the same number every time.
+    params.totalPhotonsEmitted = impl_->totalPhotonsEmitted;
     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
                                cudaMemcpyHostToDevice, impl_->stream));
     const float radiusUsed = impl_->tracePhotonPass();
     params.photonHandle = impl_->photonGasHandle;
     params.photonGatherRadius = radiusUsed;
-    params.totalPhotonsEmitted = impl_->totalPhotonsEmitted;
+    params.totalPhotonsEmitted = impl_->totalPhotonsEmitted; // now includes this pass, for the gather launch
   }
 
   CUDA_CHECK(cudaGraphicsMapResources(1, &impl_->cudaPbo, impl_->stream));
@@ -1287,7 +1474,7 @@ void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLau
   void *devicePtr = nullptr;
   CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&devicePtr, &mappedSize, impl_->cudaPbo));
   params.frameBuffer = reinterpret_cast<uchar4 *>(devicePtr);
-  params.denoiserEnabled = denoise ? 1u : 0u;
+  params.denoiserEnabled = settings.denoise ? 1u : 0u;
   params.denoisedBuffer = reinterpret_cast<float4 *>(impl_->denoisedBuffer);
 
   CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
@@ -1295,7 +1482,7 @@ void OptixRenderer::render(const OrbitCamera &camera, unsigned int samplesPerLau
   OPTIX_CHECK(optixLaunch(impl_->pipeline, impl_->stream, impl_->paramsBuffer, sizeof(Params), &impl_->sbt, width_,
                            height_, 1));
 
-  if (denoise) {
+  if (settings.denoise) {
     // Color-only denoising (no albedo/normal guide layers — see
     // buildDenoiser()'s comment), hdrIntensity left null so the denoiser
     // computes autoexposure internally rather than needing a separate

@@ -7,9 +7,11 @@
 // sketched in the design doc: there's one backend and one call site today,
 // so those interfaces have nothing to abstract yet.
 //
-// monkey-boy: ceiling chosen — one concrete class as the seam, not a generic
-// multi-backend interface set. Upgrade to the fuller interface split if/when
-// the Metal backend actually starts.
+// claudia: single-backend seam — one concrete class, not a generic
+// multi-backend interface set. Upgrade to the fuller Device/Buffer/
+// AccelStructure interface split (and a real src/rhi/) if a second backend
+// starts. There is nothing to abstract with one backend and one call site;
+// see the seam section of CLAUDE.md.
 
 #include "convert/sdf_grid.h"
 #include "convert/voxel_grid.h"
@@ -34,6 +36,31 @@ enum class TonemapOperator : int {
   Clamp = 4,    // alternate/debugging aid: the naive clamp(0,1) every render before this phase used
 };
 
+// Everything that can change between one subframe and the next without
+// invalidating the accumulated image. A struct rather than a positional
+// argument list: these are all independent display/quality knobs, they keep
+// arriving one per phase, and at six-plus parameters a call site stops being
+// readable. Defaults here are the defaults the UI starts at.
+struct RenderSettings {
+  unsigned int samplesPerLaunch = 1;
+  float exposure = 1.0f; // linear, applied at display time only
+  bool denoise = false;
+  TonemapOperator tonemap = TonemapOperator::AgX;
+  // realism: ceiling on a single sample's radiance, suppressing fireflies at
+  // the cost of a little energy in the extreme highlights. <= 0 disables.
+  float fireflyClamp = 0.0f;
+
+  // Thin-lens depth of field. aperture is the lens radius in world units, so
+  // its useful range scales with the scene — the UI derives its slider bound
+  // from the scene radius. 0 is a pinhole. focusDistance <= 0 means "focus on
+  // the camera's orbit target", which is what you want almost always.
+  float aperture = 0.0f;
+  float focusDistance = 0.0f;
+
+  // Environment rotation about +Y, radians.
+  float envRotation = 0.0f;
+};
+
 // Exactly one of mesh/voxels/sdf should be set; none set means the fixed
 // bring-up scene. A tagged struct rather than overloaded constructors, since
 // a bare pointer overload set would be ambiguous for the nullptr default.
@@ -45,6 +72,15 @@ struct SceneSource {
   const VoxelGrid *voxels = nullptr;
   const SdfGrid *sdf = nullptr;
   const EnvironmentMap *environment = nullptr;
+  // A neutral diffuse plane under the loaded object. Without it a mesh floats
+  // in a void: no contact shadow and no bounce light, which is most of what
+  // makes a render read as an object somewhere rather than a cutout. Ignored
+  // by the fixed test scene, which has its own ground, and by any scene with
+  // an environment map — an HDRI already bakes in its own ground/horizon,
+  // and a flat grey plane under it reads as a visibly synthetic card rather
+  // than as ground (measured: tried resizing and darkening it first, neither
+  // fixed the mismatch).
+  bool groundPlane = true;
 };
 
 class OptixRenderer {
@@ -65,17 +101,15 @@ public:
 
   // Renders one progressive subframe (accumulates onto the previous one) and
   // updates the GL texture returned by glTextureId(). Call resetAccumulation()
-  // first if the camera or scene changed since the last call. samplesPerLaunch
-  // trades per-frame cost for faster convergence; exposure only affects the
-  // displayed tonemap, not the stored HDR accumulator (see pathtracer.cu),
-  // so it's free to change every frame without resetting accumulation.
-  // denoise runs the OptiX AI denoiser over the accumulated HDR buffer
-  // before tonemapping — same free-to-toggle-any-frame property as
-  // exposure, since it never touches the stored accumulator either. Same
-  // for tonemap: applied only at final display time, safe to change any
-  // frame.
-  void render(const OrbitCamera &camera, unsigned int samplesPerLaunch = 1, float exposure = 1.0f,
-              bool denoise = false, TonemapOperator tonemap = TonemapOperator::AgX);
+  // first if the camera or scene changed since the last call.
+  //
+  // Every field of RenderSettings except fireflyClamp is display-time only —
+  // exposure, tonemap and denoise all read the stored HDR accumulator without
+  // modifying it, so they are free to change on any frame with no reset.
+  // fireflyClamp, aperture, focusDistance and envRotation are the exceptions:
+  // they change what gets *written* into the accumulator, so changing any of
+  // them needs a resetAccumulation() to take full effect.
+  void render(const OrbitCamera &camera, const RenderSettings &settings = {});
 
   void resetAccumulation();
 

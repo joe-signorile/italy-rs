@@ -20,4 +20,13 @@ struct EnvironmentMap {
 
 bool loadEnvironmentMap(const std::string &path, EnvironmentMap &out, std::string &err);
 
+// Builds the marginal/conditional CDFs from already-loaded pixels (linear
+// radiance, width*height*3). Split out of loadEnvironmentMap so the
+// importance-sampling math is testable against a synthetic image without
+// needing a real .hdr file on disk — see tests/environment_cdf_test.cpp.
+// Returns false (with err set) if the image is entirely black, same as
+// loadEnvironmentMap.
+bool buildEnvironmentCdf(int width, int height, const std::vector<float> &pixels, EnvironmentMap &out,
+                          std::string &err);
+
 } // namespace italy

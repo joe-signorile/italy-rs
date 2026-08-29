@@ -109,8 +109,10 @@ has live sliders/toggles that don't need a rebuild: exposure,
 samples-per-launch, the OptiX AI denoiser, and the tonemap operator (AgX
 default; Reinhard/ACES/Hable/Clamp are debugging aids for comparison).
 
-Scripted testing hooks for the two toggles that are otherwise UI-only:
-`ITALY_FORCE_DENOISE=1` and `ITALY_TONEMAP=<agx|reinhard|aces|hable|clamp>`.
+Scripted testing hooks for the toggles that are otherwise UI-only:
+`ITALY_FORCE_DENOISE=1`, `ITALY_TONEMAP=<agx|reinhard|aces|hable|clamp>`, and
+`ITALY_FIREFLY_CLAMP=<value>` (0 disables). `ITALY_DUMP_AFTER_SUBFRAME=<n>`
+sets how many subframes accumulate before `ITALY_DUMP_FRAME` writes.
 
 ### Tests
 
@@ -142,6 +144,57 @@ render to a PNG after 128 subframes and exit — useful for checking render
 correctness headlessly/from a script rather than watching the window.
 
 ## Status
+
+**Correctness + doctrine pass after phase 10.** Wrote the project's ranked
+priority order (beauty > performance > realism) into `CLAUDE.md` as a binding
+ladder rather than leaving it implicit, and added the `// realism:` marker
+convention for deliberate departures from physics. Then read all of `src/`
+and fixed ten defects, listed worst-first:
+
+- **Glass was never solid.** OptiX's built-in sphere primitive is documented
+  hollow and back-face culled (Programming Guide 9.1, 9.6): a ray refracted
+  into one never receives an exit intersection. So `MATERIAL_GLASS` was a
+  single refracting interface with no interior, no total internal reflection,
+  and nothing for absorption to act over. Dielectrics now use a custom
+  `__intersection__sphere_solid` that reports the far root when the near one
+  is behind the ray — the same route NVIDIA takes in `optixWhitted`. Beer-
+  Lambert absorption came along with it, since the interior segment length is
+  finally knowable. The glass sphere now shows its TIR horizon band and casts
+  a coloured caustic.
+- **AgX was sRGB-encoded twice** — see the phase-8 note below.
+- **Every photon pass emitted identical photons.** `params.totalPhotonsEmitted`
+  (the emission RNG seed) was uploaded to the device *after* the launch that
+  reads it, so it was always 0. Deposited counts per pass were literally
+  identical (2931, 2931, 2931); they now vary (2931, 3085, 2962).
+- **Caustics were ~65,536x too dim**, from dividing by the photon batch size
+  in both the emission and the gather. That is what the 200x
+  `ITALY_DEBUG_CAUSTICS_ONLY` boost had been compensating for; it is gone.
+- **Loading a GLB appended to the previously loaded one.** `loadGlb()` never
+  reset its output, and every UI radio button triggers a reload, so the
+  triangle count grew with each Apply while the bounds tracked only the newest
+  load. Three consecutive loads gave 6, 12, 18 triangles; now 6, 6, 6.
+- **Meshes without a NORMAL attribute shaded as if they all faced the sky.**
+  The fallback was a constant up-vector rather than the triangle's own
+  geometric normal — which `assets/test.glb` triggers, so the bundled demo
+  asset was rendering with no form definition at all.
+- **Voxel colours baked from a vertically flipped texture**, disagreeing with
+  the GPU mesh path. Verified with a purpose-built asset whose texture is
+  red-over-blue: mesh and voxel renders now agree.
+- **`optixGetTriangleVertexData`/`optixGetSphereData` were called on
+  acceleration structures built without `ALLOW_RANDOM_VERTEX_ACCESS`**, which
+  the API requires — undefined by contract, working by luck.
+- **No NaN guard and no firefly clamp**, so a single bad sample poisoned its
+  pixel permanently. Both added; the clamp removes ~78% of isolated bright
+  outliers at the default test scene.
+- **`CLAUDE.md` mandated a `src/rhi/` seam that has never existed** (and
+  `sdf_baker.cpp` bypassed it anyway). Docs now describe the actual seam,
+  `src/render/optix_renderer.h`, and name the two sanctioned OptiX call sites.
+
+Two pieces of housekeeping fell out: the `@monkey-boy/CLAUDE.md.snippet`
+import at the top of `CLAUDE.md` pointed at a project that no longer exists,
+and all seven deliberate-simplification markers still used the old
+`monkey-boy:` prefix, so the tooling that greps for `claudia:` found none of
+them.
 
 **Bug-fix pass after phase 4** caught two rendering-correctness bugs that had
 been silently present since phase 2 (affecting every material/phase built on
@@ -274,12 +327,23 @@ remap -> 6th-order polynomial contrast fit -> outset matrix), the same
 approach Godot 4.3+/Bevy ship instead of pulling in OpenColorIO for one
 transform — reproduced from memory of that fit, not diffed against
 Blender's reference OCIO config byte-for-byte (no Blender install available
-here), so verification is behavioral rather than pixel-exact: rendered the
-fixed test scene under all 5 operators and confirmed AgX shows its
-well-known signature look (lifted shadows instead of crushed blacks,
-desaturated reds, soft highlight rolloff instead of hard clipping),
-distinct from the other four, which are also each visibly distinct from
-one another.
+here).
+
+**This phase shipped with a bug, and the phase's own verification is what
+missed it — worth recording as a cautionary tale.** The chain was missing its
+closing `pow(2.2)`. That step exists because the contrast polynomial's output
+is display-encoded, and every operator here shares one final sRGB encode in
+`sutil::make_color()`; without it, the sRGB OETF ran on already-encoded
+values. The verification at the time was "does AgX show its well-known
+signature look — lifted shadows instead of crushed blacks, soft highlight
+rolloff?" It did, and that was accepted. But *a double sRGB encode produces
+exactly those symptoms too*, which is why a behavioural check against a
+remembered description could not separate the two. The tell was available and
+unused: the fixed test scene's background is a constant, `bgColor` = linear
+(0.05, 0.06, 0.08), whose correct 8-bit sRGB value is computable in advance
+as 62 — it was rendering as 139. Fixed and re-verified numerically at 63.
+The lesson generalised into `CLAUDE.md`'s doctrine: prefer a check with a
+predictable numeric answer over a check against a remembered look.
 
 Along the way, a full clean rebuild (after this repo's directory was
 renamed `italy` -> `italy-rs`) surfaced a real off-by-one in the voxelizer
@@ -294,3 +358,83 @@ was replaced with a resolution-derived bound.
 All 10 planned MVP phases are now done. See the plan doc for the full
 phase list and out-of-scope items (Gaussian-splat resampling, full VCM/
 ReSTIR caustics, Metal backend — all explicitly deferred, not forgotten).
+
+**Beauty features added alongside the correctness pass**, once the doctrine
+ladder made "which of these is worth doing" an answerable question:
+
+- **GGX metallic-roughness materials.** Every glTF-loaded surface was pure
+  Lambert regardless of what the source material said — the single biggest
+  gap between loaded output and something that reads as a real render. The
+  loader now walks the full scene graph (previously only
+  `meshes[0].primitives[0]`, so a 169-mesh asset like the bundled
+  `assets/test.glb` rendered as one), collects every material/texture the
+  scene actually references (de-duplicated by image, not by glTF texture
+  index — several materials commonly share one multi-megabyte JPEG), and
+  reads `metallicFactor`/`roughnessFactor`/`metallicRoughnessTexture`/
+  `normalTexture`. The path tracer gained a proper two-lobe BSDF (Lambert +
+  GGX with Heitz 2018 visible-normal sampling) with the combined pdf feeding
+  every MIS weight, not just the new one — every existing `powerHeuristic`
+  call site had to be re-derived, not just the new lobe's. Verified with a
+  purpose-built furnace-test asset (5 metallic spheres, roughness 0.05 to
+  1.0, under a uniform-ish HDRI): the specular highlight tightens
+  monotonically from mirror-sharp to a soft blur, with no energy blowup or
+  collapse across the sweep.
+- **Solid dielectrics.** Written up above under "Glass was never solid" —
+  the custom sphere intersector this needed is what made Beer-Lambert
+  absorption possible, since the interior segment length only exists once
+  there's a real interior.
+- **Camera and sampling controls**, all artist-facing per the doctrine's own
+  "artist controls are features" corollary: thin-lens depth of field
+  (aperture + focus distance, defaulting to the orbit target so it's correct
+  untouched), a tent reconstruction filter replacing the old box-filter
+  jitter (less aliasing at the same sample count), and environment rotation
+  — one shared `dirToEquirectUv`/`equirectUvToDir` pair feeds the lookup,
+  the pdf, and the importance sampler, so the rotation can't reach only some
+  of the three and silently break MIS.
+- **Selectable render resolution and PNG export.** Resolution changes route
+  through the same all-or-nothing scene rebuild everything else already
+  uses — `OptixRenderer` owns the accumulator/PBO/texture/denoiser as one
+  unit, so there was no reason to grow a second, partial resize path.
+  Export reuses the same PNG-writing code the scripted `ITALY_DUMP_FRAME`
+  hook already had. CLI resolution/dimension flags are now bounds-checked
+  instead of trusting `atoi` — `--voxel=0` used to reach
+  `glm::clamp(v, 0, -1)`.
+- **Environment-lit caustics.** Photon mapping was hardcoded to the
+  synthetic quad light and disabled outright the instant any HDRI loaded,
+  even for the one scene that has always had specular geometry (mirror +
+  glass) regardless of light source. `__raygen__photon` now emits from the
+  environment when one is loaded — importance-sampled via the same
+  distribution NEE uses, with the emission origin placed on a disk outside
+  the scene's bounding sphere (PBRT's `InfiniteAreaLight::Sample_Le`
+  construction). Deliberately *not* extended to loaded mesh/voxel/SDF
+  scenes: none of their material types (`MATERIAL_TEXTURED_DIFFUSE` is GGX
+  *reflectance*, no transmission; `MATERIAL_VOXEL`/`MATERIAL_SDF` are flat
+  diffuse) register as specular to the photon closest-hit, so a loaded asset
+  cannot seed a caustic no matter how emission is set up — adding the SBT
+  plumbing for it now would be complexity in exchange for nothing visible.
+  Marked as a real gap on `MATERIAL_TEXTURED_DIFFUSE`'s own doc comment
+  (`// claudia:`), not silently dropped.
+- **A shadow-catcher ground plane for loaded scenes, then a correction to
+  it.** Mesh/voxel/SDF scenes previously had nothing to ground them — no
+  contact shadow, no bounce surface, an object visibly floating. A plane
+  shipped first at 6x the object's bounding radius, which — combined with
+  the tighter 1.15x camera framing above — put its hard, perfectly flat
+  edge inside the frame at ordinary orbit distances, and under the `noon`
+  HDRI preset it blew out to pure white (confirmed under
+  `ITALY_TONEMAP=clamp`, which rules out this being a tonemap artifact).
+  The deeper problem wasn't just size: a flat synthetic grey plane
+  structurally can't match an HDRI's own baked-in ground — wrong hue, hard
+  silhouette, no falloff — so resizing and darkening it only reduced how
+  much of the frame it ate, not the mismatch itself. Fixed by skipping it
+  entirely once an environment map is loaded (the same reasoning the
+  synthetic quad light already uses — an HDRI supplies its own ground and
+  horizon) and shrinking it to a 1.4x-radius contact-shadow catcher for the
+  remaining no-environment case.
+
+Two of the above were caught mid-implementation by rendering, not by
+reading the diff: the ground plane's failure mode only showed up as a wall
+of white filling most of a `bike.glb` render, and a `voxelize_test` bounds
+assertion (a test fixture invariant broken by the loader's new
+multi-material `MeshAsset` shape) only showed up by running `ctest`. Both
+are why this project's own stated verification philosophy — render it,
+don't just reason about it — keeps paying for itself.

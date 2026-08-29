@@ -134,22 +134,41 @@ bool triBoxOverlap(const glm::vec3 &boxCenter, const glm::vec3 &boxHalf, const g
 // from a texture.
 float srgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
 
+// No V flip: glTF's texture origin is the upper-left, TextureAsset stores rows
+// top-to-bottom (see mesh_asset.h), and the GPU path samples tex2D(u, v)
+// unflipped (pathtracer.cu's MATERIAL_TEXTURED_DIFFUSE branch). Flipping here
+// made the baked voxel colors a vertical mirror of what the same asset shows
+// when rendered as a mesh — the two representations have to agree.
 glm::vec3 sampleColorNearest(const TextureAsset &tex, glm::vec2 uv) {
   auto wrap = [](float x) { return x - std::floor(x); };
   const int px = std::clamp(static_cast<int>(wrap(uv.x) * tex.width), 0, tex.width - 1);
-  const int py = std::clamp(static_cast<int>((1.0f - wrap(uv.y)) * tex.height), 0, tex.height - 1);
+  const int py = std::clamp(static_cast<int>(wrap(uv.y) * tex.height), 0, tex.height - 1);
   const size_t idx = (static_cast<size_t>(py) * tex.width + px) * 4;
-  return glm::vec3(srgbToLinear(tex.pixelsRGBA[idx] / 255.0f), srgbToLinear(tex.pixelsRGBA[idx + 1] / 255.0f),
-                    srgbToLinear(tex.pixelsRGBA[idx + 2] / 255.0f));
+  const glm::vec3 raw(tex.pixelsRGBA[idx] / 255.0f, tex.pixelsRGBA[idx + 1] / 255.0f,
+                      tex.pixelsRGBA[idx + 2] / 255.0f);
+  // Only base-colour textures are sRGB-encoded; the flag travels with the
+  // texture now, so a linear map that somehow reaches here isn't double-
+  // decoded (see TextureAsset::srgb).
+  if (!tex.srgb)
+    return raw;
+  return glm::vec3(srgbToLinear(raw.r), srgbToLinear(raw.g), srgbToLinear(raw.b));
 }
 
-glm::vec3 triangleColor(const MeshAsset &mesh, size_t triangleBase) {
-  if (mesh.hasBaseColorTexture && !mesh.uvs.empty()) {
-    const glm::vec2 uv =
-        (mesh.uvs[triangleBase] + mesh.uvs[triangleBase + 1] + mesh.uvs[triangleBase + 2]) / 3.0f;
-    return sampleColorNearest(mesh.baseColorTexture, uv) * mesh.baseColorFactor;
+glm::vec3 triangleColor(const MeshAsset &mesh, size_t triangle) {
+  // Per-triangle material lookup: one soup can now carry a whole scene's
+  // worth of materials, so the colour has to be resolved per triangle rather
+  // than once for the whole mesh.
+  const MaterialAsset &mat = mesh.materialForTriangle(triangle);
+  const size_t base = triangle * 3;
+  if (mat.baseColorTexture >= 0 && mat.baseColorTexture < static_cast<int>(mesh.textures.size()) &&
+      base + 2 < mesh.uvs.size()) {
+    const TextureAsset &tex = mesh.textures[mat.baseColorTexture];
+    if (tex.width > 0 && tex.height > 0) {
+      const glm::vec2 uv = (mesh.uvs[base] + mesh.uvs[base + 1] + mesh.uvs[base + 2]) / 3.0f;
+      return sampleColorNearest(tex, uv) * mat.baseColorFactor;
+    }
   }
-  return mesh.baseColorFactor;
+  return mat.baseColorFactor;
 }
 
 struct CellHash {
@@ -197,7 +216,7 @@ VoxelGrid voxelizeMesh(const MeshAsset &mesh, int resolution) {
     const glm::ivec3 cellMax =
         glm::clamp(glm::ivec3(glm::floor((triMax - grid.origin) / grid.voxelSize)), glm::ivec3(0),
                    glm::ivec3(resolution - 1));
-    const glm::vec3 color = triangleColor(mesh, base);
+    const glm::vec3 color = triangleColor(mesh, t);
 
     for (int z = cellMin.z; z <= cellMax.z; ++z) {
       for (int y = cellMin.y; y <= cellMax.y; ++y) {

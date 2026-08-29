@@ -132,3 +132,19 @@ add_executable(voxelize_test tests/voxelize_test.cpp src/convert/voxelize.cpp)
 target_include_directories(voxelize_test PRIVATE src)
 target_link_libraries(voxelize_test PRIVATE glm::glm)
 add_test(NAME voxelize_test COMMAND voxelize_test)
+
+# Host-side only (no GPU/OptiX needed): tests the importance-sampling CDF
+# build split out of environment.cpp's loadEnvironmentMap.
+add_executable(environment_cdf_test tests/environment_cdf_test.cpp tests/stb_image_impl.cpp src/render/environment.cpp)
+target_include_directories(environment_cdf_test PRIVATE src)
+target_link_libraries(environment_cdf_test PRIVATE stb)
+add_test(NAME environment_cdf_test COMMAND environment_cdf_test)
+
+# Needs a real GPU/OptiX SDK at run time, same as italy-rs itself — exercises
+# the actual bake pipeline in sdf_baker.cpp against a primitive with a known
+# analytic SDF (see tests/sdf_sign_test.cpp).
+add_executable(sdf_sign_test tests/sdf_sign_test.cpp src/convert/sdf_baker.cpp)
+add_dependencies(sdf_sign_test italy_optixir_sdf_bake)
+target_include_directories(sdf_sign_test PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
+target_link_libraries(sdf_sign_test PRIVATE glm::glm CUDA::cudart)
+add_test(NAME sdf_sign_test COMMAND sdf_sign_test)
