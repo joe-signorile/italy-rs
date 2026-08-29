@@ -17,7 +17,9 @@
 
 #include <sutil/vec_math.h> // float3 operators/cross/normalize — see buildModule() for why this is safe on the host
 
+#include "convert/gsplat_bounds.h"
 #include "convert/voxel_grid.h"
+#include "io/gsplat_asset.h"
 #include "render/gl_ext.h"
 #include "render/kernels/pathtracer_params.h"
 #include "render/optix_check.h"
@@ -56,7 +58,7 @@ void contextLogCallback(unsigned int level, const char *tag, const char *message
 // SolidSphere = custom-primitive sphere with our own intersector, which does
 //               report exit hits. Required for dielectrics — see
 //               __intersection__sphere_solid in pathtracer.cu.
-enum class GeometryKind { Triangle, Sphere, SolidSphere, Voxel, Sdf };
+enum class GeometryKind { Triangle, Sphere, SolidSphere, Voxel, Sdf, Gsplat };
 
 // One static-geometry object in the scene: a GAS (built once) plus the
 // material record it contributes to the SBT. `kind` selects which hit-group
@@ -85,21 +87,22 @@ struct OptixRenderer::Impl {
   OptixProgramGroup hitSolidSpherePG = nullptr;
   OptixProgramGroup hitVoxelPG = nullptr;
   OptixProgramGroup hitSdfPG = nullptr;
+  OptixProgramGroup hitGsplatPG = nullptr;
 
-  // Phase 7 caustics: a second SBT (photonSbt) sharing this same
-  // pipeline/context, used only for the photon-emission launch — see
-  // buildPhotonPipeline()'s comment for why a second SBT rather than
-  // ray-type-multiplexing the existing one. gatherHitPG/gatherMissPG,
-  // though, extend the *main* radianceSbt directly (the gather trace is
-  // issued from inside __closesthit__radiance, which runs under
-  // radianceSbt's binding — see the Params::gatherHitSbtOffset comment).
-  OptixProgramGroup photonRaygenPG = nullptr;
-  OptixProgramGroup photonMissPG = nullptr;
-  OptixProgramGroup photonHitTrianglePG = nullptr;
-  OptixProgramGroup photonHitSpherePG = nullptr;
-  OptixProgramGroup photonHitSolidSpherePG = nullptr;
-  OptixProgramGroup gatherHitPG = nullptr;
-  OptixProgramGroup gatherMissPG = nullptr;
+  // VCM Step 1 (see /home/joe/.claude/plans/what-is-the-next-wise-flurry.md):
+  // a second SBT (lightSubpathSbt) sharing this same pipeline/context, used
+  // only for the light-subpath-emission launch — see buildLightSubpathSbt()'s
+  // comment for why a second SBT rather than ray-type-multiplexing the
+  // existing one. Replaces the old phase-7 photon pipeline's equivalent
+  // program groups; there is deliberately no gatherHitPG/gatherMissPG
+  // equivalent here — Step 1 has no vertex *merging* (that gather-style
+  // range query is Step 2's job), so __closesthit__radiance just walks
+  // params.lightVertices as a plain array instead of tracing into a GAS.
+  OptixProgramGroup lightSubpathRaygenPG = nullptr;
+  OptixProgramGroup lightSubpathMissPG = nullptr;
+  OptixProgramGroup lightSubpathHitTrianglePG = nullptr;
+  OptixProgramGroup lightSubpathHitSpherePG = nullptr;
+  OptixProgramGroup lightSubpathHitSolidSpherePG = nullptr;
 
   // Phase 10 denoiser: __raygen__tonemap is a third raygen-only launch (its
   // own minimal SBT, no miss/hitgroup records — it never calls optixTrace)
@@ -157,6 +160,16 @@ struct OptixRenderer::Impl {
   // freed in destroy().
   CUdeviceptr sdfDistanceBuffer = 0;
 
+  // Device buffers backing a MATERIAL_GSPLAT object's per-primitive
+  // position/scale/rotation/opacity/color arrays — freed in destroy(). No
+  // AABB buffer kept alive: unlike voxels, __intersection__gsplat re-derives
+  // the ellipsoid from these directly rather than re-reading a box.
+  CUdeviceptr splatPositionBuffer = 0;
+  CUdeviceptr splatScaleBuffer = 0;
+  CUdeviceptr splatRotationBuffer = 0;
+  CUdeviceptr splatOpacityBuffer = 0;
+  CUdeviceptr splatColorBuffer = 0;
+
   // Environment/HDRI lighting (phase 6) — freed in destroy(). hasEnvironment
   // gates whether buildFixedTestScene/buildMeshScene/etc add a quad light at
   // all (see addBoundsKeyLight): the two lighting modes aren't blended.
@@ -169,31 +182,32 @@ struct OptixRenderer::Impl {
   int envWidth = 0;
   int envHeight = 0;
 
-  // Caustics (phase 7). Built for the fixed test scene (always has
-  // specular/glass objects) and, since the watertight-mesh gate made
-  // triangle-mesh dielectrics trustworthy, for a loaded mesh scene too —
-  // but only when it actually has a material that can seed one (see
-  // buildMeshScene's hasCausticEligibleMaterial scan): building the whole
-  // photon pipeline/SBT for an all-Lambert asset would cost a pass per
-  // frame for a permanently-empty photon map. Voxel/SDF scenes still never
-  // qualify (flat-diffuse-only, no per-primitive material to test).
-  // Global-radius progressive photon mapping — see Params::photonHandle's
-  // doc comment for which published variant this is.
-  bool enablePhotonMapping = false;
-  static constexpr unsigned int kPhotonBatchSize = 1u << 16; // 65536 photons/pass
-  static constexpr unsigned int kPhotonCapacity = 1u << 18;  // generous headroom over the batch size
-  static constexpr float kPpmAlpha = 0.7f;                   // standard PPM radius-decay constant
-  OptixShaderBindingTable photonSbt{};
-  CUdeviceptr photonBuffer = 0;      // Photon[kPhotonCapacity]
-  CUdeviceptr photonCounterBuffer = 0; // single atomic uint
-  CUdeviceptr photonGasBuffer = 0;
-  CUdeviceptr photonGasVertexBuffer = 0; // kept alive across rebuilds — see buildPhotonMap()
-  CUdeviceptr photonGasRadiusBuffer = 0;
-  OptixTraversableHandle photonGasHandle = 0;
-  unsigned int photonPassIndex = 0;
-  float photonRadius = 0.0f;
-  unsigned int totalPhotonsEmitted = 0;
-  unsigned int gatherHitSbtOffset = 0;
+  // VCM Step 1 light subpaths (see
+  // /home/joe/.claude/plans/what-is-the-next-wise-flurry.md). Replaces the
+  // old phase-7 photon/SPPM pipeline entirely. Built for the fixed test
+  // scene (always has specular/glass objects) and, since the
+  // watertight-mesh gate made triangle-mesh dielectrics trustworthy, for a
+  // loaded mesh scene too — but only when it actually has a material that
+  // can seed one (see buildMeshScene's scan): building the whole
+  // light-subpath pipeline/SBT for an all-Lambert asset would cost a pass
+  // per frame for a permanently-empty vertex buffer. Voxel/SDF/gsplat scenes
+  // still never qualify (no per-primitive material to test, and stay
+  // eye-path-only per the VCM plan's explicit scope boundary either way).
+  //
+  // kLightSubpathBatchSize is deliberately much smaller than the old photon
+  // pass's 65536: __closesthit__radiance's BDPT connection loop is O(stored
+  // vertices) *per diffuse eye hit*, with no spatial culling yet (that's
+  // vertex merging, Step 2's job) — a batch this size keeps that loop
+  // tractable for interactive use while Step 1 is unweighted/unpruned; Step
+  // 4 is where a real connection-count cap or subsampling scheme lands.
+  bool enableLightSubpaths = false;
+  static constexpr unsigned int kLightSubpathBatchSize = 512;
+  static constexpr unsigned int kLightVertexCapacity = 8192; // headroom over batchSize * the 12-bounce depth cap
+  OptixShaderBindingTable lightSubpathSbt{};
+  CUdeviceptr lightVertexBuffer = 0;        // LightVertex[kLightVertexCapacity]
+  CUdeviceptr lightVertexCounterBuffer = 0; // single atomic uint
+  unsigned int lightSubpathPassIndex = 0;
+  unsigned int totalLightPathsEmitted = 0;
 
   ~Impl() { destroy(); }
 
@@ -220,6 +234,16 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(voxelColorBuffer));
     if (sdfDistanceBuffer)
       cudaFree(reinterpret_cast<void *>(sdfDistanceBuffer));
+    if (splatPositionBuffer)
+      cudaFree(reinterpret_cast<void *>(splatPositionBuffer));
+    if (splatScaleBuffer)
+      cudaFree(reinterpret_cast<void *>(splatScaleBuffer));
+    if (splatRotationBuffer)
+      cudaFree(reinterpret_cast<void *>(splatRotationBuffer));
+    if (splatOpacityBuffer)
+      cudaFree(reinterpret_cast<void *>(splatOpacityBuffer));
+    if (splatColorBuffer)
+      cudaFree(reinterpret_cast<void *>(splatColorBuffer));
     if (envTexObj)
       cudaDestroyTextureObject(envTexObj);
     if (envArray)
@@ -228,22 +252,16 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(envMarginalCdfBuffer));
     if (envConditionalCdfBuffer)
       cudaFree(reinterpret_cast<void *>(envConditionalCdfBuffer));
-    if (photonBuffer)
-      cudaFree(reinterpret_cast<void *>(photonBuffer));
-    if (photonCounterBuffer)
-      cudaFree(reinterpret_cast<void *>(photonCounterBuffer));
-    if (photonGasBuffer)
-      cudaFree(reinterpret_cast<void *>(photonGasBuffer));
-    if (photonGasVertexBuffer)
-      cudaFree(reinterpret_cast<void *>(photonGasVertexBuffer));
-    if (photonGasRadiusBuffer)
-      cudaFree(reinterpret_cast<void *>(photonGasRadiusBuffer));
-    if (photonSbt.raygenRecord)
-      cudaFree(reinterpret_cast<void *>(photonSbt.raygenRecord));
-    if (photonSbt.missRecordBase)
-      cudaFree(reinterpret_cast<void *>(photonSbt.missRecordBase));
-    if (photonSbt.hitgroupRecordBase)
-      cudaFree(reinterpret_cast<void *>(photonSbt.hitgroupRecordBase));
+    if (lightVertexBuffer)
+      cudaFree(reinterpret_cast<void *>(lightVertexBuffer));
+    if (lightVertexCounterBuffer)
+      cudaFree(reinterpret_cast<void *>(lightVertexCounterBuffer));
+    if (lightSubpathSbt.raygenRecord)
+      cudaFree(reinterpret_cast<void *>(lightSubpathSbt.raygenRecord));
+    if (lightSubpathSbt.missRecordBase)
+      cudaFree(reinterpret_cast<void *>(lightSubpathSbt.missRecordBase));
+    if (lightSubpathSbt.hitgroupRecordBase)
+      cudaFree(reinterpret_cast<void *>(lightSubpathSbt.hitgroupRecordBase));
     if (tonemapSbt.raygenRecord)
       cudaFree(reinterpret_cast<void *>(tonemapSbt.raygenRecord));
     if (tonemapSbt.missRecordBase)
@@ -279,20 +297,18 @@ struct OptixRenderer::Impl {
       optixPipelineDestroy(pipeline);
     if (tonemapRaygenPG)
       optixProgramGroupDestroy(tonemapRaygenPG);
-    if (gatherMissPG)
-      optixProgramGroupDestroy(gatherMissPG);
-    if (gatherHitPG)
-      optixProgramGroupDestroy(gatherHitPG);
-    if (photonHitSolidSpherePG)
-      optixProgramGroupDestroy(photonHitSolidSpherePG);
-    if (photonHitSpherePG)
-      optixProgramGroupDestroy(photonHitSpherePG);
-    if (photonHitTrianglePG)
-      optixProgramGroupDestroy(photonHitTrianglePG);
-    if (photonMissPG)
-      optixProgramGroupDestroy(photonMissPG);
-    if (photonRaygenPG)
-      optixProgramGroupDestroy(photonRaygenPG);
+    if (lightSubpathHitSolidSpherePG)
+      optixProgramGroupDestroy(lightSubpathHitSolidSpherePG);
+    if (lightSubpathHitSpherePG)
+      optixProgramGroupDestroy(lightSubpathHitSpherePG);
+    if (lightSubpathHitTrianglePG)
+      optixProgramGroupDestroy(lightSubpathHitTrianglePG);
+    if (lightSubpathMissPG)
+      optixProgramGroupDestroy(lightSubpathMissPG);
+    if (lightSubpathRaygenPG)
+      optixProgramGroupDestroy(lightSubpathRaygenPG);
+    if (hitGsplatPG)
+      optixProgramGroupDestroy(hitGsplatPG);
     if (hitSdfPG)
       optixProgramGroupDestroy(hitSdfPG);
     if (hitVoxelPG)
@@ -415,58 +431,62 @@ struct OptixRenderer::Impl {
     hitSdfDesc.hitgroup.entryFunctionNameIS = "__intersection__sdf";
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitSdfDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitSdfPG));
 
-    // Phase 7 caustics: photon emission (own raygen/miss, reuses the
-    // triangle/sphere IS modules already built above) and the gather query
-    // (sphere IS + any-hit only, no closest-hit — see __anyhit__gather).
-    OptixProgramGroupDesc photonRaygenDesc{};
-    photonRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-    photonRaygenDesc.raygen.module = module;
-    photonRaygenDesc.raygen.entryFunctionName = "__raygen__photon";
+    // Roadmap phase 3: imported Gaussian splats. Custom-primitive ellipsoid
+    // intersection plus an any-hit for the stochastic alpha test (see
+    // MATERIAL_GSPLAT's doc comment in pathtracer_params.h) — the only hit
+    // group in this renderer that needs all three of IS/AH/CH.
+    OptixProgramGroupDesc hitGsplatDesc{};
+    hitGsplatDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitGsplatDesc.hitgroup.moduleCH = module;
+    hitGsplatDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+    hitGsplatDesc.hitgroup.moduleAH = module;
+    hitGsplatDesc.hitgroup.entryFunctionNameAH = "__anyhit__gsplat";
+    hitGsplatDesc.hitgroup.moduleIS = module;
+    hitGsplatDesc.hitgroup.entryFunctionNameIS = "__intersection__gsplat";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitGsplatDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitGsplatPG));
+
+    // VCM Step 1: light-subpath emission (own raygen/miss, reuses the
+    // triangle/sphere IS modules already built above). No gather-style
+    // any-hit query here — Step 1 has no vertex merging, so
+    // __closesthit__radiance's BDPT connections just walk
+    // params.lightVertices as a plain array (see that comment).
+    OptixProgramGroupDesc lightSubpathRaygenDesc{};
+    lightSubpathRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    lightSubpathRaygenDesc.raygen.module = module;
+    lightSubpathRaygenDesc.raygen.entryFunctionName = "__raygen__lightSubpath";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &lightSubpathRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &lightSubpathRaygenPG));
+
+    OptixProgramGroupDesc lightSubpathMissDesc{};
+    lightSubpathMissDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    lightSubpathMissDesc.miss.module = module;
+    lightSubpathMissDesc.miss.entryFunctionName = "__miss__lightSubpath";
     OPTIX_CHECK_LOG(
-        optixProgramGroupCreate(context, &photonRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonRaygenPG));
+        optixProgramGroupCreate(context, &lightSubpathMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &lightSubpathMissPG));
 
-    OptixProgramGroupDesc photonMissDesc{};
-    photonMissDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
-    photonMissDesc.miss.module = module;
-    photonMissDesc.miss.entryFunctionName = "__miss__photon";
-    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &photonMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonMissPG));
+    OptixProgramGroupDesc lightSubpathHitTriDesc{};
+    lightSubpathHitTriDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    lightSubpathHitTriDesc.hitgroup.moduleCH = module;
+    lightSubpathHitTriDesc.hitgroup.entryFunctionNameCH = "__closesthit__lightSubpath";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &lightSubpathHitTriDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &lightSubpathHitTrianglePG));
 
-    OptixProgramGroupDesc photonHitTriDesc{};
-    photonHitTriDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
-    photonHitTriDesc.hitgroup.moduleCH = module;
-    photonHitTriDesc.hitgroup.entryFunctionNameCH = "__closesthit__photon";
-    OPTIX_CHECK_LOG(
-        optixProgramGroupCreate(context, &photonHitTriDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonHitTrianglePG));
+    OptixProgramGroupDesc lightSubpathHitSphereDesc{};
+    lightSubpathHitSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    lightSubpathHitSphereDesc.hitgroup.moduleCH = module;
+    lightSubpathHitSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__lightSubpath";
+    lightSubpathHitSphereDesc.hitgroup.moduleIS = sphereModule;
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &lightSubpathHitSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &lightSubpathHitSpherePG));
 
-    OptixProgramGroupDesc photonHitSphereDesc{};
-    photonHitSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
-    photonHitSphereDesc.hitgroup.moduleCH = module;
-    photonHitSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__photon";
-    photonHitSphereDesc.hitgroup.moduleIS = sphereModule;
-    OPTIX_CHECK_LOG(
-        optixProgramGroupCreate(context, &photonHitSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE, &photonHitSpherePG));
-
-    OptixProgramGroupDesc photonHitSolidSphereDesc{};
-    photonHitSolidSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
-    photonHitSolidSphereDesc.hitgroup.moduleCH = module;
-    photonHitSolidSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__photon";
-    photonHitSolidSphereDesc.hitgroup.moduleIS = module;
-    photonHitSolidSphereDesc.hitgroup.entryFunctionNameIS = "__intersection__sphere_solid";
-    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &photonHitSolidSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE,
-                                             &photonHitSolidSpherePG));
-
-    OptixProgramGroupDesc gatherHitDesc{};
-    gatherHitDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
-    gatherHitDesc.hitgroup.moduleAH = module;
-    gatherHitDesc.hitgroup.entryFunctionNameAH = "__anyhit__gather";
-    gatherHitDesc.hitgroup.moduleIS = sphereModule; // photons are spheres of radius photonGatherRadius
-    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &gatherHitDesc, 1, &pgOptions, LOG, &LOG_SIZE, &gatherHitPG));
-
-    OptixProgramGroupDesc gatherMissDesc{};
-    gatherMissDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
-    gatherMissDesc.miss.module = module;
-    gatherMissDesc.miss.entryFunctionName = "__miss__gather";
-    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &gatherMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &gatherMissPG));
+    OptixProgramGroupDesc lightSubpathHitSolidSphereDesc{};
+    lightSubpathHitSolidSphereDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    lightSubpathHitSolidSphereDesc.hitgroup.moduleCH = module;
+    lightSubpathHitSolidSphereDesc.hitgroup.entryFunctionNameCH = "__closesthit__lightSubpath";
+    lightSubpathHitSolidSphereDesc.hitgroup.moduleIS = module;
+    lightSubpathHitSolidSphereDesc.hitgroup.entryFunctionNameIS = "__intersection__sphere_solid";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &lightSubpathHitSolidSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &lightSubpathHitSolidSpherePG));
 
     // Phase 10 denoiser: raygen-only, never calls optixTrace.
     OptixProgramGroupDesc tonemapRaygenDesc{};
@@ -478,15 +498,27 @@ struct OptixRenderer::Impl {
   }
 
   void buildPipeline() {
-    OptixProgramGroup groups[] = {raygenPG,           missRadiancePG,      missOcclusionPG,   hitTrianglePG,
-                                   hitSpherePG,        hitSolidSpherePG,    hitVoxelPG,        hitSdfPG,
-                                   photonRaygenPG,     photonMissPG,        photonHitTrianglePG,
-                                   photonHitSpherePG,  photonHitSolidSpherePG, gatherHitPG,
-                                   gatherMissPG,       tonemapRaygenPG};
+    OptixProgramGroup groups[] = {raygenPG,
+                                   missRadiancePG,
+                                   missOcclusionPG,
+                                   hitTrianglePG,
+                                   hitSpherePG,
+                                   hitSolidSpherePG,
+                                   hitVoxelPG,
+                                   hitSdfPG,
+                                   hitGsplatPG,
+                                   lightSubpathRaygenPG,
+                                   lightSubpathMissPG,
+                                   lightSubpathHitTrianglePG,
+                                   lightSubpathHitSpherePG,
+                                   lightSubpathHitSolidSpherePG,
+                                   tonemapRaygenPG};
     OptixPipelineLinkOptions linkOptions{};
     // raygen -> radiance hit -> occlusion shadow ray (2), or raygen ->
-    // radiance hit -> gather query (2), or photon-raygen -> photon-hit (1,
-    // no nested trace) — 2 covers every path in this pipeline.
+    // radiance hit -> BDPT-connection occlusion shadow ray (2, same
+    // traceOcclusion() call as NEE — see __closesthit__radiance), or
+    // light-subpath-raygen -> light-subpath-hit (1, no nested trace) — 2
+    // covers every path in this pipeline.
     const uint32_t maxTraceDepth = 2;
     linkOptions.maxTraceDepth = maxTraceDepth;
     OPTIX_CHECK_LOG(optixPipelineCreate(context, &pipelineCompileOptions, &linkOptions, groups,
@@ -508,8 +540,12 @@ struct OptixRenderer::Impl {
   //
   // PREFER_FAST_TRACE by default: each AS is built once at scene load and
   // then traced for the rest of the session, so build time is irrelevant and
-  // traversal time is everything (doctrine rung 2). The photon GAS is the one
-  // exception — it is rebuilt every frame, so it passes FAST_BUILD instead.
+  // traversal time is everything (doctrine rung 2). VCM Step 1 has no
+  // per-frame AS rebuild at all — the old phase-7 photon GAS (the one
+  // FAST_BUILD exception this comment used to describe) is gone along with
+  // the rest of that pipeline; __closesthit__radiance walks
+  // params.lightVertices as a plain array instead. A per-frame rebuild
+  // returns in Step 2, once there's a vertex *merging* query to accelerate.
   //
   // Callers whose closest-hit programs call optixGetTriangleVertexData or
   // optixGetSphereData must pass ALLOW_RANDOM_VERTEX_ACCESS. That is a
@@ -766,8 +802,8 @@ struct OptixRenderer::Impl {
     input.triangleArray.flags = flags;
     input.triangleArray.numSbtRecords = 1;
 
-    // Random vertex access as well: __closesthit__photon derives its normal
-    // via optixGetTriangleVertexData, and photon mapping now runs for
+    // Random vertex access as well: __closesthit__lightSubpath derives its
+    // normal via optixGetTriangleVertexData, and light subpaths now run for
     // loaded-mesh scenes.
     obj.gas = buildAccel(input, obj.gasBuffer, kTracedGeometryFlags);
     cudaFree(reinterpret_cast<void *>(vertexBuffer));
@@ -852,6 +888,75 @@ struct OptixRenderer::Impl {
     return obj;
   }
 
+  // One custom AABB per splat (3-sigma ellipsoid bound, see
+  // convert/gsplat_bounds.h) feeds the BVH build; __intersection__gsplat and
+  // __anyhit__gsplat re-derive the actual ellipsoid/Gaussian directly from
+  // the position/scale/rotation/opacity/color arrays below rather than
+  // re-reading the AABB, so — like buildSdfObject/buildSolidSphereObject,
+  // unlike buildVoxelObject — the AABB buffer only needs to survive the
+  // build.
+  SceneObject buildSplatObject(const GsplatAsset &splats) {
+    SceneObject obj;
+    obj.kind = GeometryKind::Gsplat;
+    obj.material.materialType = MATERIAL_GSPLAT;
+
+    std::vector<OptixAabb> aabbs(splats.count());
+    for (size_t i = 0; i < splats.count(); ++i) {
+      const auto [lo, hi] = computeSplatAabb(splats.positions[i], splats.scales[i], splats.rotations[i]);
+      aabbs[i] = OptixAabb{lo.x, lo.y, lo.z, hi.x, hi.y, hi.z};
+    }
+    CUdeviceptr aabbBuffer;
+    const size_t aabbBytes = aabbs.size() * sizeof(OptixAabb);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&aabbBuffer), aabbBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(aabbBuffer), aabbs.data(), aabbBytes, cudaMemcpyHostToDevice));
+
+    std::vector<float3> positions(splats.count());
+    std::vector<float3> scales(splats.count());
+    std::vector<float4> rotations(splats.count());
+    std::vector<float3> colors(splats.count());
+    for (size_t i = 0; i < splats.count(); ++i) {
+      positions[i] = toFloat3(splats.positions[i]);
+      scales[i] = toFloat3(splats.scales[i]);
+      rotations[i] = make_float4(splats.rotations[i].x, splats.rotations[i].y, splats.rotations[i].z,
+                                  splats.rotations[i].w);
+      colors[i] = toFloat3(splats.colorDC[i]);
+    }
+    splatPositionBuffer = uploadVector(positions);
+    obj.material.splatPositions = reinterpret_cast<float3 *>(splatPositionBuffer);
+    splatScaleBuffer = uploadVector(scales);
+    obj.material.splatScales = reinterpret_cast<float3 *>(splatScaleBuffer);
+    splatRotationBuffer = uploadVector(rotations);
+    obj.material.splatRotations = reinterpret_cast<float4 *>(splatRotationBuffer);
+    splatOpacityBuffer = uploadVector(splats.opacity);
+    obj.material.splatOpacity = reinterpret_cast<float *>(splatOpacityBuffer);
+    splatColorBuffer = uploadVector(colors);
+    obj.material.splatColors = reinterpret_cast<float3 *>(splatColorBuffer);
+
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    input.customPrimitiveArray.aabbBuffers = &aabbBuffer;
+    input.customPrimitiveArray.numPrimitives = static_cast<unsigned int>(aabbs.size());
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.customPrimitiveArray.flags = flags;
+    input.customPrimitiveArray.numSbtRecords = 1;
+
+    obj.gas = buildAccel(input, obj.gasBuffer);
+    cudaFree(reinterpret_cast<void *>(aabbBuffer));
+    return obj;
+  }
+
+  void buildSplatScene(const GsplatAsset &splats) {
+    objects.push_back(buildSplatObject(splats));
+    boundsCenter = splats.boundsCenter();
+    boundsRadius = std::max(splats.boundsRadius(), 1e-3f);
+    addGroundPlane(boundsCenter, boundsRadius, splats.boundsMin.y);
+    addBoundsKeyLight(boundsCenter, boundsRadius);
+    // No light-subpath eligibility, same reasoning as voxel/SDF scenes: flat
+    // diffuse only, no per-primitive material to test for a specular/
+    // transmissive lobe, and eye-path-only per the VCM plan's scope boundary
+    // regardless (see enableLightSubpaths' other doc comments).
+  }
+
   void buildFixedTestScene() {
     HitGroupData groundMat{};
     groundMat.materialType = MATERIAL_DIFFUSE;
@@ -899,23 +1004,17 @@ struct OptixRenderer::Impl {
     boundsCenter = glm::vec3(0.0f, 0.2f, 0.0f);
     boundsRadius = 3.0f;
 
-    // Caustics only make sense here: this is the only scene with specular
-    // (mirror/glass) objects to seed one from — mesh/voxel/SDF scenes are
-    // always MATERIAL_TEXTURED_DIFFUSE/VOXEL/SDF, none of which
-    // __closesthit__photon treats as specular, so they cannot produce a
-    // caustic no matter how the light is set up (their only current material
-    // model is GGX metallic-roughness reflectance, not glass/mirror
-    // transmission — a real gltF dielectric/transmission material is future
-    // work, see the marker on MATERIAL_TEXTURED_DIFFUSE's doc comment).
+    // Light subpaths only make sense here: this is the only scene with
+    // specular (mirror/glass) objects for a subpath to bounce through en
+    // route to a connectable diffuse vertex — mesh/voxel/SDF scenes are
+    // always MATERIAL_TEXTURED_DIFFUSE/VOXEL/SDF, and voxel/SDF stay
+    // eye-path-only per the VCM plan's scope boundary regardless.
     //
-    // No longer gated on !hasEnvironment: caustics used to be turned off
-    // outright the moment any HDRI was loaded, even for this scene, which
-    // does have real specular geometry to seed one from either way — photon
-    // emission just needed to learn to sample the environment instead of
-    // the quad light (see emitFromEnvironment in pathtracer.cu), the same
-    // way NEE already treats the two lighting modes as alternatives, not as
-    // a reason to drop a feature.
-    enablePhotonMapping = true;
+    // Not gated on !hasEnvironment: light-subpath emission follows whichever
+    // lighting mode NEE is using (see emitFromEnvironment in pathtracer.cu),
+    // the same way NEE already treats the two as alternatives, not a reason
+    // to drop a feature.
+    enableLightSubpaths = true;
   }
 
   // A neutral plane just under the object, so it has something to cast a
@@ -983,13 +1082,14 @@ struct OptixRenderer::Impl {
     addGroundPlane(boundsCenter, boundsRadius, mesh.boundsMin.y);
     addBoundsKeyLight(boundsCenter, boundsRadius);
 
-    // Same eligibility test __closesthit__photon's MATERIAL_TEXTURED_DIFFUSE
-    // branch uses (KHR_materials_transmission, or a mirror-like metallic/
-    // roughness combo) — checked here purely to decide whether it's worth
-    // building the photon pipeline at all, not to duplicate its logic.
+    // Same eligibility test __closesthit__lightSubpath's MATERIAL_TEXTURED_
+    // DIFFUSE branch uses (KHR_materials_transmission, or a mirror-like
+    // metallic/roughness combo) — checked here purely to decide whether it's
+    // worth building the light-subpath pipeline at all, not to duplicate its
+    // logic.
     for (const MaterialAsset &m : mesh.materials) {
       if (m.transmission > 0.0f || (m.metallic > kCausticMirrorMetallic && m.roughness < kCausticMirrorRoughness)) {
-        enablePhotonMapping = true;
+        enableLightSubpaths = true;
         break;
       }
     }
@@ -1065,7 +1165,9 @@ struct OptixRenderer::Impl {
     if (source.environment)
       buildEnvironment(*source.environment);
 
-    if (source.sdf)
+    if (source.splats)
+      buildSplatScene(*source.splats);
+    else if (source.sdf)
       buildSdfScene(*source.sdf);
     else if (source.voxels)
       buildVoxelScene(*source.voxels);
@@ -1076,37 +1178,38 @@ struct OptixRenderer::Impl {
 
     buildIAS();
 
-    if (enablePhotonMapping) {
-      buildPhotonSbt();
-      photonRadius = boundsRadius * 0.05f;
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonBuffer), sizeof(Photon) * kPhotonCapacity));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonCounterBuffer), sizeof(unsigned int)));
+    if (enableLightSubpaths) {
+      buildLightSubpathSbt();
+      CUDA_CHECK(
+          cudaMalloc(reinterpret_cast<void **>(&lightVertexBuffer), sizeof(LightVertex) * kLightVertexCapacity));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&lightVertexCounterBuffer), sizeof(unsigned int)));
     }
   }
 
-  // A second SBT sharing this same pipeline, used only for the photon-
-  // emission launch. optixLaunch's SBT argument is what resolves every
-  // trace call's hit-group/miss index for programs invoked *by* that
-  // launch (raygen and anything reached from it) — so __raygen__photon's
-  // own optixTrace(params.handle, ..., sbtOffset=<object index>, ...) calls
-  // resolve against *this* table, reaching __closesthit__photon for the
-  // same objects that radianceSbt resolves to __closesthit__radiance.
-  // That's the whole reason this needs to be a separate table rather than
-  // extending radianceSbt (like the gather hit-group is): the emission
-  // raygen hits the *same* scene instances as the camera raygen, and
-  // instance.sbtOffset is baked into the IAS at object-index granularity,
-  // not ray-type granularity — a second SBT sidesteps needing to introduce
-  // ray-type-multiplexed indexing (sbtOffset*RAY_TYPE_COUNT+rayType) into
-  // the already-verified radiance/occlusion indexing at all.
-  void buildPhotonSbt() {
+  // A second SBT sharing this same pipeline, used only for the
+  // light-subpath-emission launch. optixLaunch's SBT argument is what
+  // resolves every trace call's hit-group/miss index for programs invoked
+  // *by* that launch (raygen and anything reached from it) — so
+  // __raygen__lightSubpath's own optixTrace(params.handle, ...,
+  // sbtOffset=<object index>, ...) calls resolve against *this* table,
+  // reaching __closesthit__lightSubpath for the same objects that
+  // radianceSbt resolves to __closesthit__radiance. That's the whole reason
+  // this needs to be a separate table rather than extending radianceSbt: the
+  // emission raygen hits the *same* scene instances as the camera raygen,
+  // and instance.sbtOffset is baked into the IAS at object-index
+  // granularity, not ray-type granularity — a second SBT sidesteps needing
+  // to introduce ray-type-multiplexed indexing
+  // (sbtOffset*RAY_TYPE_COUNT+rayType) into the already-verified
+  // radiance/occlusion indexing at all.
+  void buildLightSubpathSbt() {
     RayGenRecord rgRecord{};
-    OPTIX_CHECK(optixSbtRecordPackHeader(photonRaygenPG, &rgRecord));
+    OPTIX_CHECK(optixSbtRecordPackHeader(lightSubpathRaygenPG, &rgRecord));
     CUdeviceptr d_rg;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
 
     MissRecord missRecord{};
-    OPTIX_CHECK(optixSbtRecordPackHeader(photonMissPG, &missRecord));
+    OPTIX_CHECK(optixSbtRecordPackHeader(lightSubpathMissPG, &missRecord));
     CUdeviceptr d_miss;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecord)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_miss), &missRecord, sizeof(missRecord), cudaMemcpyHostToDevice));
@@ -1114,16 +1217,16 @@ struct OptixRenderer::Impl {
     std::vector<HitGroupRecord> hitRecords(objects.size());
     for (size_t i = 0; i < objects.size(); ++i) {
       // Fixed test scene only ever has triangle/sphere objects (see
-      // enablePhotonMapping) — no voxel/sdf case to handle here. The solid
+      // enableLightSubpaths) — no voxel/sdf case to handle here. The solid
       // sphere does need its own entry: it is a custom primitive, so packing
       // it against the triangle program group would leave it with no
       // intersection program at all and the glass would vanish from the
-      // photon pass — taking the caustic with it.
-      OptixProgramGroup pg = photonHitTrianglePG;
+      // light-subpath pass.
+      OptixProgramGroup pg = lightSubpathHitTrianglePG;
       if (objects[i].kind == GeometryKind::Sphere)
-        pg = photonHitSpherePG;
+        pg = lightSubpathHitSpherePG;
       else if (objects[i].kind == GeometryKind::SolidSphere)
-        pg = photonHitSolidSpherePG;
+        pg = lightSubpathHitSolidSpherePG;
       OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
       hitRecords[i].data = objects[i].material;
     }
@@ -1132,95 +1235,45 @@ struct OptixRenderer::Impl {
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_hit), hitBytes));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_hit), hitRecords.data(), hitBytes, cudaMemcpyHostToDevice));
 
-    photonSbt.raygenRecord = d_rg;
-    photonSbt.missRecordBase = d_miss;
-    photonSbt.missRecordStrideInBytes = sizeof(MissRecord);
-    photonSbt.missRecordCount = 1;
-    photonSbt.hitgroupRecordBase = d_hit;
-    photonSbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
-    photonSbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
+    lightSubpathSbt.raygenRecord = d_rg;
+    lightSubpathSbt.missRecordBase = d_miss;
+    lightSubpathSbt.missRecordStrideInBytes = sizeof(MissRecord);
+    lightSubpathSbt.missRecordCount = 1;
+    lightSubpathSbt.hitgroupRecordBase = d_hit;
+    lightSubpathSbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
+    lightSubpathSbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
   }
 
-  // Emits one pass of photons (the caller must already have uploaded a
-  // Params with photons/photonCounter/photonCapacity/photonBatchSize/light/
-  // handle set, for the emission launch itself to read), then rebuilds the
-  // photon BVH (a GAS of uniform-radius spheres, one per deposited photon).
-  // Returns the radius baked into that GAS — the caller needs this exact
-  // value for the *next* Params upload (params.photonGatherRadius), since
-  // photonRadius itself is shrunk here in preparation for next pass and no
-  // longer matches what was just built. Called once per render() call — see
-  // that function for why camera movement doesn't reset any of this (the
-  // photon map is view-independent).
-  float tracePhotonPass() {
-    const float radiusThisPass = photonRadius;
-    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(photonCounterBuffer), 0, sizeof(unsigned int), stream));
-    OPTIX_CHECK(optixLaunch(pipeline, stream, paramsBuffer, sizeof(Params), &photonSbt, kPhotonBatchSize, 1, 1));
+  // Emits one pass of light subpaths (the caller must already have uploaded
+  // a Params with lightVertices/lightVertexCounter/lightVertexCapacity/
+  // lightSubpathBatchSize/light/handle set, for the emission launch itself
+  // to read). Returns the number of vertices deposited this pass (clamped to
+  // capacity) so the caller can set Params::lightVertexCount for the main
+  // eye-path launch that follows. Called once per render() call, same as the
+  // old photon pass — see that function for why camera movement doesn't
+  // reset any of this (light subpaths are view-independent).
+  //
+  // Unlike the phase-7 photon pass this replaces, there is no acceleration
+  // structure rebuild here: Step 1 has no vertex *merging*, so
+  // __closesthit__radiance just iterates params.lightVertices directly (see
+  // its doc comment in pathtracer_params.h). Step 2 is what adds a
+  // per-frame GAS rebuild over this same buffer for the merge query.
+  unsigned int traceLightSubpathPass() {
+    CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(lightVertexCounterBuffer), 0, sizeof(unsigned int), stream));
+    OPTIX_CHECK(
+        optixLaunch(pipeline, stream, paramsBuffer, sizeof(Params), &lightSubpathSbt, kLightSubpathBatchSize, 1, 1));
 
     unsigned int deposited = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&deposited, reinterpret_cast<void *>(photonCounterBuffer), sizeof(unsigned int),
+    CUDA_CHECK(cudaMemcpyAsync(&deposited, reinterpret_cast<void *>(lightVertexCounterBuffer), sizeof(unsigned int),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    deposited = std::min(deposited, kPhotonCapacity);
-    if (photonPassIndex < 3 || photonPassIndex % 64 == 0)
-      std::fprintf(stderr, "italy: photon pass %u: %u caustic photons deposited (radius %.4f)\n", photonPassIndex,
-                   deposited, radiusThisPass);
-
-    if (deposited > 0) {
-      if (photonGasBuffer) {
-        cudaFree(reinterpret_cast<void *>(photonGasBuffer));
-        photonGasBuffer = 0;
-      }
-      if (photonGasVertexBuffer) {
-        cudaFree(reinterpret_cast<void *>(photonGasVertexBuffer));
-        photonGasVertexBuffer = 0;
-      }
-      if (photonGasRadiusBuffer) {
-        cudaFree(reinterpret_cast<void *>(photonGasRadiusBuffer));
-        photonGasRadiusBuffer = 0;
-      }
-
-      // The sphere build input wants a plain position buffer, but Photon
-      // interleaves position/direction/power — extract just the positions
-      // rather than fighting a non-float3 stride through the sphere API.
-      std::vector<Photon> photonsHost(deposited);
-      CUDA_CHECK(cudaMemcpy(photonsHost.data(), reinterpret_cast<void *>(photonBuffer), deposited * sizeof(Photon),
-                             cudaMemcpyDeviceToHost));
-      std::vector<float3> positions(deposited);
-      for (unsigned int i = 0; i < deposited; ++i)
-        positions[i] = photonsHost[i].position;
-
-      CUDA_CHECK(
-          cudaMalloc(reinterpret_cast<void **>(&photonGasVertexBuffer), deposited * sizeof(float3)));
-      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(photonGasVertexBuffer), positions.data(),
-                             deposited * sizeof(float3), cudaMemcpyHostToDevice));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&photonGasRadiusBuffer), sizeof(float)));
-      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(photonGasRadiusBuffer), &radiusThisPass, sizeof(float),
-                             cudaMemcpyHostToDevice));
-
-      OptixBuildInput input{};
-      input.type = OPTIX_BUILD_INPUT_TYPE_SPHERES;
-      input.sphereArray.vertexBuffers = &photonGasVertexBuffer;
-      input.sphereArray.numVertices = deposited;
-      input.sphereArray.radiusBuffers = &photonGasRadiusBuffer;
-      input.sphereArray.singleRadius = 1;
-      static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
-      input.sphereArray.flags = flags;
-      input.sphereArray.numSbtRecords = 1;
-
-      // The one AS here that is rebuilt every single frame, so it is the one
-      // that wants a cheap build over a fast traversal.
-      photonGasHandle = buildAccel(input, photonGasBuffer, OPTIX_BUILD_FLAG_PREFER_FAST_BUILD);
-    } else {
-      photonGasHandle = 0; // no caustic photons yet this run — gather becomes a no-op (see photonHandle==0 check)
-    }
-
-    totalPhotonsEmitted += kPhotonBatchSize;
-    // Original (non-stochastic-per-point) PPM radius decay, Hachisuka/Ogaki/
-    // Jensen 2008: R shrinks roughly as 1/sqrt(pass index), guaranteeing the
-    // density-estimate bias vanishes as passes -> infinity.
-    photonRadius *= std::sqrt((photonPassIndex + kPpmAlpha) / (photonPassIndex + 1.0f));
-    ++photonPassIndex;
-    return radiusThisPass;
+    deposited = std::min(deposited, kLightVertexCapacity);
+    if (lightSubpathPassIndex < 3 || lightSubpathPassIndex % 64 == 0)
+      std::fprintf(stderr, "italy: light-subpath pass %u: %u vertices deposited\n", lightSubpathPassIndex,
+                   deposited);
+    ++lightSubpathPassIndex;
+    totalLightPathsEmitted += kLightSubpathBatchSize;
+    return deposited;
   }
 
   void buildIAS() {
@@ -1260,26 +1313,22 @@ struct OptixRenderer::Impl {
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
 
-    // Miss index 2 (__miss__gather) backs the photon gather query issued
-    // from inside __closesthit__radiance — see Params::photonHandle. It's
-    // appended unconditionally (harmless/unused when there's no photon map)
-    // rather than only when enablePhotonMapping, since the alternative is a
-    // second SBT-layout variant to keep straight.
-    MissRecord missRecords[3]{};
+    // Just the two miss programs radiance/occlusion always needed. VCM
+    // Step 1 has no third (gather-style) trace from inside
+    // __closesthit__radiance — the BDPT connection loop's shadow rays reuse
+    // missOcclusionPG via the same traceOcclusion() helper NEE already
+    // calls, so there is no separate miss index or SBT-layout variant to
+    // carry the way the old phase-7 gather query needed.
+    MissRecord missRecords[2]{};
     OPTIX_CHECK(optixSbtRecordPackHeader(missRadiancePG, &missRecords[0]));
     missRecords[0].data.bgColor = make_float3(0.05f, 0.06f, 0.08f);
     OPTIX_CHECK(optixSbtRecordPackHeader(missOcclusionPG, &missRecords[1]));
-    OPTIX_CHECK(optixSbtRecordPackHeader(gatherMissPG, &missRecords[2]));
     CUdeviceptr d_miss;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecords)));
     CUDA_CHECK(
         cudaMemcpy(reinterpret_cast<void *>(d_miss), missRecords, sizeof(missRecords), cudaMemcpyHostToDevice));
 
-    // One extra record past the per-object ones, for the gather hit-group —
-    // see Params::gatherHitSbtOffset for why it has to live at a
-    // scene-object-count-dependent index rather than a fixed one.
-    gatherHitSbtOffset = static_cast<unsigned int>(objects.size());
-    std::vector<HitGroupRecord> hitRecords(objects.size() + 1);
+    std::vector<HitGroupRecord> hitRecords(objects.size());
     for (size_t i = 0; i < objects.size(); ++i) {
       OptixProgramGroup pg;
       switch (objects[i].kind) {
@@ -1295,6 +1344,9 @@ struct OptixRenderer::Impl {
       case GeometryKind::Sdf:
         pg = hitSdfPG;
         break;
+      case GeometryKind::Gsplat:
+        pg = hitGsplatPG;
+        break;
       default:
         pg = hitTrianglePG;
         break;
@@ -1302,7 +1354,6 @@ struct OptixRenderer::Impl {
       OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
       hitRecords[i].data = objects[i].material;
     }
-    OPTIX_CHECK(optixSbtRecordPackHeader(gatherHitPG, &hitRecords[gatherHitSbtOffset]));
     CUdeviceptr d_hit;
     const size_t hitBytes = hitRecords.size() * sizeof(HitGroupRecord);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_hit), hitBytes));
@@ -1311,7 +1362,7 @@ struct OptixRenderer::Impl {
     sbt.raygenRecord = d_rg;
     sbt.missRecordBase = d_miss;
     sbt.missRecordStrideInBytes = sizeof(MissRecord);
-    sbt.missRecordCount = 3;
+    sbt.missRecordCount = 2;
     sbt.hitgroupRecordBase = d_hit;
     sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
     sbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
@@ -1344,12 +1395,13 @@ struct OptixRenderer::Impl {
         cudaMalloc(reinterpret_cast<void **>(&denoisedBuffer), static_cast<size_t>(width) * height * sizeof(float4)));
   }
 
-  // Third SBT, same reasoning as photonSbt: __raygen__tonemap runs under its
-  // own launch, and needs a raygen record packed for tonemapRaygenPG rather
-  // than whatever's in radianceSbt's raygen slot. No miss/hitgroup records
-  // at all (not just "unused, harmless" like photonSbt's radiance-table
-  // reuse pattern elsewhere) — this raygen never calls optixTrace, so there
-  // is nothing for those tables to ever be consulted for.
+  // Third SBT, same reasoning as lightSubpathSbt: __raygen__tonemap runs
+  // under its own launch, and needs a raygen record packed for
+  // tonemapRaygenPG rather than whatever's in radianceSbt's raygen slot. No
+  // hitgroup records at all (not just "unused, harmless" like
+  // lightSubpathSbt's radiance-table reuse pattern elsewhere) — this raygen
+  // never calls optixTrace, so there is nothing for those tables to ever be
+  // consulted for.
   void buildTonemapSbt() {
     RayGenRecord rgRecord{};
     OPTIX_CHECK(optixSbtRecordPackHeader(tonemapRaygenPG, &rgRecord));
@@ -1361,12 +1413,14 @@ struct OptixRenderer::Impl {
     // OptiX validates that missRecordBase is non-null even though this
     // raygen never calls optixTrace and so can never actually reach a miss
     // program — "no miss table at all" (missRecordCount=0, base=nullptr, as
-    // photonSbt's hitgroup table gets away with) isn't accepted for miss
-    // specifically. gatherMissPG (an empty no-op, see __miss__gather) is a
-    // convenient already-existing dummy target that's equally never invoked
-    // here in practice.
+    // lightSubpathSbt's hitgroup table gets away with) isn't accepted for
+    // miss specifically. missOcclusionPG (a real miss program elsewhere in
+    // this pipeline, but one this raygen can never reach either way, since
+    // it never calls optixTrace) is a convenient already-existing dummy
+    // target now that the old gather-query's dedicated no-op miss program is
+    // gone along with the rest of that pipeline.
     MissRecord missRecord{};
-    OPTIX_CHECK(optixSbtRecordPackHeader(gatherMissPG, &missRecord));
+    OPTIX_CHECK(optixSbtRecordPackHeader(missOcclusionPG, &missRecord));
     CUdeviceptr d_miss;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecord)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_miss), &missRecord, sizeof(missRecord), cudaMemcpyHostToDevice));
@@ -1460,33 +1514,32 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
     params.envWidth = impl_->envWidth;
     params.envHeight = impl_->envHeight;
   }
-  params.gatherHitSbtOffset = impl_->gatherHitSbtOffset;
-
-  // Caustics: run one photon-emission pass and rebuild the photon BVH
-  // *before* the main launch, so this frame's gather queries see it. Not
-  // gated on camera movement (unlike accumBuffer/subframeIndex) — the
-  // photon map doesn't depend on the camera at all, so it keeps
-  // progressively refining regardless of orbiting/panning.
-  if (impl_->enablePhotonMapping) {
-    params.photons = reinterpret_cast<Photon *>(impl_->photonBuffer);
-    params.photonCounter = reinterpret_cast<unsigned int *>(impl_->photonCounterBuffer);
-    params.photonCapacity = Impl::kPhotonCapacity;
-    params.photonBatchSize = Impl::kPhotonBatchSize;
-    // Must be set *before* this upload, not after: __raygen__photon seeds its
-    // RNG from totalPhotonsEmitted, so it is read by the emission launch that
-    // tracePhotonPass() issues below. Assigning it afterwards (as this did)
-    // meant the emission launch always saw the value-initialized 0, so every
-    // pass re-emitted the identical 65536 photons to the identical positions
-    // and the "progressive" photon map never progressed — only the gather
-    // radius shrank, over a frozen photon set. The tell was the per-pass
-    // deposited-count log printing the same number every time.
-    params.totalPhotonsEmitted = impl_->totalPhotonsEmitted;
+  // VCM Step 1: run one light-subpath-emission pass before the main launch,
+  // so this frame's BDPT connections see it. Not gated on camera movement
+  // (unlike accumBuffer/subframeIndex) — light subpaths don't depend on the
+  // camera at all, so they keep progressively refreshing regardless of
+  // orbiting/panning. Also gated on settings.lightSubpaths, the plan's own
+  // A/B verification switch (see RenderSettings::lightSubpaths' doc
+  // comment) — lightVertexCount defaults to 0 (Params{} value-init), which
+  // makes __closesthit__radiance's connection loop a no-op, the same
+  // "reduces to today's NEE-only behaviour" fallback the old
+  // photonHandle == 0 convention gave.
+  if (impl_->enableLightSubpaths && settings.lightSubpaths) {
+    params.lightVertices = reinterpret_cast<LightVertex *>(impl_->lightVertexBuffer);
+    params.lightVertexCounter = reinterpret_cast<unsigned int *>(impl_->lightVertexCounterBuffer);
+    params.lightVertexCapacity = Impl::kLightVertexCapacity;
+    params.lightSubpathBatchSize = Impl::kLightSubpathBatchSize;
+    // Must be set *before* this upload, not after — same totalPhotonsEmitted
+    // timing lesson the old pipeline learned the hard way (see humans.md's
+    // correctness-pass writeup): __raygen__lightSubpath seeds its RNG from
+    // this, so it has to be read by the emission launch that
+    // traceLightSubpathPass() issues below, not by some later launch.
+    params.totalLightPathsEmitted = impl_->totalLightPathsEmitted;
     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
                                cudaMemcpyHostToDevice, impl_->stream));
-    const float radiusUsed = impl_->tracePhotonPass();
-    params.photonHandle = impl_->photonGasHandle;
-    params.photonGatherRadius = radiusUsed;
-    params.totalPhotonsEmitted = impl_->totalPhotonsEmitted; // now includes this pass, for the gather launch
+    const unsigned int deposited = impl_->traceLightSubpathPass();
+    params.lightVertexCount = deposited;
+    params.totalLightPathsEmitted = impl_->totalLightPathsEmitted; // now includes this pass, for the main launch
   }
 
   CUDA_CHECK(cudaGraphicsMapResources(1, &impl_->cudaPbo, impl_->stream));

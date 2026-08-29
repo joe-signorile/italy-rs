@@ -24,6 +24,7 @@
 #include "convert/voxelize.h"
 #include "core/orbit_camera.h"
 #include "io/gltf_loader.h"
+#include "io/gsplat_ply_loader.h"
 #include "io/mesh_validate.h"
 #include "render/environment.h"
 #include "render/optix_renderer.h"
@@ -86,7 +87,9 @@ void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *wind
 constexpr int kMinResolution = 8;
 constexpr int kMaxResolution = 512;
 
-enum class Representation : int { Mesh, Voxel, Sdf };
+// Gsplat is a distinct load source, not a resampling of the loaded GLB mesh
+// like Voxel/Sdf are — see rebuildScene()'s dispatch.
+enum class Representation : int { Mesh, Voxel, Sdf, Gsplat };
 enum class EnvChoice : int { None, Overcast, Midnight, Noon, Custom, ProceduralSky };
 
 // Everything the UI edits, plus the loaded/resampled assets those edits
@@ -99,6 +102,12 @@ struct AppState {
   bool haveMesh = false;
   italy::VoxelGrid voxelGrid;
   italy::SdfGrid sdfGrid;
+  // Roadmap phase 3: an imported Gaussian-splat scene — a distinct load
+  // source, not a resampling of meshAsset, so it gets its own path/asset/
+  // flag rather than reusing glbPathBuf/meshAsset/haveMesh.
+  italy::GsplatAsset splatAsset;
+  bool haveSplats = false;
+  char gsplatPathBuf[512] = "";
   italy::EnvironmentMap environment;
   bool haveEnvironment = false;
 
@@ -147,7 +156,25 @@ struct AppState {
 // entry points can't drift out of sync with each other.
 void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer, italy::OrbitCamera &camera) {
   state.haveMesh = false;
-  if (state.glbPathBuf[0] != '\0') {
+  state.haveSplats = false;
+  if (state.representation == Representation::Gsplat) {
+    // A distinct load source, not a resampling of a loaded GLB — see
+    // AppState::splatAsset's doc comment. No watertightness gate: that check
+    // is mesh-specific (2-manifold edges) and doesn't apply to a point set.
+    if (state.gsplatPathBuf[0] != '\0') {
+      std::string err;
+      if (!italy::loadGsplatPly(state.gsplatPathBuf, state.splatAsset, err)) {
+        state.statusLine = "Failed to load " + std::string(state.gsplatPathBuf) + ": " + err;
+        std::fprintf(stderr, "italy: %s\n", state.statusLine.c_str());
+      } else {
+        state.haveSplats = true;
+        state.statusLine =
+            "Loaded " + std::string(state.gsplatPathBuf) + " (" + std::to_string(state.splatAsset.count()) + " splats)";
+      }
+    } else {
+      state.statusLine = "No gsplat .ply path set.";
+    }
+  } else if (state.glbPathBuf[0] != '\0') {
     std::string err;
     if (!italy::loadGlb(state.glbPathBuf, state.meshAsset, err)) {
       state.statusLine = "Failed to load " + std::string(state.glbPathBuf) + ": " + err;
@@ -224,7 +251,9 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
   }
 
   italy::SceneSource source;
-  if (haveSdf)
+  if (state.haveSplats)
+    source.splats = &state.splatAsset;
+  else if (haveSdf)
     source.sdf = &state.sdfGrid;
   else if (haveVoxels)
     source.voxels = &state.voxelGrid;
@@ -235,7 +264,7 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
   source.groundPlane = state.groundPlane;
 
   renderer = std::make_unique<italy::OptixRenderer>(state.renderWidth, state.renderHeight, source);
-  if (state.haveMesh)
+  if (state.haveMesh || state.haveSplats)
     camera.frame(renderer->sceneBoundsCenter(), renderer->sceneBoundsRadius());
 }
 
@@ -300,6 +329,9 @@ int main(int argc, char **argv) {
     } else if (key == "--hdri") {
       state.envChoice = EnvChoice::Custom;
       std::snprintf(state.hdriPathBuf, sizeof(state.hdriPathBuf), "%s", value.c_str());
+    } else if (key == "--gsplat") {
+      state.representation = Representation::Gsplat;
+      std::snprintf(state.gsplatPathBuf, sizeof(state.gsplatPathBuf), "%s", value.c_str());
     }
   }
 
@@ -326,6 +358,11 @@ int main(int argc, char **argv) {
     state.render.denoise = true;
   if (const char *fc = std::getenv("ITALY_FIREFLY_CLAMP"))
     state.render.fireflyClamp = static_cast<float>(std::atof(fc));
+  // VCM Step 1 A/B verification switch — see RenderSettings::lightSubpaths'
+  // doc comment: 0 zero-weights BDPT connections back to today's NEE-only
+  // behaviour, for comparing against the closed-form energy-check scene.
+  if (const char *ls = std::getenv("ITALY_LIGHT_SUBPATHS"))
+    state.render.lightSubpaths = std::atoi(ls) != 0;
   if (std::getenv("ITALY_NO_GROUND"))
     state.groundPlane = false;
   if (const char *ap = std::getenv("ITALY_APERTURE"))
@@ -340,6 +377,10 @@ int main(int argc, char **argv) {
     state.skySunElevationDeg = static_cast<float>(std::atof(e));
   if (const char *a = std::getenv("ITALY_SKY_AZIMUTH"))
     state.skySunAzimuthDeg = static_cast<float>(std::atof(a));
+  if (const char *gp = std::getenv("ITALY_GSPLAT_PATH")) {
+    state.representation = Representation::Gsplat;
+    std::snprintf(state.gsplatPathBuf, sizeof(state.gsplatPathBuf), "%s", gp);
+  }
   if (const char *tm = std::getenv("ITALY_TONEMAP")) {
     const std::string v = tm;
     if (v == "agx") state.render.tonemap = italy::TonemapOperator::AgX;
@@ -428,20 +469,27 @@ int main(int argc, char **argv) {
         ImGui::Text("Lighting: %s", state.haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
         ImGui::Separator();
 
-        ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
+        ImGui::Text("Representation");
+        // Shown unconditionally (not gated on state.haveMesh like the old
+        // Mesh/Voxel/SDF-only version): Gsplat is a distinct load source, so
+        // the user needs to be able to pick it before anything is loaded, to
+        // know which path field below applies.
+        bool apply = ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Gsplat", reinterpret_cast<int *>(&state.representation), 3);
+        if (state.representation == Representation::Voxel || state.representation == Representation::Sdf)
+          ImGui::SliderInt("Resolution", &state.resolution, kMinResolution, kMaxResolution);
 
-        bool apply = ImGui::Button("Load / Apply");
+        if (state.representation == Representation::Gsplat)
+          ImGui::InputText("Gsplat .ply path", state.gsplatPathBuf, sizeof(state.gsplatPathBuf));
+        else
+          ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
 
-        if (state.haveMesh) {
-          ImGui::Text("Representation");
-          apply |= ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
-          ImGui::SameLine();
-          apply |= ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
-          ImGui::SameLine();
-          apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
-          if (state.representation != Representation::Mesh)
-            ImGui::SliderInt("Resolution", &state.resolution, kMinResolution, kMaxResolution);
-        }
+        apply |= ImGui::Button("Load / Apply");
 
         ImGui::Separator();
         ImGui::Text("HDRI");

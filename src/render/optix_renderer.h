@@ -16,6 +16,7 @@
 #include "convert/sdf_grid.h"
 #include "convert/voxel_grid.h"
 #include "core/orbit_camera.h"
+#include "io/gsplat_asset.h"
 #include "io/mesh_asset.h"
 #include "render/environment.h"
 
@@ -50,6 +51,16 @@ struct RenderSettings {
   // the cost of a little energy in the extreme highlights. <= 0 disables.
   float fireflyClamp = 0.0f;
 
+  // VCM Step 1 (see /home/joe/.claude/plans/what-is-the-next-wise-flurry.md):
+  // whether __closesthit__radiance attempts BDPT connections to stored
+  // light-subpath vertices at all. Defaulted on; the main use for turning it
+  // off is the plan's own A/B verification (does the render reduce to
+  // today's NEE-only behaviour with this zeroed?) via
+  // ITALY_LIGHT_SUBPATHS=0. Only takes effect for scenes that actually have
+  // a connectable material to begin with — see enableLightSubpaths' comment
+  // in Impl::buildScene().
+  bool lightSubpaths = true;
+
   // Thin-lens depth of field. aperture is the lens radius in world units, so
   // its useful range scales with the scene — the UI derives its slider bound
   // from the scene radius. 0 is a pinhole. focusDistance <= 0 means "focus on
@@ -61,16 +72,21 @@ struct RenderSettings {
   float envRotation = 0.0f;
 };
 
-// Exactly one of mesh/voxels/sdf should be set; none set means the fixed
-// bring-up scene. A tagged struct rather than overloaded constructors, since
-// a bare pointer overload set would be ambiguous for the nullptr default.
-// `environment` is orthogonal to the other three (a lighting choice, not a
-// geometry one) — when set, it replaces the synthetic quad light those
-// other three would otherwise get, for whichever geometry is active.
+// Exactly one of mesh/voxels/sdf/splats should be set; none set means the
+// fixed bring-up scene. A tagged struct rather than overloaded constructors,
+// since a bare pointer overload set would be ambiguous for the nullptr
+// default. `environment` is orthogonal to the other four (a lighting
+// choice, not a geometry one) — when set, it replaces the synthetic quad
+// light those other four would otherwise get, for whichever geometry is
+// active.
 struct SceneSource {
   const MeshAsset *mesh = nullptr;
   const VoxelGrid *voxels = nullptr;
   const SdfGrid *sdf = nullptr;
+  // Roadmap phase 3: an imported 3D Gaussian Splatting scene (see
+  // io/gsplat_ply_loader.h). Takes priority over mesh/voxels/sdf if somehow
+  // more than one is set — see buildScene()'s dispatch order.
+  const GsplatAsset *splats = nullptr;
   const EnvironmentMap *environment = nullptr;
   // A neutral diffuse plane under the loaded object. Without it a mesh floats
   // in a void: no contact shadow and no bounce light, which is most of what
@@ -89,10 +105,12 @@ public:
   // scene from phase 2. source.mesh set: renders that loaded GLB mesh (as
   // MATERIAL_TEXTURED_DIFFUSE triangles). source.voxels set: renders that
   // voxelized mesh (as MATERIAL_VOXEL custom AABB primitives). source.sdf
-  // set: sphere-traces the baked distance field (MATERIAL_SDF). Whichever of
-  // those three is picked, it's lit either by source.environment (HDRI,
-  // importance sampled) if given, or otherwise by a synthetic quad light
-  // sized to the bounding box.
+  // set: sphere-traces the baked distance field (MATERIAL_SDF). source.splats
+  // set: renders an imported Gaussian-splat scene (MATERIAL_GSPLAT, one
+  // custom-AABB ellipsoid primitive per splat, stochastic alpha via
+  // __anyhit__gsplat). Whichever of those four is picked, it's lit either by
+  // source.environment (HDRI, importance sampled) if given, or otherwise by
+  // a synthetic quad light sized to the bounding box.
   OptixRenderer(int width, int height, const SceneSource &source = {});
   ~OptixRenderer();
 
@@ -106,9 +124,9 @@ public:
   // Every field of RenderSettings except fireflyClamp is display-time only —
   // exposure, tonemap and denoise all read the stored HDR accumulator without
   // modifying it, so they are free to change on any frame with no reset.
-  // fireflyClamp, aperture, focusDistance and envRotation are the exceptions:
-  // they change what gets *written* into the accumulator, so changing any of
-  // them needs a resetAccumulation() to take full effect.
+  // fireflyClamp, aperture, focusDistance, envRotation and lightSubpaths are
+  // the exceptions: they change what gets *written* into the accumulator, so
+  // changing any of them needs a resetAccumulation() to take full effect.
   void render(const OrbitCamera &camera, const RenderSettings &settings = {});
 
   void resetAccumulation();

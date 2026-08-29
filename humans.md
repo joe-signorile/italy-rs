@@ -93,6 +93,21 @@ mesh. See `src/convert/sdf_baker.h` for how baking works and its known
 approximation (no true closest-point query exists in OptiX, so distance is
 estimated via minimum hit distance over many random directions).
 
+To render an imported Gaussian-splat scene instead of a GLB (a distinct load
+source, not a representation of a loaded mesh — the two flags aren't
+combined):
+
+```
+./build/italy-rs --gsplat=path/to/scene.ply
+```
+
+Expects the standard 3D Gaussian Splatting `.ply` vertex layout (position,
+scale, rotation, opacity, SH DC color — see `src/io/gsplat_ply_loader.h`).
+Higher-order SH bands (view-dependent color) are read past but dropped;
+splats render as flat-diffuse, alpha-blended via stochastic per-splat
+transparency rather than screen-space rasterization — see `MATERIAL_GSPLAT`
+in `src/render/kernels/pathtracer_params.h`.
+
 To light the scene with an HDRI instead of the built-in quad light (applies
 to any of the above, including the built-in test scene — a good way to see
 glass/mirror materials against real environment lighting):
@@ -151,6 +166,30 @@ render to a PNG after 128 subframes and exit — useful for checking render
 correctness headlessly/from a script rather than watching the window.
 
 ## Status
+
+**Roadmap phase 3: Gaussian-splat import.** Imports pre-generated 3D
+Gaussian Splatting `.ply` scenes (the format `s-rank`'s triposplat and most
+3DGS trainers/exporters write) and renders them path-traced, not fit from a
+mesh — the design doc explicitly deferred mesh→3DGS fitting as its own
+research-grade problem. `src/io/gsplat_asset.h`/`gsplat_ply_loader.{h,cpp}`
+parse the standard vertex layout (position, scale_0-2, rot_0-3, opacity,
+f_dc_0-2 — higher SH bands are read past but dropped, see the `realism:`
+note on `MATERIAL_GSPLAT`) and apply its activation functions once at
+import. Each splat becomes a custom-primitive ellipsoid (3-sigma bound,
+`convert/gsplat_bounds.h`); `__intersection__gsplat` finds the ray/ellipsoid
+crossing and `__anyhit__gsplat` stochastically accepts or rejects it against
+the splat's actual Gaussian density — alpha-correct compositing of
+overlapping/translucent splats with no depth sort, unbiased in expectation
+(doctrine: unbiased transport kept for beauty, not realism). Diffuse-only
+shading via an ellipsoid gradient normal, same tier as MATERIAL_VOXEL/
+MATERIAL_SDF (no caustic eligibility). New `Representation::Gsplat` UI radio
+button + its own path field (a splat file is a distinct load source, not a
+resampling of a loaded GLB), `--gsplat=<path>` CLI flag, and
+`ITALY_GSPLAT_PATH` scripted-testing hook. Verified with a synthetic
+sphere-of-splats `.ply` (`ITALY_DUMP_FRAME`): renders as a soft, textured
+cloud with alpha-blended edges, not the hard-edged blocky look a
+voxel-resampling fallback would have produced. Not yet verified against a
+real captured/trained splat scene — no such asset lives in this repo yet.
 
 **Roadmap phase 2: procedural sky (Preetham/Perez analytic daylight
 model).** `src/render/procedural_sky.{h,cpp}` synthesizes an equirect sky
