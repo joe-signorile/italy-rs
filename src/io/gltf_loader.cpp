@@ -19,6 +19,29 @@
 namespace italy {
 namespace {
 
+// KHR_materials_transmission/ior/volume are optional extensions tinygltf
+// doesn't parse into typed fields (only core PBR metallic-roughness gets
+// that treatment) — read them out of the generic extensions JSON instead.
+// Absent extension or absent key both mean "use the glTF spec default",
+// matching how tinygltf itself treats absent core PBR fields.
+float extensionNumber(const tinygltf::ExtensionMap &ext, const char *extName, const char *key, float def) {
+  const auto it = ext.find(extName);
+  if (it == ext.end() || !it->second.Has(key))
+    return def;
+  return static_cast<float>(it->second.Get(key).GetNumberAsDouble());
+}
+
+glm::vec3 extensionColor3(const tinygltf::ExtensionMap &ext, const char *extName, const char *key, glm::vec3 def) {
+  const auto it = ext.find(extName);
+  if (it == ext.end() || !it->second.Has(key))
+    return def;
+  const tinygltf::Value &arr = it->second.Get(key);
+  if (!arr.IsArray() || arr.ArrayLen() < 3)
+    return def;
+  return glm::vec3(static_cast<float>(arr.Get(0).GetNumberAsDouble()), static_cast<float>(arr.Get(1).GetNumberAsDouble()),
+                    static_cast<float>(arr.Get(2).GetNumberAsDouble()));
+}
+
 // claudia: only FLOAT-componentType accessors are read (the overwhelming
 // common case for glTF exporters) — normalized-integer attribute encodings
 // and sparse accessors are unsupported. Both are now *detected* rather than
@@ -270,6 +293,18 @@ bool loadGlb(const std::string &path, MeshAsset &outMesh, std::string &outError)
         addTexture(model, pbr.metallicRoughnessTexture.index, /*srgb=*/false, textureCache, outMesh);
     mat.normalTexture = addTexture(model, src.normalTexture.index, /*srgb=*/false, textureCache, outMesh);
     mat.normalScale = static_cast<float>(src.normalTexture.scale);
+
+    // Transmissive/dielectric extensions — see MaterialAsset's doc comment.
+    // Defaults (0 transmission, ior 1.5, white attenuation, infinite
+    // attenuation distance) are the glTF spec's own "fully opaque, no
+    // absorption" values, so a material that declares none of these renders
+    // exactly as it did before this was added.
+    mat.transmission = extensionNumber(src.extensions, "KHR_materials_transmission", "transmissionFactor", 0.0f);
+    mat.ior = extensionNumber(src.extensions, "KHR_materials_ior", "ior", 1.5f);
+    mat.attenuationColor =
+        extensionColor3(src.extensions, "KHR_materials_volume", "attenuationColor", glm::vec3(1.0f));
+    mat.attenuationDistance =
+        extensionNumber(src.extensions, "KHR_materials_volume", "attenuationDistance", std::numeric_limits<float>::infinity());
     outMesh.materials.push_back(mat);
   }
   // materialForTriangle() indexes materials unconditionally, so the table can

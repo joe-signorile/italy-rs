@@ -100,7 +100,12 @@ glass/mirror materials against real environment lighting):
 ```
 ./build/italy-rs path/to/asset.glb --env=overcast   # or midnight, noon
 ./build/italy-rs path/to/asset.glb --hdri=path/to/custom.hdr
+./build/italy-rs path/to/asset.glb --env=sky        # procedural Preetham sky, defaults to clear midday
 ```
+
+The procedural sky's turbidity/sun elevation/sun azimuth are UI sliders once
+loaded (shown under the "Procedural Sky" HDRI radio button); `--env=sky`
+alone seeds a default clear-midday look for scripted use.
 
 All of the above (GLB path, representation, HDRI preset) are also live
 ImGui controls once the window is open — the CLI flags just seed the same
@@ -113,6 +118,8 @@ Scripted testing hooks for the toggles that are otherwise UI-only:
 `ITALY_FORCE_DENOISE=1`, `ITALY_TONEMAP=<agx|reinhard|aces|hable|clamp>`, and
 `ITALY_FIREFLY_CLAMP=<value>` (0 disables). `ITALY_DUMP_AFTER_SUBFRAME=<n>`
 sets how many subframes accumulate before `ITALY_DUMP_FRAME` writes.
+`ITALY_SKY_TURBIDITY`/`ITALY_SKY_ELEVATION`/`ITALY_SKY_AZIMUTH` seed the
+procedural sky's params (see `--env=sky` above) the same way.
 
 ### Tests
 
@@ -144,6 +151,85 @@ render to a PNG after 128 subframes and exit — useful for checking render
 correctness headlessly/from a script rather than watching the window.
 
 ## Status
+
+**Roadmap phase 2: procedural sky (Preetham/Perez analytic daylight
+model).** `src/render/procedural_sky.{h,cpp}` synthesizes an equirect sky
+image (sun elevation/azimuth + turbidity as artist controls) and feeds it
+through the exact same `buildEnvironmentCdf` a loaded `.hdr` file already
+uses, so it needed zero changes downstream — GPU upload, NEE, importance
+sampling, and photon emission all already treat "an environment" generically.
+New `EnvChoice::ProceduralSky` UI radio button (with turbidity/elevation/
+azimuth sliders alongside the existing Overcast/Midnight/Noon/Custom
+presets), `--env=sky` CLI flag, and `ITALY_SKY_TURBIDITY`/`ITALY_SKY_
+ELEVATION`/`ITALY_SKY_AZIMUTH` scripted-testing hooks matching the existing
+`ITALY_ENV_ROTATION`-style pattern.
+
+Preetham was picked over the higher-fidelity Hosek-Wilkie model specifically
+because it's small enough to be fully closed-form (a page of published
+polynomial coefficients) rather than Hosek-Wilkie's large fitted dataset,
+which would have to be transcribed from a reference implementation with no
+way to diff against it here — this project already shipped one bug from
+exactly that failure mode (AgX's missing `pow(2.2)`, see below). Preetham
+wasn't actually immune to it: a first draft's zenith-chromaticity polynomial
+had the coefficient matrix transposed (grouped by power of view angle
+instead of power of turbidity — superficially similar, silently permutes
+which number multiplies which term) and rendered an entire sky in
+olive-green instead of blue. The unit test (`procedural_sky_test.cpp`)
+didn't catch it — it only checked that the sky is brighter toward the sun
+than away from it, not hue — so this was caught by eye on the first
+`ITALY_DUMP_FRAME` render, then fixed by checking the coefficients
+digit-for-digit against two independent open-source implementations
+(`ebruneton/clear-sky-models` and `diharaw/sky-models`, both transcribing
+the same paper) rather than trusting a second guess. Re-verified after the
+fix: a default clear-midday render shows a plausible blue sky, a visible
+sun highlight on the mirror sphere, and sky-tinted glass; a low-elevation/
+higher-turbidity render shows a distinctly different, warmer gradient,
+confirming the parameters actually drive the output rather than the fix
+having only patched the one case that was eyeballed.
+
+**Roadmap phase 1: watertight-mesh import gate + caustics on loaded
+meshes.** First of a larger agreed roadmap (procedural sky, ray-traced
+Gaussian-splat import, then VCM/ReSTIR/unified-SDF acceleration last) —
+this phase was picked first because it was small and already unblocked.
+`src/io/mesh_validate.{h,cpp}` rejects any imported mesh that isn't a
+closed 2-manifold (every edge shared by exactly two triangles, checked
+after welding the loader's unindexed triangle soup back into shared
+vertices by position) — `rebuildScene()` in `main.cpp` calls it right
+after `loadGlb()` and refuses the load with a diagnostic boundary/non-
+manifold edge count on failure, the same status-line pattern a failed GLB
+parse already used. That closedness guarantee is what a real dielectric
+material on triangle geometry needs (a well-defined interior), unlike
+`MATERIAL_GLASS`'s dedicated solid-sphere intersector — so loaded glTF
+materials now parse `KHR_materials_transmission`/`_ior`/`_volume` and, when
+`transmission > 0`, get a stochastic per-sample dielectric bounce (same
+Fresnel/refraction/Beer-Lambert device functions `MATERIAL_GLASS` already
+had, now parameterized per-material instead of per-object) in both the
+main path tracer and the photon pass. A cheap second win shipped
+alongside it: a near-zero-roughness, high-metallic textured surface (e.g.
+chrome trim) is now treated as specular-enough to carry a caustic bounce
+too, no transmission needed. `enablePhotonMapping` now turns on for a
+loaded mesh scene whenever it actually has one of these two material
+kinds (checked once at load time so an ordinary all-Lambert asset doesn't
+pay for a photon pipeline that would only ever produce an empty map).
+Voxel/SDF representations are unaffected — flat-diffuse-only, no
+per-primitive material to carry a transmission factor.
+
+Verified: a hand-rolled closed-cube-shell fixture accepted, the same cube
+with two triangles deleted rejected with a boundary-edge count (both
+exercised by the new `mesh_validate_test`); a downloaded Khronos
+conformance asset that deliberately mixes closed spheres with flat
+decorative geometry (text labels, a backdrop plane) correctly rejected —
+confirms the gate isn't just accepting everything; a hand-built watertight
+glass cube (`KHR_materials_transmission=1`, tinted `KHR_materials_volume`
+attenuation) renders visible refraction bending, depth-dependent tinted
+absorption, and no light leaking through the shell, with the photon pass
+depositing a different, non-zero count than the fixed demo scene
+(confirming it's actually tracing the loaded asset); a hand-built chrome
+cube (metallic 1.0, roughness 0.02, no transmission) also deposits
+photons via the new mirror-threshold branch. `ctest` grew from 3 to 4
+tests (`mesh_validate_test` added) and stays green; `assets/test.glb`
+(an ordinary opaque textured asset, transmission defaults to 0) renders
+pixel-unchanged and correctly does *not* build a photon pipeline.
 
 **Correctness + doctrine pass after phase 10.** Wrote the project's ranked
 priority order (beauty > performance > realism) into `CLAUDE.md` as a binding

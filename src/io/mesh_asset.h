@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -27,6 +28,18 @@ struct MaterialAsset {
   int metallicRoughnessTexture = -1; // glTF packs roughness in G, metallic in B
   int normalTexture = -1;
   float normalScale = 1.0f;
+
+  // KHR_materials_transmission/ior/volume — glass-like dielectric surfaces
+  // on ordinary triangle geometry (as opposed to MATERIAL_GLASS's dedicated
+  // analytic-sphere path). Only meaningful once the mesh has passed the
+  // watertightness gate (see mesh_validate.h): refraction through triangle
+  // geometry needs a well-defined interior, same reasoning the built-in
+  // sphere primitive's hollowness fix needed one for MATERIAL_GLASS.
+  // Defaults are glTF's own "fully opaque, no absorption" values.
+  float transmission = 0.0f;
+  float ior = 1.5f;
+  glm::vec3 attenuationColor{1.0f};
+  float attenuationDistance = std::numeric_limits<float>::infinity();
 };
 
 // Flattened triangle soup (3 entries per triangle, no index buffer) — trades

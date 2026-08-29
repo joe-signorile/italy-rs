@@ -6,6 +6,15 @@
 #include <cuda_runtime.h>
 #include <optix.h>
 
+// Threshold for treating a GGX metallic-roughness triangle as "mirror-like
+// enough" to carry a caustic photon bounce (see __closesthit__photon's
+// MATERIAL_TEXTURED_DIFFUSE branch in pathtracer.cu). Also used host-side by
+// optix_renderer.cpp to decide up front whether a loaded mesh has anything
+// that could seed a caustic at all — shared here so the two checks can't
+// drift apart.
+inline constexpr float kCausticMirrorMetallic = 0.9f;
+inline constexpr float kCausticMirrorRoughness = 0.1f;
+
 enum MaterialType : unsigned int {
   MATERIAL_DIFFUSE = 0,
   MATERIAL_MIRROR = 1,
@@ -17,15 +26,18 @@ enum MaterialType : unsigned int {
   // the GGX pass. albedo/uvs/normals/tangents/materials/triangleMaterial on
   // HitGroupData carry everything a triangle needs to look itself up.
   //
-  // claudia: no transmission/dielectric variant — this is reflectance only,
-  // there's no glTF-sourced glass. __closesthit__photon's specular-bounce
-  // branch (the one that sets causticEligible) only recognizes
-  // MATERIAL_MIRROR/MATERIAL_GLASS, so a loaded mesh/voxel/SDF scene cannot
-  // seed a caustic no matter how photon emission is set up — confirmed
-  // before deciding not to lift the photon-mapping gate for these scenes
-  // (see enablePhotonMapping's comment in optix_renderer.cpp). Upgrade if a
-  // real asset ships a KHR_materials_transmission/volume material worth
-  // honoring.
+  // Gained a real transmission/dielectric variant once the watertight-mesh
+  // import gate (mesh_validate.h) made "this triangle mesh has a
+  // well-defined interior" a guarantee rather than a hope: a per-triangle
+  // KHR_materials_transmission/ior/volume material (GpuMaterial's
+  // transmission/ior/attenuation* fields) refracts through the mesh the
+  // same way MATERIAL_GLASS refracts through a solid sphere — see the
+  // merged dielectric branch at the end of __closesthit__radiance and the
+  // matching branch in __closesthit__photon. A mirror-like metallic/rough
+  // combo (kCausticMirrorMetallic/kCausticMirrorRoughness above) gets the
+  // same caustic-eligibility treatment without needing transmission at all.
+  // Voxel/SDF scenes still can't (no per-primitive material to carry either
+  // property) — see enablePhotonMapping's comment in optix_renderer.cpp.
   MATERIAL_TEXTURED_DIFFUSE = 4,
   // Diffuse BRDF, custom-AABB voxel primitive; albedo is a per-voxel baked
   // color, shading normal comes from which of the 6 box faces was entered
@@ -178,6 +190,18 @@ struct GpuMaterial {
   cudaTextureObject_t baseColorTex;         // sRGB-decoded in texture hardware
   cudaTextureObject_t metallicRoughnessTex; // linear; glTF packs roughness in G, metallic in B
   cudaTextureObject_t normalTex;            // linear, tangent-space
+
+  // KHR_materials_transmission/ior/volume — per-material, unlike
+  // HitGroupData::ior below (that one is scoped to the single-object
+  // MATERIAL_GLASS sphere; a glTF scene can mix opaque and transmissive
+  // materials on one mesh, so this has to live wherever metallic/roughness
+  // already do). 0 transmission means "ignore ior/attenuation entirely,
+  // this material is opaque" — see the transmission branch in
+  // MATERIAL_TEXTURED_DIFFUSE's closest-hit handling in pathtracer.cu.
+  float transmission;
+  float ior;
+  float3 attenuationColor;
+  float attenuationDistance;
 };
 
 struct RayGenData {};

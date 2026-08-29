@@ -169,11 +169,16 @@ struct OptixRenderer::Impl {
   int envWidth = 0;
   int envHeight = 0;
 
-  // Caustics (phase 7) — only built for the fixed test scene (the only one
-  // with specular objects to seed a caustic from) and only when there's no
-  // environment map (photon emission samples params.light, which is unset
-  // when hasEnvironment). Global-radius progressive photon mapping — see
-  // Params::photonHandle's doc comment for which published variant this is.
+  // Caustics (phase 7). Built for the fixed test scene (always has
+  // specular/glass objects) and, since the watertight-mesh gate made
+  // triangle-mesh dielectrics trustworthy, for a loaded mesh scene too —
+  // but only when it actually has a material that can seed one (see
+  // buildMeshScene's hasCausticEligibleMaterial scan): building the whole
+  // photon pipeline/SBT for an all-Lambert asset would cost a pass per
+  // frame for a permanently-empty photon map. Voxel/SDF scenes still never
+  // qualify (flat-diffuse-only, no per-primitive material to test).
+  // Global-radius progressive photon mapping — see Params::photonHandle's
+  // doc comment for which published variant this is.
   bool enablePhotonMapping = false;
   static constexpr unsigned int kPhotonBatchSize = 1u << 16; // 65536 photons/pass
   static constexpr unsigned int kPhotonCapacity = 1u << 18;  // generous headroom over the batch size
@@ -742,6 +747,10 @@ struct OptixRenderer::Impl {
       g.baseColorTex = texOrZero(m.baseColorTexture);
       g.metallicRoughnessTex = texOrZero(m.metallicRoughnessTexture);
       g.normalTex = texOrZero(m.normalTexture);
+      g.transmission = m.transmission;
+      g.ior = m.ior;
+      g.attenuationColor = toFloat3(m.attenuationColor);
+      g.attenuationDistance = m.attenuationDistance;
     }
     meshMaterials = uploadVector(gpuMaterials);
     obj.material.materials = reinterpret_cast<GpuMaterial *>(meshMaterials);
@@ -973,6 +982,17 @@ struct OptixRenderer::Impl {
     boundsRadius = std::max(mesh.boundsRadius(), 1e-3f);
     addGroundPlane(boundsCenter, boundsRadius, mesh.boundsMin.y);
     addBoundsKeyLight(boundsCenter, boundsRadius);
+
+    // Same eligibility test __closesthit__photon's MATERIAL_TEXTURED_DIFFUSE
+    // branch uses (KHR_materials_transmission, or a mirror-like metallic/
+    // roughness combo) — checked here purely to decide whether it's worth
+    // building the photon pipeline at all, not to duplicate its logic.
+    for (const MaterialAsset &m : mesh.materials) {
+      if (m.transmission > 0.0f || (m.metallic > kCausticMirrorMetallic && m.roughness < kCausticMirrorRoughness)) {
+        enablePhotonMapping = true;
+        break;
+      }
+    }
   }
 
   void buildVoxelScene(const VoxelGrid &grid) {

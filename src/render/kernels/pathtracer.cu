@@ -58,6 +58,20 @@ static __forceinline__ __device__ float schlickFresnel(float cosTheta, float ior
   return r0 + (1.0f - r0) * x * x * x * x * x;
 }
 
+// KHR_materials_volume's convention: light travelling `attenuationDistance`
+// through the volume is attenuated to exactly `attenuationColor`, i.e.
+// exp(-extinction * attenuationDistance) == attenuationColor per channel.
+// Infinite/non-positive attenuationDistance is glTF's "no volume extension"
+// default — no absorption at all, same as MATERIAL_GLASS's "extinction ==
+// 0" convention.
+static __forceinline__ __device__ float3 attenuationToExtinction(float3 attenuationColor, float attenuationDistance) {
+  if (!(attenuationDistance > 0.0f) || isinf(attenuationDistance))
+    return make_float3(0.0f);
+  return make_float3(-logf(fmaxf(attenuationColor.x, 1e-6f)) / attenuationDistance,
+                      -logf(fmaxf(attenuationColor.y, 1e-6f)) / attenuationDistance,
+                      -logf(fmaxf(attenuationColor.z, 1e-6f)) / attenuationDistance);
+}
+
 // ----------------------------------------------------------------------------
 // Tonemapping (phase 8): converts linear HDR radiance to the [0,1] range
 // sutil::toSRGB()/quantizeUnsigned8Bits() (sutil/cuda/helpers.h) then encode
@@ -946,6 +960,15 @@ extern "C" __global__ void __closesthit__radiance() {
   shading.alpha = 1.0f;
   shading.hasSpecular = false;
 
+  // KHR_materials_transmission — only MATERIAL_TEXTURED_DIFFUSE triangles
+  // can set `transmission` above 0 (see below); everything else stays
+  // opaque. Defaults mirror MATERIAL_GLASS's own per-object fields so a
+  // GLASS hit falling into the merged dielectric branch further down needs
+  // no special-casing.
+  float transmission = 0.0f;
+  float dielectricIor = rt->ior;
+  float3 dielectricExtinction = rt->extinction;
+
   if (rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
     const unsigned int prim = optixGetPrimitiveIndex();
     const float2 bary = optixGetTriangleBarycentrics();
@@ -1012,6 +1035,16 @@ extern "C" __global__ void __closesthit__radiance() {
     const float r = fminf(fmaxf(roughness, 0.03f), 1.0f); // floor keeps the GGX lobe numerically sane
     shading.alpha = r * r;
     shading.hasSpecular = true;
+
+    transmission = mat.transmission;
+    if (transmission > 0.0f) {
+      dielectricIor = mat.ior;
+      dielectricExtinction = attenuationToExtinction(mat.attenuationColor, mat.attenuationDistance);
+      // The merged dielectric branch below needs the real geometric normal
+      // for sidedness (dot(rayDir, Ng)) — only computed here, on demand,
+      // since ordinary opaque triangles never need it.
+      Ng = computeGeometricNormal(rayDir);
+    }
   } else if (rt->materialType == MATERIAL_VOXEL) {
     const float3 faceN = voxelFaceNormal(optixGetAttribute_0());
     N = faceforward(faceN, -rayDir, faceN);
@@ -1071,8 +1104,16 @@ extern "C" __global__ void __closesthit__radiance() {
       emitted = rt->emission * weight;
     }
     done = 1;
-  } else if (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE ||
-             rt->materialType == MATERIAL_VOXEL || rt->materialType == MATERIAL_SDF) {
+  } else if ((rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE ||
+              rt->materialType == MATERIAL_VOXEL || rt->materialType == MATERIAL_SDF) &&
+             !(transmission > 0.0f && sutil::rnd(seed) < transmission)) {
+    // Stochastic transmission: a material with transmission in (0,1) is a
+    // probability-weighted mix of this reflectance path and the dielectric
+    // path below (per-sample, not per-pixel — unbiased in expectation, same
+    // Monte-Carlo mixture idea Russian roulette already uses elsewhere in
+    // this file). Most real KHR_materials_transmission assets set the
+    // factor to 0 or 1 anyway, where this reduces to a plain branch.
+    //
     // Next-event estimation: toward the environment if one is loaded
     // (params.envTex != 0), else toward the quad light — the two aren't
     // combined, see Params::envTex's doc comment.
@@ -1182,13 +1223,19 @@ extern "C" __global__ void __closesthit__radiance() {
     nextDirection = reflect(rayDir, N);
     attenuation = attenuation * rt->albedo;
     nextPdf = -1.0f;
-  } else { // MATERIAL_GLASS
+  } else { // MATERIAL_GLASS, or a MATERIAL_TEXTURED_DIFFUSE triangle whose
+           // stochastic transmission draw above chose the dielectric path.
     // Sidedness never comes from N: it has already been faceforwarded and so
     // always reports "entering". Prefer the intersector's own report where
     // there is one (solid spheres), and fall back to the *geometric* normal
-    // otherwise, which is what a future triangle-mesh dielectric would use.
-    // N itself is still the right normal to refract/reflect about either
-    // way, since refractRay wants one facing against the incident ray.
+    // otherwise — the case a transmissive triangle mesh takes, using the Ng
+    // computed on demand in the MATERIAL_TEXTURED_DIFFUSE branch above. N
+    // itself is still the right normal to refract/reflect about either way,
+    // since refractRay wants one facing against the incident ray.
+    //
+    // dielectricIor/dielectricExtinction are rt->ior/rt->extinction for an
+    // actual MATERIAL_GLASS object, or this triangle's own material's
+    // transmissive properties otherwise — see the hoisted defaults above.
     const bool entering = rt->sphereRadius > 0.0f ? (optixGetHitKind() == SPHERE_HIT_FROM_OUTSIDE)
                                                    : (dot(rayDir, Ng) < 0.0f);
 
@@ -1198,16 +1245,16 @@ extern "C" __global__ void __closesthit__radiance() {
     // than thin rim. Applies to segments ended by total internal reflection
     // too, since those are exit-side hits as well.
     if (!entering)
-      attenuation = attenuation * make_float3(expf(-rt->extinction.x * optixGetRayTmax()),
-                                               expf(-rt->extinction.y * optixGetRayTmax()),
-                                               expf(-rt->extinction.z * optixGetRayTmax()));
+      attenuation = attenuation * make_float3(expf(-dielectricExtinction.x * optixGetRayTmax()),
+                                               expf(-dielectricExtinction.y * optixGetRayTmax()),
+                                               expf(-dielectricExtinction.z * optixGetRayTmax()));
 
-    const float eta = entering ? (1.0f / rt->ior) : rt->ior;
+    const float eta = entering ? (1.0f / dielectricIor) : dielectricIor;
     const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
     // Schlick's r0 = ((1-ior)/(1+ior))^2 is invariant under ior <-> 1/ior, so
     // one argument covers both sides; TIR on the way out is handled by
     // refractRay returning false, not by the Fresnel term.
-    const float fresnel = schlickFresnel(cosTheta, rt->ior);
+    const float fresnel = schlickFresnel(cosTheta, dielectricIor);
 
     float3 refracted;
     const bool canRefract = refractRay(rayDir, N, eta, refracted);
@@ -1329,6 +1376,48 @@ extern "C" __global__ void __closesthit__photon() {
     nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
     causticEligible = 1u;
     done = 0u;
+  } else if (rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
+    // Lifts the gate MATERIAL_TEXTURED_DIFFUSE's doc comment used to
+    // describe: a loaded mesh can now seed a caustic two ways — a real
+    // KHR_materials_transmission surface refracting like glass, or a
+    // near-zero-roughness/high-metallic surface (chrome trim) acting as a
+    // mirror. Everything else deposits, same as MATERIAL_DIFFUSE below.
+    const unsigned int prim = optixGetPrimitiveIndex();
+    const unsigned int matIdx = rt->triangleMaterial ? rt->triangleMaterial[prim] : 0u;
+    const GpuMaterial &mat = rt->materials[matIdx];
+
+    if (mat.transmission > 0.0f) {
+      // Same physics as the MATERIAL_GLASS branch above, sourced from this
+      // triangle's own material rather than the one-per-object HitGroupData
+      // fields — see __closesthit__radiance's merged dielectric branch for
+      // why per-material rather than per-object.
+      const bool entering = dot(rayDir, Ng) < 0.0f;
+      const float3 extinction = attenuationToExtinction(mat.attenuationColor, mat.attenuationDistance);
+      if (!entering)
+        power = power * make_float3(expf(-extinction.x * optixGetRayTmax()), expf(-extinction.y * optixGetRayTmax()),
+                                     expf(-extinction.z * optixGetRayTmax()));
+      const float eta = entering ? (1.0f / mat.ior) : mat.ior;
+      const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
+      const float fresnel = schlickFresnel(cosTheta, mat.ior);
+      float3 refracted;
+      const bool canRefract = refractRay(rayDir, N, eta, refracted);
+      nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
+      causticEligible = 1u;
+      done = 0u;
+    } else if (mat.metallic > kCausticMirrorMetallic && mat.roughness < kCausticMirrorRoughness) {
+      nextDirection = reflect(rayDir, N);
+      power = power * mat.baseColorFactor;
+      causticEligible = 1u;
+      done = 0u;
+    } else if (causticEligible) {
+      const unsigned int idx = atomicAdd(params.photonCounter, 1u);
+      if (idx < params.photonCapacity) {
+        params.photons[idx].position = P;
+        params.photons[idx].direction = rayDir;
+        params.photons[idx].power = power;
+      }
+      done = 1u;
+    }
   } else if (rt->materialType == MATERIAL_DIFFUSE && causticEligible) {
     // Deposit and terminate — single-bounce caustics only (matches the
     // "light through glass onto a table" verification scenario exactly;
@@ -1343,9 +1432,11 @@ extern "C" __global__ void __closesthit__photon() {
     }
     done = 1u;
   }
-  // MATERIAL_DIFFUSE-without-causticEligible (direct light->diffuse, already
-  // covered by NEE) and MATERIAL_LIGHT (photon hit another light) both fall
-  // through to the done=1u/no-deposit default above.
+  // MATERIAL_DIFFUSE/MATERIAL_TEXTURED_DIFFUSE-without-causticEligible
+  // (direct light->diffuse, already covered by NEE), MATERIAL_VOXEL/
+  // MATERIAL_SDF (still flat-diffuse-only, no per-triangle material to test
+  // — out of scope for this pass), and MATERIAL_LIGHT (photon hit another
+  // light) all fall through to the done=1u/no-deposit default above.
 
   optixSetPayload_0(seed);
   optixSetPayload_1(__float_as_uint(power.x));

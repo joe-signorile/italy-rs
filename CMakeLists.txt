@@ -119,9 +119,12 @@ add_executable(italy-rs
   src/core/orbit_camera.cpp
   src/render/optix_renderer.cpp
   src/io/gltf_loader.cpp
+  src/io/mesh_validate.cpp
+  src/io/gsplat_ply_loader.cpp
   src/convert/voxelize.cpp
   src/convert/sdf_baker.cpp
   src/render/environment.cpp
+  src/render/procedural_sky.cpp
 )
 add_dependencies(italy-rs italy_optixir_pathtracer italy_optixir_sdf_bake)
 target_include_directories(italy-rs PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
@@ -148,3 +151,26 @@ add_dependencies(sdf_sign_test italy_optixir_sdf_bake)
 target_include_directories(sdf_sign_test PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
 target_link_libraries(sdf_sign_test PRIVATE glm::glm CUDA::cudart)
 add_test(NAME sdf_sign_test COMMAND sdf_sign_test)
+
+# Host-side only (no GPU/OptiX needed): tests the watertightness gate added
+# for the transmissive-material work (see tests/mesh_validate_test.cpp).
+add_executable(mesh_validate_test tests/mesh_validate_test.cpp src/io/mesh_validate.cpp)
+target_include_directories(mesh_validate_test PRIVATE src)
+target_link_libraries(mesh_validate_test PRIVATE glm::glm)
+add_test(NAME mesh_validate_test COMMAND mesh_validate_test)
+
+# Host-side only (no GPU/OptiX needed): tests the Preetham procedural sky
+# generator added for the sky-model roadmap phase (see procedural_sky.cpp).
+add_executable(procedural_sky_test tests/procedural_sky_test.cpp tests/stb_image_impl.cpp
+                                    src/render/procedural_sky.cpp src/render/environment.cpp)
+target_include_directories(procedural_sky_test PRIVATE src)
+target_link_libraries(procedural_sky_test PRIVATE glm::glm stb)
+add_test(NAME procedural_sky_test COMMAND procedural_sky_test)
+
+# Host-side only (no GPU/OptiX needed): tests the gsplat .ply loader and its
+# AABB helper, added for the Gaussian-splat-import roadmap phase (see
+# io/gsplat_ply_loader.cpp and convert/gsplat_bounds.h).
+add_executable(gsplat_ply_loader_test tests/gsplat_ply_loader_test.cpp src/io/gsplat_ply_loader.cpp)
+target_include_directories(gsplat_ply_loader_test PRIVATE src)
+target_link_libraries(gsplat_ply_loader_test PRIVATE glm::glm)
+add_test(NAME gsplat_ply_loader_test COMMAND gsplat_ply_loader_test)

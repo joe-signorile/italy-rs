@@ -24,8 +24,10 @@
 #include "convert/voxelize.h"
 #include "core/orbit_camera.h"
 #include "io/gltf_loader.h"
+#include "io/mesh_validate.h"
 #include "render/environment.h"
 #include "render/optix_renderer.h"
+#include "render/procedural_sky.h"
 
 namespace {
 
@@ -85,7 +87,7 @@ constexpr int kMinResolution = 8;
 constexpr int kMaxResolution = 512;
 
 enum class Representation : int { Mesh, Voxel, Sdf };
-enum class EnvChoice : int { None, Overcast, Midnight, Noon, Custom };
+enum class EnvChoice : int { None, Overcast, Midnight, Noon, Custom, ProceduralSky };
 
 // Everything the UI edits, plus the loaded/resampled assets those edits
 // produce. Assets are kept here (not as OptixRenderer members) because
@@ -111,6 +113,13 @@ struct AppState {
   EnvChoice envChoice = EnvChoice::None;
   char hdriPathBuf[512] = "";
   bool groundPlane = true;
+
+  // Procedural sky (Preetham/Perez) params — only shown/used when envChoice
+  // == ProceduralSky. Defaults are an ordinary clear midday sky.
+  float skyTurbidity = 3.0f;
+  float skySunElevationDeg = 45.0f;
+  float skySunAzimuthDeg = 0.0f;
+  static constexpr int kSkyResolution = 1024; // matches the bundled HDRI presets' rough scale
 
   italy::RenderSettings render;
 
@@ -140,14 +149,21 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
   state.haveMesh = false;
   if (state.glbPathBuf[0] != '\0') {
     std::string err;
-    if (italy::loadGlb(state.glbPathBuf, state.meshAsset, err)) {
+    if (!italy::loadGlb(state.glbPathBuf, state.meshAsset, err)) {
+      state.statusLine = "Failed to load " + std::string(state.glbPathBuf) + ": " + err;
+      std::fprintf(stderr, "italy: %s\n", state.statusLine.c_str());
+    } else if (!italy::isWatertight(state.meshAsset, err)) {
+      // Rejected, not just warned: SDF baking's sign vote and (once loaded
+      // meshes can carry a transmissive material) refraction both depend on
+      // a well-defined inside/outside, which only a closed mesh guarantees.
+      state.statusLine = "Rejected " + std::string(state.glbPathBuf) + ": " + err;
+      std::fprintf(stderr, "italy: %s\n", state.statusLine.c_str());
+    } else {
       state.haveMesh = true;
       state.statusLine = "Loaded " + std::string(state.glbPathBuf) + " (" +
                           std::to_string(state.meshAsset.triangleCount()) + " tris, " +
                           std::to_string(state.meshAsset.materials.size()) + " materials, " +
                           std::to_string(state.meshAsset.textures.size()) + " textures)";
-    } else {
-      state.statusLine = "Failed to load " + std::string(state.glbPathBuf) + ": " + err;
     }
   } else {
     state.statusLine = "Showing the built-in test scene.";
@@ -182,6 +198,7 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
   case EnvChoice::Custom:
     hdriPath = state.hdriPathBuf;
     break;
+  case EnvChoice::ProceduralSky:
   case EnvChoice::None:
     break;
   }
@@ -192,6 +209,17 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
     } else {
       state.statusLine += " | environment failed: " + err;
       std::fprintf(stderr, "italy: failed to load environment %s: %s\n", hdriPath.c_str(), err.c_str());
+    }
+  } else if (state.envChoice == EnvChoice::ProceduralSky) {
+    // Populates state.environment directly (no file path involved) — feeds
+    // the exact same SceneSource::environment field a loaded HDRI would.
+    std::string err;
+    if (italy::buildProceduralSky(AppState::kSkyResolution, AppState::kSkyResolution / 2, state.skySunElevationDeg,
+                                   state.skySunAzimuthDeg, state.skyTurbidity, state.environment, err)) {
+      state.haveEnvironment = true;
+    } else {
+      state.statusLine += " | procedural sky failed: " + err;
+      std::fprintf(stderr, "italy: procedural sky failed: %s\n", err.c_str());
     }
   }
 
@@ -265,8 +293,10 @@ int main(int argc, char **argv) {
         state.envChoice = EnvChoice::Midnight;
       else if (value == "noon")
         state.envChoice = EnvChoice::Noon;
+      else if (value == "sky")
+        state.envChoice = EnvChoice::ProceduralSky;
       else
-        std::fprintf(stderr, "italy: unknown --env preset '%s' (try overcast, midnight, noon)\n", value.c_str());
+        std::fprintf(stderr, "italy: unknown --env preset '%s' (try overcast, midnight, noon, sky)\n", value.c_str());
     } else if (key == "--hdri") {
       state.envChoice = EnvChoice::Custom;
       std::snprintf(state.hdriPathBuf, sizeof(state.hdriPathBuf), "%s", value.c_str());
@@ -304,6 +334,12 @@ int main(int argc, char **argv) {
     state.render.focusDistance = static_cast<float>(std::atof(fd));
   if (const char *er = std::getenv("ITALY_ENV_ROTATION"))
     state.render.envRotation = static_cast<float>(std::atof(er));
+  if (const char *t = std::getenv("ITALY_SKY_TURBIDITY"))
+    state.skyTurbidity = static_cast<float>(std::atof(t));
+  if (const char *e = std::getenv("ITALY_SKY_ELEVATION"))
+    state.skySunElevationDeg = static_cast<float>(std::atof(e));
+  if (const char *a = std::getenv("ITALY_SKY_AZIMUTH"))
+    state.skySunAzimuthDeg = static_cast<float>(std::atof(a));
   if (const char *tm = std::getenv("ITALY_TONEMAP")) {
     const std::string v = tm;
     if (v == "agx") state.render.tonemap = italy::TonemapOperator::AgX;
@@ -418,8 +454,15 @@ int main(int argc, char **argv) {
         apply |= ImGui::RadioButton("Noon", reinterpret_cast<int *>(&state.envChoice), 3);
         ImGui::SameLine();
         apply |= ImGui::RadioButton("Custom", reinterpret_cast<int *>(&state.envChoice), 4);
+        ImGui::SameLine();
+        apply |= ImGui::RadioButton("Procedural Sky", reinterpret_cast<int *>(&state.envChoice), 5);
         if (state.envChoice == EnvChoice::Custom)
           ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
+        if (state.envChoice == EnvChoice::ProceduralSky) {
+          apply |= ImGui::SliderFloat("Turbidity", &state.skyTurbidity, 1.9f, 10.0f);
+          apply |= ImGui::SliderFloat("Sun elevation", &state.skySunElevationDeg, -10.0f, 90.0f);
+          apply |= ImGui::SliderFloat("Sun azimuth", &state.skySunAzimuthDeg, 0.0f, 360.0f);
+        }
 
         apply |= ImGui::Checkbox("Ground plane", &state.groundPlane);
 
