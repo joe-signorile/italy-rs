@@ -23,6 +23,10 @@ extern "C" {
 __constant__ Params params;
 }
 
+__device__ unsigned long long g_debugAnyHitCount = 0;
+__device__ unsigned long long g_debugQueryCount = 0;
+__device__ unsigned long long g_debugPositiveCount = 0;
+
 static __forceinline__ __device__ void cosineSampleHemisphere(float u1, float u2, float3 &p) {
   const float r = sqrtf(u1);
   const float phi = 2.0f * M_PIf * u2;
@@ -56,6 +60,63 @@ static __forceinline__ __device__ float schlickFresnel(float cosTheta, float ior
   r0 = r0 * r0;
   const float x = 1.0f - cosTheta;
   return r0 + (1.0f - r0) * x * x * x * x * x;
+}
+
+// VCM Step 3: shared Fresnel/refraction bounce, factored out of what were
+// three near-identical copies (__closesthit__radiance's dielectric branch,
+// __closesthit__lightSubpath's MATERIAL_GLASS branch, and its
+// MATERIAL_TEXTURED_DIFFUSE transmission branch) — VCM triples the
+// material-branch surface (eye path, light path, connection/merge eval), so
+// three hand-synced copies stopped being the right tradeoff once a light
+// subpath could actually reach transmissive materials (Step 1/2 never
+// walked through them: MATERIAL_GLASS/transmissive hits were always a
+// dead-end delta bounce with no connection possible, so any duplication
+// there was inert). `N` must already face against `rayDir` (the caller's
+// shading normal, faceforwarded); `entering` is resolved by the caller
+// since solid-sphere vs. triangle geometry use different sidedness tests
+// (optixGetHitKind() vs. dot(rayDir, Ng)) — see each call site.
+// `throughput` is multiplied in place by the Beer-Lambert exit absorption
+// and, only when isLightTransport && the sample actually refracted, by
+// Veach's adjoint eta^2 correction (radiance-transport/eye-path rays are
+// the reference direction and never need it — see the realism: marker at
+// the light-subpath call sites).
+static __forceinline__ __device__ float3 evalDielectricBounce(const float3 &rayDir, const float3 &N, bool entering,
+                                                                float ior, const float3 &extinction, float rayTmax,
+                                                                bool isLightTransport, unsigned int &seed,
+                                                                float3 &throughput) {
+  if (!entering)
+    throughput = throughput * make_float3(expf(-extinction.x * rayTmax), expf(-extinction.y * rayTmax),
+                                           expf(-extinction.z * rayTmax));
+  const float eta = entering ? (1.0f / ior) : ior; // eta = ior_incident / ior_transmitted
+  const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
+  // Schlick's r0 is invariant under ior <-> 1/ior, so one argument covers
+  // both sides; TIR on the way out is handled by refractRay returning
+  // false, not by the Fresnel term.
+  const float fresnel = schlickFresnel(cosTheta, ior);
+
+  float3 refracted;
+  const bool canRefract = refractRay(rayDir, N, eta, refracted);
+  const bool didRefract = canRefract && !(sutil::rnd(seed) < fresnel);
+  const float3 nextDirection = didRefract ? refracted : reflect(rayDir, N);
+
+  if (didRefract && isLightTransport) {
+    // realism: Veach adjoint eta^2 correction, light-subpath refraction
+    // only — required for BDPT/VCM connection-through-glass correctness,
+    // absent pre-Step-3 because no light-side refraction was ever
+    // connectable to begin with (a light subpath always dead-ended at a
+    // dielectric hit — see this function's own doc comment). Radiance
+    // (eye-path) transport is the reference direction under Veach's
+    // formulation and needs no correction; importance (light-subpath)
+    // transport picks up a factor of (eta_transmitted/eta_incident)^2 =
+    // (1/eta)^2 on every refraction, or the connection/merge terms this
+    // throughput eventually feeds would be systematically too bright or
+    // dim by that ratio whenever light refracts through glass on its way
+    // to a stored vertex.
+    const float etaCorrection = 1.0f / (eta * eta);
+    throughput = throughput * etaCorrection;
+  }
+
+  return nextDirection;
 }
 
 // KHR_materials_volume's convention: light travelling `attenuationDistance`
@@ -527,6 +588,13 @@ extern "C" __global__ void __miss__radiance() {
 
 extern "C" __global__ void __miss__occlusion() { optixSetPayload_0(0u); }
 
+// Merge queries (missSBTIndex 2, see the vertexMergeHandle trace in
+// __closesthit__radiance) intentionally do nothing on a miss: "no light
+// vertices within radius" needs no payload change, since the running sum
+// (payload registers 14-16) was already zero-initialized by the caller.
+// Same reasoning the deleted phase-7 __miss__gather used.
+extern "C" __global__ void __miss__merge() {}
+
 // Shared ray/AABB slab test — used by both the voxel intersection program
 // (box IS the primitive) and the SDF one (box just bounds where to start/
 // stop sphere tracing). Returns false for no overlap; otherwise t0/t1 are
@@ -654,6 +722,24 @@ static __forceinline__ __device__ float sampleSdf(const HitGroupData *rt, float3
   const float c0 = c00 * (1 - fy) + c10 * fy;
   const float c1 = c01 * (1 - fy) + c11 * fy;
   return c0 * (1 - fz) + c1 * fz;
+}
+
+// Unified-SDF acceleration, Phase 1: nearest-cell material lookup at a
+// shading point — see HitGroupData::sdfBaseColor's doc comment for why this
+// is nearest-cell rather than trilinear like sampleSdf() above. Same
+// cell-center convention as sampleSdf's local-space conversion (grid values
+// are stored at cell centers, offset by 0.5 from the corner index), just
+// rounded to the nearest cell instead of floored+interpolated.
+static __forceinline__ __device__ void sdfNearestCellMaterial(const HitGroupData *rt, float3 p, float3 &baseColor,
+                                                                float &metallic, float &roughness) {
+  const float3 local = (p - rt->sdfOrigin) / rt->sdfVoxelSize - make_float3(0.5f, 0.5f, 0.5f);
+  const int x = max(0, min(rt->sdfNx - 1, static_cast<int>(lroundf(local.x))));
+  const int y = max(0, min(rt->sdfNy - 1, static_cast<int>(lroundf(local.y))));
+  const int z = max(0, min(rt->sdfNz - 1, static_cast<int>(lroundf(local.z))));
+  const int idx = (z * rt->sdfNy + y) * rt->sdfNx + x;
+  baseColor = rt->sdfBaseColor[idx];
+  metallic = rt->sdfMetallic[idx];
+  roughness = rt->sdfRoughness[idx];
 }
 
 // Sphere-traces from the SDF grid's bbox entry point to its exit point,
@@ -986,6 +1072,25 @@ static __forceinline__ __device__ bool sampleBsdf(const ShadingMaterial &m, floa
   return true;
 }
 
+// VCM Step 3: reconstructs a ShadingMaterial from a stored LightVertex's
+// compact (baseColorFactor, metallic, roughness) fields — the same glTF
+// metallic-roughness split __closesthit__radiance's MATERIAL_TEXTURED_
+// DIFFUSE branch already uses. hasSpecular is unconditionally true: a
+// MATERIAL_DIFFUSE deposit (see LightVertex's doc comment) always passes
+// metallic=0, roughness=1, which drives specularLobeProbability() to 0 and
+// so evalBsdf/sampleBsdf reduce to pure Lambert on their own — no separate
+// hasSpecular=false path needed.
+static __forceinline__ __device__ ShadingMaterial materialFromLightVertex(float3 baseColorFactor, float metallic,
+                                                                            float roughness) {
+  ShadingMaterial m;
+  m.diffuse = baseColorFactor * (1.0f - metallic);
+  m.f0 = lerp(make_float3(0.04f), baseColorFactor, metallic);
+  const float r = fminf(fmaxf(roughness, 0.03f), 1.0f);
+  m.alpha = r * r;
+  m.hasSpecular = true;
+  return m;
+}
+
 // -X,+X,-Y,+Y,-Z,+Z, indexed by __intersection__voxel's face attribute.
 static __forceinline__ __device__ float3 voxelFaceNormal(unsigned int face) {
   switch (face) {
@@ -1165,7 +1270,20 @@ extern "C" __global__ void __closesthit__radiance() {
   } else if (rt->materialType == MATERIAL_SDF) {
     const float3 gradN = sdfGradientNormal(rt, P);
     N = faceforward(gradN, -rayDir, gradN);
-    // albedo already defaulted to rt->albedo above — a single flat tint.
+    // Unified-SDF acceleration, Phase 1: per-cell material (was a single
+    // flat tint for the whole field) — see HitGroupData::sdfBaseColor's doc
+    // comment. Still diffuse-only shading (shading.diffuse set, hasSpecular
+    // left false) despite now carrying real metallic/roughness — full
+    // BSDF-pdf wiring is a later phase's job.
+    //
+    // claudia: SDF stays diffuse-only shading despite carrying real
+    // roughness/metallic data — BSDF-pdf wiring (specular lobe,
+    // light-subpath connectability) is a later phase's job, reusing VCM
+    // Step 3's evalBsdf/materialFromLightVertex plumbing rather than
+    // inventing SDF-specific BSDF evaluation now.
+    float cellMetallic, cellRoughness; // unused while shading stays diffuse-only, see the claudia: marker above
+    sdfNearestCellMaterial(rt, P, albedo, cellMetallic, cellRoughness);
+    shading.diffuse = albedo;
     // Sphere tracing only locates the surface to within `epsilon` (see
     // __intersection__sdf), unlike triangle/voxel geometry which is exact —
     // the shared 1e-3f NEE/bounce-ray offset below isn't reliably larger
@@ -1299,11 +1417,92 @@ extern "C" __global__ void __closesthit__radiance() {
     // pipeline used.
     if (params.lightVertexCount > 0 &&
         (rt->materialType == MATERIAL_DIFFUSE || rt->materialType == MATERIAL_TEXTURED_DIFFUSE)) {
+      // VCM Step 2: vertex merging. Perf rework (see /home/joe/.claude/
+      // plans/looks-like-vcm-caustics-is-silly-hennessy.md, "sub-phase A"):
+      // the merge estimate itself now runs as a real spatial GAS query
+      // (params.vertexMergeHandle, see __anyhit__merge's doc comment)
+      // instead of a per-vertex radius test inside the loop below. Georgiev's
+      // non-double-counting radius partition (connect to far vertices,
+      // merge-estimate near ones) is unchanged — the loop below still skips
+      // any vertex within mergeRadius, it just no longer also does the
+      // merge math itself, since the GAS query already covered it.
+      const float mergeRadius = params.mergeRadius;
+      const float mergeRadius2 = mergeRadius * mergeRadius;
+      const float mergeDiskArea = M_PIf * fmaxf(mergeRadius2, 1e-12f);
+
+      float3 merged = make_float3(0.0f);
+      if (params.vertexMergeHandle && mergeRadius > 0.0f) {
+        // "Ray-traced range query": any fixed direction of length >= the
+        // merge-sphere diameter is guaranteed to cross every sphere
+        // containing P (see __anyhit__merge's doc comment) — N is a
+        // convenient already-unit-length choice, same as the deleted
+        // phase-7 gather used.
+        // Not const: optixTrace()'s payload arguments are bound by
+        // reference and read-modify-written even for "input only" slots
+        // (the same call writes any-hit's possibly-updated values back into
+        // them), so nvcc rejects const here ("expression must be a
+        // modifiable lvalue") even though this call site never reads g0-g13
+        // back afterward.
+        unsigned int g0 = __float_as_uint(N.x), g1 = __float_as_uint(N.y), g2 = __float_as_uint(N.z);
+        unsigned int g3 = __float_as_uint(V.x), g4 = __float_as_uint(V.y), g5 = __float_as_uint(V.z);
+        unsigned int g6 = __float_as_uint(shading.diffuse.x), g7 = __float_as_uint(shading.diffuse.y),
+                     g8 = __float_as_uint(shading.diffuse.z);
+        unsigned int g9 = __float_as_uint(shading.f0.x), g10 = __float_as_uint(shading.f0.y),
+                     g11 = __float_as_uint(shading.f0.z);
+        unsigned int g12 = __float_as_uint(shading.alpha);
+        unsigned int g13 = shading.hasSpecular ? 1u : 0u;
+        unsigned int g14 = 0u, g15 = 0u, g16 = 0u;
+        const float tmax = 2.02f * mergeRadius;
+        optixTrace(params.vertexMergeHandle, P, N, 0.0f, tmax, 0.0f, OptixVisibilityMask(1),
+                   OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT, params.mergeHitSbtOffset, 1, 2, g0, g1, g2, g3, g4, g5, g6, g7,
+                   g8, g9, g10, g11, g12, g13, g14, g15, g16);
+        merged = make_float3(__uint_as_float(g14), __uint_as_float(g15), __uint_as_float(g16)) / mergeDiskArea;
+        if (params.subframeIndex == 0) {
+          unsigned long long c = atomicAdd(&g_debugQueryCount, 1ull);
+          if (c % 20000 == 0)
+            printf("DEBUG query count so far=%llu merged=(%f,%f,%f)\n", c + 1, merged.x, merged.y, merged.z);
+        }
+      }
+
+      // VCM Step 4: connection-count cap. See Params::maxConnectionsPerVertex's
+      // doc comment — uncapped (iterCount == lightVertexCount, reweight ==
+      // 1) unless the caller opts in. subsample draws `iterCount` uniformly-
+      // random indices with replacement instead of visiting every vertex;
+      // reweight makes that an unbiased estimator of the full sum in
+      // expectation. Only applies to the connection sum below — the merge
+      // sum above is an exact spatial query, not a subsampled estimate, so
+      // it is never reweighted (see this codebase's own reasoning for why
+      // uniform subsampling is unsound for a small-radius spatial query,
+      // in the plan doc referenced above).
+      const bool subsample =
+          params.maxConnectionsPerVertex > 0 && params.lightVertexCount > params.maxConnectionsPerVertex;
+      const unsigned int iterCount = subsample ? params.maxConnectionsPerVertex : params.lightVertexCount;
+      const float reweight =
+          subsample ? static_cast<float>(params.lightVertexCount) / static_cast<float>(params.maxConnectionsPerVertex)
+                    : 1.0f;
+
       float3 connected = make_float3(0.0f);
-      for (unsigned int i = 0; i < params.lightVertexCount; ++i) {
+      for (unsigned int k = 0; k < iterCount; ++k) {
+        unsigned int i = k;
+        if (subsample) {
+          i = static_cast<unsigned int>(sutil::rnd(seed) * static_cast<float>(params.lightVertexCount));
+          if (i >= params.lightVertexCount)
+            i = params.lightVertexCount - 1;
+        }
         const LightVertex &lv = params.lightVertices[i];
         const float3 toVertex = lv.position - P;
         const float dist2 = dot(toVertex, toVertex);
+
+        // Covered by the vertexMergeHandle GAS query above — skip rather
+        // than double-count. Cheap (one dot product, already computed
+        // above), no BSDF eval or shadow ray, so capping/subsampling this
+        // loop (see maxConnectionsPerVertex above) never affects merge
+        // quality: merge correctness comes entirely from the GAS's actual
+        // spatial locality, not from whether this loop happens to visit a
+        // given vertex.
+        if (mergeRadius > 0.0f && dist2 <= mergeRadius2)
+          continue;
+
         if (dist2 < 1e-8f)
           continue;
         const float dist = sqrtf(dist2);
@@ -1321,13 +1520,29 @@ extern "C" __global__ void __closesthit__radiance() {
           continue;
         if (traceOcclusion(params.handle, P, dir, 1e-3f, dist - 2e-3f))
           continue;
-        // claudia: Lambertian-diffuse-only light side for Step 1 — see
-        // LightVertex::albedo's doc comment. Same formula shape as the old
-        // single-bounce caustic gather (f_receiver/pi * power * cosTheta),
-        // generalized to a two-sided BSDF*BSDF*geometry-term connection: the
-        // gather's disk-area density estimate is replaced by an exact
-        // 1/distance^2 term since this is a direct point-to-point
-        // connection, not a radius-based estimate.
+        // VCM Step 3: full material coverage. y and P are two genuinely
+        // distinct points joined by a real edge of length `dist` here
+        // (unlike the merge case above), so there are two independent
+        // physical BRDF evaluations: the light vertex's own material
+        // scattering its arriving throughput toward P (dir's reverse, from
+        // y's perspective), and the eye vertex's own material (fCosEye,
+        // above) scattering that toward the eye. `dir` = P->y; from y's
+        // local frame the incoming direction is -lv.direction (where its
+        // own throughput arrived from) and the outgoing direction being
+        // asked about is -dir (back toward P).
+        const ShadingMaterial lightMat = materialFromLightVertex(lv.baseColorFactor, lv.metallic, lv.roughness);
+        float3 fLight;
+        float pdfLightUnused;
+        evalBsdf(lightMat, lv.normal, -lv.direction, -dir, fLight, pdfLightUnused);
+        if (fLight.x + fLight.y + fLight.z <= 0.0f)
+          continue;
+        // Formula shape: two BSDF*cos terms (fCosEye and fLight both already
+        // fold in their own NdotL — evalBsdf's contract is "f(V,L)*cos(L)",
+        // so cosLight above is only a cheap early-reject, not a separate
+        // multiplicand here) times an exact 1/distance^2 geometry term
+        // (unlike the merge estimate's disk-area density approximation,
+        // this is a direct point-to-point connection, so the geometry term
+        // is exact rather than radius-based).
         //
         // No MIS weight against NEE/BSDF sampling here (weight is
         // implicitly 1): a stored vertex sits at least one diffuse bounce
@@ -1335,14 +1550,13 @@ extern "C" __global__ void __closesthit__radiance() {
         // the light itself), so neither this eye vertex's own NEE nor its
         // BSDF-sampled continuation can reproduce this exact path — nothing
         // to double-count against, so an unweighted addition stays
-        // unbiased, the same reasoning the old caustic gather relied on. A
-        // full Veach-style recursive MIS weight across every (s,t) split
-        // needs the dVCM/dVC pdf-history bookkeeping the VCM plan
-        // introduces alongside merging in Step 2 — deliberately not built
-        // early, so there's no phantom half-finished weight term here.
-        connected += fCosEye * (lv.albedo / M_PIf) * (cosLight / dist2) * lv.throughput;
+        // unbiased, the same reasoning the old caustic gather relied on.
+        // (Double-counting against the *merge* sum above is what the radius
+        // partition, not an MIS weight, rules out — see this block's
+        // top-of-loop comment.)
+        connected += fCosEye * fLight * (lv.throughput / dist2);
       }
-      radiance += connected;
+      radiance += connected * reweight + merged;
     }
 
     // Sample the next bounce from the same BSDF the NEE above evaluated, so
@@ -1376,34 +1590,14 @@ extern "C" __global__ void __closesthit__radiance() {
     const bool entering = rt->sphereRadius > 0.0f ? (optixGetHitKind() == SPHERE_HIT_FROM_OUTSIDE)
                                                    : (dot(rayDir, Ng) < 0.0f);
 
-    // Beer-Lambert. On an exit hit the ray has just crossed the interior, and
-    // optixGetRayTmax() is exactly that segment's length, so the absorption
-    // depends on how much glass was actually traversed — thick centre darker
-    // than thin rim. Applies to segments ended by total internal reflection
-    // too, since those are exit-side hits as well.
-    if (!entering)
-      attenuation = attenuation * make_float3(expf(-dielectricExtinction.x * optixGetRayTmax()),
-                                               expf(-dielectricExtinction.y * optixGetRayTmax()),
-                                               expf(-dielectricExtinction.z * optixGetRayTmax()));
-
-    const float eta = entering ? (1.0f / dielectricIor) : dielectricIor;
-    const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
-    // Schlick's r0 = ((1-ior)/(1+ior))^2 is invariant under ior <-> 1/ior, so
-    // one argument covers both sides; TIR on the way out is handled by
-    // refractRay returning false, not by the Fresnel term.
-    const float fresnel = schlickFresnel(cosTheta, dielectricIor);
-
-    float3 refracted;
-    const bool canRefract = refractRay(rayDir, N, eta, refracted);
-    if (!canRefract || sutil::rnd(seed) < fresnel) {
-      nextDirection = reflect(rayDir, N);
-    } else {
-      nextDirection = refracted;
-    }
-    // No albedo multiply here: a dielectric's colour is absorption through
-    // its volume (the Beer-Lambert term above), not a per-interface tint.
-    // Multiplying a flat albedo at every crossing was thickness-independent,
-    // so it could never make thick glass read differently from thin.
+    // VCM Step 3: shared with __closesthit__lightSubpath's dielectric
+    // branches — see evalDielectricBounce's doc comment. No albedo multiply
+    // here: a dielectric's colour is absorption through its volume (the
+    // Beer-Lambert term inside the helper), not a per-interface tint.
+    // isLightTransport=false: this is the eye/radiance-transport path,
+    // Veach's reference direction, so no adjoint eta^2 correction applies.
+    nextDirection = evalDielectricBounce(rayDir, N, entering, dielectricIor, dielectricExtinction,
+                                          optixGetRayTmax(), /*isLightTransport=*/false, seed, attenuation);
     nextPdf = -1.0f;
   }
 
@@ -1429,6 +1623,76 @@ extern "C" __global__ void __closesthit__radiance() {
   optixSetPayload_16(__float_as_uint(nextDirection.y));
   optixSetPayload_17(__float_as_uint(nextDirection.z));
   optixSetPayload_18(static_cast<unsigned int>(done));
+}
+
+// Perf rework (see /home/joe/.claude/plans/looks-like-vcm-caustics-is-silly-
+// hennessy.md, "sub-phase A"): any-hit half of a "ray-traced range query"
+// against params.vertexMergeHandle — a GAS of uniform-radius spheres, one
+// per stored LightVertex, radius = params.mergeRadius, rebuilt every frame
+// by Impl::buildMergeGas(). This is the exact same trick the deleted
+// phase-7 __anyhit__gather used for its photon map: any-hit runs once per
+// candidate sphere along the query ray *without* stopping traversal
+// (optixIgnoreIntersection keeps it going), and as long as the ray is long
+// enough to guarantee crossing every sphere it starts inside (see the
+// query call site's tmax comment in __closesthit__radiance — any fixed
+// direction of length >= the sphere diameter works), this visits every
+// LightVertex within mergeRadius of the query point exactly once. Replaces
+// the O(lightVertexCount) brute-force radius scan that used to live inline
+// in __closesthit__radiance's connection loop — the physical formula
+// (single eye-side BSDF eval against the light vertex's arriving
+// direction, weighted by its stored throughput) is unchanged, only *how*
+// the nearby vertices are found changed.
+//
+// Payload contract (all set by the caller before tracing, p14-16
+// read-modify-written here): p0-2 query shading normal N, p3-5 query view
+// direction V, p6-8 query ShadingMaterial::diffuse, p9-11 ::f0, p12
+// ::alpha, p13 ::hasSpecular (0 or 1), p14-16 running radiance sum.
+extern "C" __global__ void __anyhit__merge() {
+  const LightVertex &lv = params.lightVertices[optixGetPrimitiveIndex()];
+  if (params.subframeIndex == 0) {
+    unsigned long long c = atomicAdd(&g_debugAnyHitCount, 1ull);
+    if (c < 30)
+      printf("DEBUG anyhit count so far=%llu\n", c + 1);
+  }
+
+  ShadingMaterial m;
+  m.diffuse = make_float3(__uint_as_float(optixGetPayload_6()), __uint_as_float(optixGetPayload_7()),
+                           __uint_as_float(optixGetPayload_8()));
+  m.f0 = make_float3(__uint_as_float(optixGetPayload_9()), __uint_as_float(optixGetPayload_10()),
+                      __uint_as_float(optixGetPayload_11()));
+  m.alpha = __uint_as_float(optixGetPayload_12());
+  m.hasSpecular = optixGetPayload_13() != 0u;
+
+  const float3 N = make_float3(__uint_as_float(optixGetPayload_0()), __uint_as_float(optixGetPayload_1()),
+                                __uint_as_float(optixGetPayload_2()));
+  const float3 V = make_float3(__uint_as_float(optixGetPayload_3()), __uint_as_float(optixGetPayload_4()),
+                                __uint_as_float(optixGetPayload_5()));
+
+  // Same physical formula as the deleted inline merge branch: the query
+  // point P and the light vertex y are treated as (approximately) the same
+  // surface point (that's what "within mergeRadius" means as r -> 0), so
+  // there is exactly one physical BRDF to evaluate — the EYE's own
+  // material, queried with the photon's incoming direction as "L".
+  // lv.throughput already carries every scattering event before reaching
+  // y, so no light-side BSDF belongs here (see the deleted comment this
+  // replaced for the fuller derivation, preserved in git history).
+  float3 fCosEye;
+  float pdfUnused;
+  evalBsdf(m, N, V, -lv.direction, fCosEye, pdfUnused);
+  if (fCosEye.x + fCosEye.y + fCosEye.z > 0.0f) {
+    if (params.subframeIndex == 0) {
+      unsigned long long c = atomicAdd(&g_debugPositiveCount, 1ull);
+      if (c < 30)
+        printf("DEBUG positive count so far=%llu\n", c + 1);
+    }
+    const float3 sum = make_float3(__uint_as_float(optixGetPayload_14()), __uint_as_float(optixGetPayload_15()),
+                                    __uint_as_float(optixGetPayload_16())) +
+                        fCosEye * lv.throughput;
+    optixSetPayload_14(__float_as_uint(sum.x));
+    optixSetPayload_15(__float_as_uint(sum.y));
+    optixSetPayload_16(__float_as_uint(sum.z));
+  }
+  optixIgnoreIntersection();
 }
 
 // ----------------------------------------------------------------------------
@@ -1468,22 +1732,14 @@ extern "C" __global__ void __closesthit__lightSubpath() {
     throughput = throughput * rt->albedo;
     done = 0u; // delta bounce: never a connectable vertex, see kCausticMirrorMetallic/Roughness's doc comment
   } else if (rt->materialType == MATERIAL_GLASS) {
-    // Same sidedness and absorption as __closesthit__radiance's glass branch
-    // — the light subpath has to refract out of the sphere correctly, and
-    // lose the same energy on the way through, or a connection through it
-    // lands with the wrong colour.
+    // VCM Step 3: shared with __closesthit__radiance's dielectric branch —
+    // see evalDielectricBounce's doc comment. isLightTransport=true: this
+    // is the light subpath, so a refraction here picks up the Veach adjoint
+    // eta^2 correction (see the realism: marker inside the helper).
     const bool entering = rt->sphereRadius > 0.0f ? (optixGetHitKind() == SPHERE_HIT_FROM_OUTSIDE)
                                                    : (dot(rayDir, Ng) < 0.0f);
-    if (!entering)
-      throughput = throughput * make_float3(expf(-rt->extinction.x * optixGetRayTmax()),
-                                             expf(-rt->extinction.y * optixGetRayTmax()),
-                                             expf(-rt->extinction.z * optixGetRayTmax()));
-    const float eta = entering ? (1.0f / rt->ior) : rt->ior;
-    const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
-    const float fresnel = schlickFresnel(cosTheta, rt->ior);
-    float3 refracted;
-    const bool canRefract = refractRay(rayDir, N, eta, refracted);
-    nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
+    nextDirection = evalDielectricBounce(rayDir, N, entering, rt->ior, rt->extinction, optixGetRayTmax(),
+                                          /*isLightTransport=*/true, seed, throughput);
     done = 0u;
   } else if (rt->materialType == MATERIAL_TEXTURED_DIFFUSE) {
     const unsigned int prim = optixGetPrimitiveIndex();
@@ -1497,59 +1753,75 @@ extern "C" __global__ void __closesthit__lightSubpath() {
       // why per-material rather than per-object.
       const bool entering = dot(rayDir, Ng) < 0.0f;
       const float3 extinction = attenuationToExtinction(mat.attenuationColor, mat.attenuationDistance);
-      if (!entering)
-        throughput = throughput * make_float3(expf(-extinction.x * optixGetRayTmax()),
-                                               expf(-extinction.y * optixGetRayTmax()),
-                                               expf(-extinction.z * optixGetRayTmax()));
-      const float eta = entering ? (1.0f / mat.ior) : mat.ior;
-      const float cosTheta = fminf(fabsf(dot(rayDir, N)), 1.0f);
-      const float fresnel = schlickFresnel(cosTheta, mat.ior);
-      float3 refracted;
-      const bool canRefract = refractRay(rayDir, N, eta, refracted);
-      nextDirection = (!canRefract || sutil::rnd(seed) < fresnel) ? reflect(rayDir, N) : refracted;
+      nextDirection = evalDielectricBounce(rayDir, N, entering, mat.ior, extinction, optixGetRayTmax(),
+                                            /*isLightTransport=*/true, seed, throughput);
       done = 0u; // delta transmissive bounce: not connectable, same as MATERIAL_GLASS
     } else if (mat.metallic > kCausticMirrorMetallic && mat.roughness < kCausticMirrorRoughness) {
       nextDirection = reflect(rayDir, N);
       throughput = throughput * mat.baseColorFactor;
       done = 0u; // mirror-like: not connectable either, same threshold __closesthit__radiance's connection loop implies
     } else {
-      // claudia: Lambertian-diffuse-only for Step 1 — see LightVertex::
-      // albedo's doc comment. Deposit using the diffuse albedo (base colour
-      // scaled by 1-metallic, the same split __closesthit__radiance's
-      // ShadingMaterial uses), then continue the walk with a cosine-weighted
-      // diffuse bounce — for a Lambert lobe, f*cos/pdf collapses to exactly
-      // the albedo, so that's the whole throughput update.
-      const float3 diffuseAlbedo = mat.baseColorFactor * (1.0f - mat.metallic);
+      // VCM Step 3: full material coverage — deposit the real material
+      // fields (was Lambertian-only albedo through Step 1/2, see
+      // LightVertex's doc comment) and continue the walk by sampling the
+      // full BSDF (GGX-capable, via sampleBsdf) rather than an always-
+      // cosine-weighted diffuse bounce, so a glossy light-subpath vertex's
+      // own continuation direction is distributed correctly too, not just
+      // its stored material.
       const unsigned int idx = atomicAdd(params.lightVertexCounter, 1u);
       if (idx < params.lightVertexCapacity) {
         params.lightVertices[idx].position = P;
         params.lightVertices[idx].normal = N;
         params.lightVertices[idx].direction = rayDir;
         params.lightVertices[idx].throughput = throughput;
-        params.lightVertices[idx].albedo = diffuseAlbedo;
+        params.lightVertices[idx].baseColorFactor = mat.baseColorFactor;
+        params.lightVertices[idx].metallic = mat.metallic;
+        params.lightVertices[idx].roughness = mat.roughness;
       }
-      float3 local;
-      cosineSampleHemisphere(sutil::rnd(seed), sutil::rnd(seed), local);
-      const Onb onb(N);
-      nextDirection = onb.toWorld(local);
-      throughput = throughput * diffuseAlbedo;
-      done = 0u;
+      const ShadingMaterial lightMat = materialFromLightVertex(mat.baseColorFactor, mat.metallic, mat.roughness);
+      float3 bounceDir, bounceWeight;
+      float bouncePdf;
+      if (sampleBsdf(lightMat, N, -rayDir, seed, bounceDir, bounceWeight, bouncePdf)) {
+        nextDirection = bounceDir;
+        throughput = throughput * bounceWeight;
+        done = 0u;
+      } else {
+        done = 1u; // degenerate sample (below the horizon); kill the path rather than bias it
+      }
     }
   } else if (rt->materialType == MATERIAL_DIFFUSE) {
+    // No metallic/roughness data on this material at all (the fixed
+    // bring-up scene's flat-albedo objects) — deposit metallic=0,
+    // roughness=1 (see LightVertex's doc comment) and continue via the same
+    // sampleBsdf() path the textured branch above uses, for one shared
+    // bounce-sampling code path rather than two. Note this is a small,
+    // intentional behavior change from Step 1/2's always-cosine-weighted
+    // bounce: materialFromLightVertex's f0=lerp(0.04,baseColor,0)=0.04
+    // gives even a "metallic=0" material glTF's usual ~4% dielectric
+    // specular lobe, so this branch now picks up the same faint Fresnel
+    // highlight __closesthit__radiance's own MATERIAL_TEXTURED_DIFFUSE
+    // materials already have — harmonizing with the rest of the renderer
+    // rather than a regression.
     const unsigned int idx = atomicAdd(params.lightVertexCounter, 1u);
     if (idx < params.lightVertexCapacity) {
       params.lightVertices[idx].position = P;
       params.lightVertices[idx].normal = N;
       params.lightVertices[idx].direction = rayDir;
       params.lightVertices[idx].throughput = throughput;
-      params.lightVertices[idx].albedo = rt->albedo;
+      params.lightVertices[idx].baseColorFactor = rt->albedo;
+      params.lightVertices[idx].metallic = 0.0f;
+      params.lightVertices[idx].roughness = 1.0f;
     }
-    float3 local;
-    cosineSampleHemisphere(sutil::rnd(seed), sutil::rnd(seed), local);
-    const Onb onb(N);
-    nextDirection = onb.toWorld(local);
-    throughput = throughput * rt->albedo;
-    done = 0u;
+    const ShadingMaterial lightMat = materialFromLightVertex(rt->albedo, 0.0f, 1.0f);
+    float3 bounceDir, bounceWeight;
+    float bouncePdf;
+    if (sampleBsdf(lightMat, N, -rayDir, seed, bounceDir, bounceWeight, bouncePdf)) {
+      nextDirection = bounceDir;
+      throughput = throughput * bounceWeight;
+      done = 0u;
+    } else {
+      done = 1u;
+    }
   }
   // MATERIAL_LIGHT (the subpath hit another light — no vertex to deposit,
   // nothing further to trace) and MATERIAL_VOXEL/MATERIAL_SDF/

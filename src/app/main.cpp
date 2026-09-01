@@ -617,6 +617,13 @@ int main(int argc, char **argv) {
           renderer->resetAccumulation();
         }
 
+        // VCM Step 4: live A/B toggle for RenderSettings::lightSubpaths —
+        // was env-var-only (ITALY_LIGHT_SUBPATHS, still supported at
+        // startup, see above) since Step 1. Same reset-on-change convention
+        // as every other render-affecting control on this panel.
+        if (ImGui::Checkbox("Light subpaths (VCM connections/merging)", &state.render.lightSubpaths))
+          renderer->resetAccumulation();
+
         ImGui::Separator();
         ImGui::Text("Lens");
         // Aperture is a world-space radius, so a fixed field range would be

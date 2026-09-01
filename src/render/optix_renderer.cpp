@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -104,6 +105,15 @@ struct OptixRenderer::Impl {
   OptixProgramGroup lightSubpathHitSpherePG = nullptr;
   OptixProgramGroup lightSubpathHitSolidSpherePG = nullptr;
 
+  // Perf rework (see /home/joe/.claude/plans/looks-like-vcm-caustics-is-
+  // silly-hennessy.md, "sub-phase A"): reinstates a gather-style any-hit
+  // hit-group/miss for vertex merging — the deleted phase-7 photon pass had
+  // gatherHitPG/gatherMissPG for the same reason, see buildMergeGas()'s and
+  // __anyhit__merge's doc comments for why the brute-force scan this
+  // replaces needed one after all.
+  OptixProgramGroup mergeHitPG = nullptr;
+  OptixProgramGroup mergeMissPG = nullptr;
+
   // Phase 10 denoiser: __raygen__tonemap is a third raygen-only launch (its
   // own minimal SBT, no miss/hitgroup records — it never calls optixTrace)
   // that reads the denoiser's output into the display buffer. Same "reuse
@@ -159,6 +169,12 @@ struct OptixRenderer::Impl {
   // Device buffer backing a MATERIAL_SDF object's dense distance field —
   // freed in destroy().
   CUdeviceptr sdfDistanceBuffer = 0;
+  // Unified-SDF acceleration, Phase 1: per-cell material, parallel to
+  // sdfDistanceBuffer — freed in destroy(). See SdfGrid::baseColor's doc
+  // comment.
+  CUdeviceptr sdfBaseColorBuffer = 0;
+  CUdeviceptr sdfMetallicBuffer = 0;
+  CUdeviceptr sdfRoughnessBuffer = 0;
 
   // Device buffers backing a MATERIAL_GSPLAT object's per-primitive
   // position/scale/rotation/opacity/color arrays — freed in destroy(). No
@@ -195,20 +211,23 @@ struct OptixRenderer::Impl {
   // eye-path-only per the VCM plan's explicit scope boundary either way).
   //
   // kLightSubpathBatchSize is deliberately much smaller than the old photon
-  // pass's 65536: __closesthit__radiance's BDPT connection loop is O(stored
-  // vertices) *per diffuse eye hit*, with no spatial culling yet (that's
-  // vertex merging, Step 2's job) — a batch this size keeps that loop
-  // tractable for interactive use while Step 1 is unweighted/unpruned; Step
-  // 4 is where a real connection-count cap or subsampling scheme lands.
+  // pass's 65536: __closesthit__radiance's BDPT connection loop is
+  // O(min(stored vertices, Params::maxConnectionsPerVertex)) *per diffuse
+  // eye hit* — a batch this size keeps that loop tractable for interactive
+  // use.
   //
-  // claudia: quick tuning pass (caustics reported too dim vs. sdf-noon.png)
-  // — raised 512->2048 (capacity kept at the same ~16x-of-batch headroom
-  // ratio) to feed more light subpaths into Step 1's unmerged BDPT
-  // connections per frame, at a proportional per-frame cost. This does not
-  // address the actual gap (no vertex merging / Lambertian-only connections,
-  // Steps 2-3 of the VCM plan) — it only strengthens what Step 1 already
-  // computes. Revert or retune once Step 2 lands and this loop gets spatial
-  // culling.
+  // claudia: still an unbenchmarked guess, not a retuned value — Steps 2-3
+  // (vertex merging, full material coverage) and Step 4 (the
+  // maxConnectionsPerVertex subsampling cap, see pathtracer_params.h) have
+  // now landed, and the merge estimate does give near-vertex queries an
+  // effective radius cutoff, but the *connection* loop's far-vertex sum
+  // stays O(count) regardless (point-to-point, not radius-based — see
+  // Params::mergeRadius' doc comment). This value has never been measured
+  // against a live render: the environment these changes were written in
+  // has no GL/OptiX context to run one in (confirmed when this comment was
+  // written — see the session's own verification notes). Benchmark
+  // 512/1024/2048/4096 frame time on the closed-form scene and retune
+  // before trusting this number for anything perf-sensitive.
   bool enableLightSubpaths = false;
   static constexpr unsigned int kLightSubpathBatchSize = 2048;
   static constexpr unsigned int kLightVertexCapacity = 32768; // headroom over batchSize * the 12-bounce depth cap
@@ -217,6 +236,44 @@ struct OptixRenderer::Impl {
   CUdeviceptr lightVertexCounterBuffer = 0; // single atomic uint
   unsigned int lightSubpathPassIndex = 0;
   unsigned int totalLightPathsEmitted = 0;
+
+  // VCM Step 2: vertex-merging radius, classic progressive-photon-mapping
+  // decay (Hachisuka & Jensen 2009's schedule, same one the deleted phase-7
+  // SPPM pass used) — negative means "not yet initialized", set on the
+  // first light-subpath pass to a fraction of the scene's bounding radius.
+  // See Params::mergeRadius' doc comment in pathtracer_params.h for the
+  // radius-partition merge scheme this feeds.
+  float mergeRadius = -1.0f;
+
+  // Perf rework: standalone GAS of uniform-radius spheres over
+  // lightVertexBuffer's positions, rebuilt every frame by buildMergeGas()
+  // (called from render(), right after traceLightSubpathPass()). Not part
+  // of the scene IAS — same isolation the deleted phase-7 photonGas* had.
+  // mergeHitSbtOffset is the main sbt's hitgroup-table index for mergeHitPG
+  // (one past the last scene object's record, set in buildSbt()).
+  //
+  // Output/temp/radius buffers are allocated once (sized for
+  // kLightVertexCapacity, the worst case) and reused every frame rather
+  // than malloc'd/freed per call — measured cost of the naive malloc/free-
+  // every-frame version (see buildMergeGas()'s doc comment) made the GAS
+  // rebuild net *slower* than the O(lightVertexCount) brute-force scan it
+  // replaced, on a scene depositing only ~900 vertices/frame.
+  CUdeviceptr mergeGasOutputBuffer = 0;
+  CUdeviceptr mergeGasTempBuffer = 0;
+  CUdeviceptr mergeGasRadiusBuffer = 0;
+  size_t mergeGasOutputCapacityBytes = 0;
+  size_t mergeGasTempCapacityBytes = 0;
+  OptixTraversableHandle mergeGasHandle = 0;
+  unsigned int mergeHitSbtOffset = 0;
+
+  static constexpr float kPpmAlpha = 0.7f;
+  // Fraction of the scene's bounding sphere radius used as the *initial*
+  // merge radius before any decay — large enough to gather a useful vertex
+  // count at pass 0, small enough not to blur caustic structure into mush.
+  // Chosen by inspection against this renderer's existing bring-up scene
+  // scale, not derived from anything; retune if a much larger/smaller scene
+  // makes merges too sparse/blurry.
+  static constexpr float kInitialMergeRadiusFraction = 0.02f;
 
   ~Impl() { destroy(); }
 
@@ -243,6 +300,12 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(voxelColorBuffer));
     if (sdfDistanceBuffer)
       cudaFree(reinterpret_cast<void *>(sdfDistanceBuffer));
+    if (sdfBaseColorBuffer)
+      cudaFree(reinterpret_cast<void *>(sdfBaseColorBuffer));
+    if (sdfMetallicBuffer)
+      cudaFree(reinterpret_cast<void *>(sdfMetallicBuffer));
+    if (sdfRoughnessBuffer)
+      cudaFree(reinterpret_cast<void *>(sdfRoughnessBuffer));
     if (splatPositionBuffer)
       cudaFree(reinterpret_cast<void *>(splatPositionBuffer));
     if (splatScaleBuffer)
@@ -265,6 +328,12 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(lightVertexBuffer));
     if (lightVertexCounterBuffer)
       cudaFree(reinterpret_cast<void *>(lightVertexCounterBuffer));
+    if (mergeGasOutputBuffer)
+      cudaFree(reinterpret_cast<void *>(mergeGasOutputBuffer));
+    if (mergeGasTempBuffer)
+      cudaFree(reinterpret_cast<void *>(mergeGasTempBuffer));
+    if (mergeGasRadiusBuffer)
+      cudaFree(reinterpret_cast<void *>(mergeGasRadiusBuffer));
     if (lightSubpathSbt.raygenRecord)
       cudaFree(reinterpret_cast<void *>(lightSubpathSbt.raygenRecord));
     if (lightSubpathSbt.missRecordBase)
@@ -306,6 +375,10 @@ struct OptixRenderer::Impl {
       optixPipelineDestroy(pipeline);
     if (tonemapRaygenPG)
       optixProgramGroupDestroy(tonemapRaygenPG);
+    if (mergeMissPG)
+      optixProgramGroupDestroy(mergeMissPG);
+    if (mergeHitPG)
+      optixProgramGroupDestroy(mergeHitPG);
     if (lightSubpathHitSolidSpherePG)
       optixProgramGroupDestroy(lightSubpathHitSolidSpherePG);
     if (lightSubpathHitSpherePG)
@@ -354,7 +427,20 @@ struct OptixRenderer::Impl {
 
   void buildModule() {
     pipelineCompileOptions.usesMotionBlur = false;
-    pipelineCompileOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
+    // ALLOW_SINGLE_LEVEL_INSTANCING: the main scene traversal (camera/
+    // occlusion/light-subpath rays), an IAS of per-object GASes.
+    // ALLOW_SINGLE_GAS: the merge query (see Params::vertexMergeHandle)
+    // traces directly into a bare GAS with no IAS wrapping it — the OptiX
+    // validation layer rejects that (OPTIX_VALIDATION_ERROR
+    // UNSUPPORTED_SINGLE_LEVEL_BLAS: "traversal of single level scene
+    // graphs is not supported") unless this flag is also set. Silently a
+    // no-op without it and without validation mode enabled — any-hit simply
+    // never fires, no host-visible error — so this one is easy to miss; it
+    // only surfaced by temporarily enabling
+    // OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL while debugging the merge
+    // query never finding any vertices.
+    pipelineCompileOptions.traversableGraphFlags =
+        OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING | OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
     pipelineCompileOptions.numPayloadValues = 19;
     pipelineCompileOptions.numAttributeValues = 2;
     pipelineCompileOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
@@ -497,6 +583,25 @@ struct OptixRenderer::Impl {
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &lightSubpathHitSolidSphereDesc, 1, &pgOptions, LOG, &LOG_SIZE,
                                              &lightSubpathHitSolidSpherePG));
 
+    // Perf rework: vertex-merge gather query (see __anyhit__merge's doc
+    // comment) — any-hit only, no closest-hit, same shape the deleted
+    // phase-7 gatherHitPG had. moduleIS = sphereModule: merge-GAS spheres
+    // use OptiX's built-in sphere primitive (radiusBuffers/vertexBuffers),
+    // not the custom solid-sphere intersector real dielectric geometry
+    // needs — these are pure query volumes, never actually rendered.
+    OptixProgramGroupDesc mergeHitDesc{};
+    mergeHitDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    mergeHitDesc.hitgroup.moduleAH = module;
+    mergeHitDesc.hitgroup.entryFunctionNameAH = "__anyhit__merge";
+    mergeHitDesc.hitgroup.moduleIS = sphereModule;
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &mergeHitDesc, 1, &pgOptions, LOG, &LOG_SIZE, &mergeHitPG));
+
+    OptixProgramGroupDesc mergeMissDesc{};
+    mergeMissDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    mergeMissDesc.miss.module = module;
+    mergeMissDesc.miss.entryFunctionName = "__miss__merge";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &mergeMissDesc, 1, &pgOptions, LOG, &LOG_SIZE, &mergeMissPG));
+
     // Phase 10 denoiser: raygen-only, never calls optixTrace.
     OptixProgramGroupDesc tonemapRaygenDesc{};
     tonemapRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -521,11 +626,15 @@ struct OptixRenderer::Impl {
                                    lightSubpathHitTrianglePG,
                                    lightSubpathHitSpherePG,
                                    lightSubpathHitSolidSpherePG,
+                                   mergeHitPG,
+                                   mergeMissPG,
                                    tonemapRaygenPG};
     OptixPipelineLinkOptions linkOptions{};
     // raygen -> radiance hit -> occlusion shadow ray (2), or raygen ->
     // radiance hit -> BDPT-connection occlusion shadow ray (2, same
-    // traceOcclusion() call as NEE — see __closesthit__radiance), or
+    // traceOcclusion() call as NEE — see __closesthit__radiance), or raygen
+    // -> radiance hit -> vertex-merge gather query (2, same depth as the
+    // other two — see the vertexMergeHandle trace site), or
     // light-subpath-raygen -> light-subpath-hit (1, no nested trace) — 2
     // covers every path in this pipeline.
     const uint32_t maxTraceDepth = 2;
@@ -865,7 +974,6 @@ struct OptixRenderer::Impl {
     SceneObject obj;
     obj.kind = GeometryKind::Sdf;
     obj.material.materialType = MATERIAL_SDF;
-    obj.material.albedo = toFloat3(grid.tintColor);
     obj.material.sdfOrigin = toFloat3(grid.origin);
     obj.material.sdfVoxelSize = grid.voxelSize;
     obj.material.sdfNx = grid.nx;
@@ -877,6 +985,31 @@ struct OptixRenderer::Impl {
     CUDA_CHECK(
         cudaMemcpy(reinterpret_cast<void *>(sdfDistanceBuffer), grid.distances.data(), bytes, cudaMemcpyHostToDevice));
     obj.material.sdfDistances = reinterpret_cast<float *>(sdfDistanceBuffer);
+
+    // Unified-SDF acceleration, Phase 1: per-cell material, uploaded
+    // alongside the distance field — see SdfGrid::baseColor's doc comment.
+    // grid.baseColor/metallic/roughness are always sized to match
+    // grid.distances (bakeSdf() populates all three together), so no
+    // separate empty-check is needed here the way an optional field would.
+    std::vector<float3> baseColorHost(grid.baseColor.size());
+    for (size_t i = 0; i < grid.baseColor.size(); ++i)
+      baseColorHost[i] = toFloat3(grid.baseColor[i]);
+    const size_t colorBytes = baseColorHost.size() * sizeof(float3);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&sdfBaseColorBuffer), colorBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(sdfBaseColorBuffer), baseColorHost.data(), colorBytes,
+                           cudaMemcpyHostToDevice));
+    obj.material.sdfBaseColor = reinterpret_cast<float3 *>(sdfBaseColorBuffer);
+
+    const size_t scalarBytes = grid.metallic.size() * sizeof(float);
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&sdfMetallicBuffer), scalarBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(sdfMetallicBuffer), grid.metallic.data(), scalarBytes,
+                           cudaMemcpyHostToDevice));
+    obj.material.sdfMetallic = reinterpret_cast<float *>(sdfMetallicBuffer);
+
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&sdfRoughnessBuffer), scalarBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(sdfRoughnessBuffer), grid.roughness.data(), scalarBytes,
+                           cudaMemcpyHostToDevice));
+    obj.material.sdfRoughness = reinterpret_cast<float *>(sdfRoughnessBuffer);
 
     const glm::vec3 boundsMax = grid.boundsMax();
     OptixAabb aabb{grid.origin.x, grid.origin.y, grid.origin.z, boundsMax.x, boundsMax.y, boundsMax.z};
@@ -1262,11 +1395,16 @@ struct OptixRenderer::Impl {
   // old photon pass — see that function for why camera movement doesn't
   // reset any of this (light subpaths are view-independent).
   //
-  // Unlike the phase-7 photon pass this replaces, there is no acceleration
-  // structure rebuild here: Step 1 has no vertex *merging*, so
-  // __closesthit__radiance just iterates params.lightVertices directly (see
-  // its doc comment in pathtracer_params.h). Step 2 is what adds a
-  // per-frame GAS rebuild over this same buffer for the merge query.
+  // The merge-query acceleration structure (vertexMergeHandle) is *not*
+  // rebuilt here — that's buildMergeGas()'s job, called separately from
+  // render() right after this function returns, since it needs this
+  // function's return value (the deposited count) and its just-decayed
+  // mergeRadius as inputs.
+  //
+  // Also advances the PPM merge-radius decay schedule (see mergeRadius'
+  // member doc comment) — done here, alongside the pass-index/emitted-count
+  // bookkeeping this function already owns, rather than in render(), so all
+  // of a "pass"'s state updates together.
   unsigned int traceLightSubpathPass() {
     CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(lightVertexCounterBuffer), 0, sizeof(unsigned int), stream));
     OPTIX_CHECK(
@@ -1280,9 +1418,105 @@ struct OptixRenderer::Impl {
     if (lightSubpathPassIndex < 3 || lightSubpathPassIndex % 64 == 0)
       std::fprintf(stderr, "italy: light-subpath pass %u: %u vertices deposited\n", lightSubpathPassIndex,
                    deposited);
+
+    if (mergeRadius < 0.0f)
+      mergeRadius = boundsRadius * kInitialMergeRadiusFraction;
+    else
+      mergeRadius *= std::sqrt((lightSubpathPassIndex + kPpmAlpha) / (lightSubpathPassIndex + 1.0f));
+
     ++lightSubpathPassIndex;
     totalLightPathsEmitted += kLightSubpathBatchSize;
     return deposited;
+  }
+
+  // Perf rework (see /home/joe/.claude/plans/looks-like-vcm-caustics-is-
+  // silly-hennessy.md, "sub-phase A"): rebuilds vertexMergeHandle — one
+  // uniform-radius sphere per this frame's stored LightVertex — so
+  // __closesthit__radiance's merge query (see __anyhit__merge's doc
+  // comment) finds nearby vertices via a real spatial lookup instead of the
+  // O(lightVertexCount) brute-force scan this replaces. Called from
+  // render() right after traceLightSubpathPass() returns, since it needs
+  // that call's deposited count and just-decayed mergeRadius.
+  //
+  // Also see OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS on
+  // pipelineCompileOptions.traversableGraphFlags (buildModule()) — this
+  // function's optixTrace call site traces directly into a bare GAS (no
+  // IAS), which silently never invokes any-hit without that flag (no host-
+  // visible error unless OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL is
+  // temporarily enabled to surface it). Cost a full debugging pass to find:
+  // every symptom (query fires, handle is valid, geometry/radius data is
+  // correct, __miss__merge fires) looked like a working-but-empty merge, not
+  // a rejected trace, until validation mode surfaced
+  // UNSUPPORTED_SINGLE_LEVEL_BLAS directly.
+  //
+  // Buffer management: output/temp buffers are grown (not malloc/free'd)
+  // only when this frame's required size exceeds current capacity — avoids
+  // malloc/free churn on the common case where vertex count is roughly
+  // stable frame to frame — and the build has no cudaStreamSynchronize
+  // after it: the main eye-path launch that actually consumes
+  // mergeGasHandle is submitted to this same `stream` right after (see
+  // render()), and CUDA's in-order stream semantics already guarantee the
+  // build completes first, so a host-side wait here would only add a stall
+  // with no correctness benefit. Sphere centers are read straight out of
+  // lightVertexBuffer via vertexStrideInBytes = sizeof(LightVertex) — no
+  // host round-trip or repacking needed.
+  void buildMergeGas(unsigned int vertexCount) {
+    if (vertexCount == 0 || mergeRadius <= 0.0f) {
+      mergeGasHandle = 0; // no vertices this frame (or radius not yet initialized) — merge query becomes a no-op
+      return;
+    }
+
+    if (!mergeGasRadiusBuffer)
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&mergeGasRadiusBuffer), sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(mergeGasRadiusBuffer), &mergeRadius, sizeof(float),
+                                cudaMemcpyHostToDevice, stream));
+
+    const CUdeviceptr vertexBuffer = lightVertexBuffer + offsetof(LightVertex, position);
+
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_SPHERES;
+    input.sphereArray.vertexBuffers = &vertexBuffer;
+    input.sphereArray.vertexStrideInBytes = sizeof(LightVertex);
+    input.sphereArray.numVertices = vertexCount;
+    input.sphereArray.radiusBuffers = &mergeGasRadiusBuffer;
+    input.sphereArray.singleRadius = 1;
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.sphereArray.flags = flags;
+    input.sphereArray.numSbtRecords = 1;
+
+    OptixAccelBuildOptions accelOptions{};
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_BUILD;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+
+    // Compute sizes for THIS frame's actual vertexCount every call (cheap —
+    // host-only, no GPU work) and only reallocate the persistent output/temp
+    // buffers when the requirement grows past current capacity — avoids the
+    // malloc/free-every-frame churn a naive version of this function has
+    // (see the file history for the measured cost of that), without
+    // pre-committing to kLightVertexCapacity's worst-case size up front.
+    OptixAccelBufferSizes sizes{};
+    OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accelOptions, &input, 1, &sizes));
+    if (sizes.outputSizeInBytes > mergeGasOutputCapacityBytes) {
+      if (mergeGasOutputBuffer)
+        cudaFree(reinterpret_cast<void *>(mergeGasOutputBuffer));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&mergeGasOutputBuffer), sizes.outputSizeInBytes));
+      mergeGasOutputCapacityBytes = sizes.outputSizeInBytes;
+    }
+    if (sizes.tempSizeInBytes > mergeGasTempCapacityBytes) {
+      if (mergeGasTempBuffer)
+        cudaFree(reinterpret_cast<void *>(mergeGasTempBuffer));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&mergeGasTempBuffer), sizes.tempSizeInBytes));
+      mergeGasTempCapacityBytes = sizes.tempSizeInBytes;
+    }
+
+    // No cudaStreamSynchronize: mergeGasOutputBuffer/mergeGasTempBuffer are
+    // persistent (never freed right after this call), and the main eye-path
+    // launch that consumes mergeGasHandle is submitted to this same
+    // `stream` right after (see render()) — CUDA's in-order stream
+    // semantics already guarantee the build completes first.
+    OPTIX_CHECK(optixAccelBuild(context, stream, &accelOptions, &input, 1, mergeGasTempBuffer,
+                                 mergeGasTempCapacityBytes, mergeGasOutputBuffer, mergeGasOutputCapacityBytes,
+                                 &mergeGasHandle, nullptr, 0));
   }
 
   void buildIAS() {
@@ -1322,22 +1556,29 @@ struct OptixRenderer::Impl {
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
 
-    // Just the two miss programs radiance/occlusion always needed. VCM
-    // Step 1 has no third (gather-style) trace from inside
-    // __closesthit__radiance — the BDPT connection loop's shadow rays reuse
-    // missOcclusionPG via the same traceOcclusion() helper NEE already
-    // calls, so there is no separate miss index or SBT-layout variant to
-    // carry the way the old phase-7 gather query needed.
-    MissRecord missRecords[2]{};
+    // Miss index 2 (__miss__merge) backs the vertex-merge gather query
+    // issued from inside __closesthit__radiance — see
+    // Params::vertexMergeHandle. Appended unconditionally (harmless/unused
+    // when there's no merge GAS yet, same "always present, no-op until a
+    // handle exists" convention lightSubpathSbt's tables use) rather than
+    // only when light subpaths are enabled, so there's no second SBT-layout
+    // variant to keep in sync.
+    MissRecord missRecords[3]{};
     OPTIX_CHECK(optixSbtRecordPackHeader(missRadiancePG, &missRecords[0]));
     missRecords[0].data.bgColor = make_float3(0.05f, 0.06f, 0.08f);
     OPTIX_CHECK(optixSbtRecordPackHeader(missOcclusionPG, &missRecords[1]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(mergeMissPG, &missRecords[2]));
     CUdeviceptr d_miss;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecords)));
     CUDA_CHECK(
         cudaMemcpy(reinterpret_cast<void *>(d_miss), missRecords, sizeof(missRecords), cudaMemcpyHostToDevice));
 
-    std::vector<HitGroupRecord> hitRecords(objects.size());
+    // One extra record past the per-object ones, for the merge hit-group —
+    // see Params::mergeHitSbtOffset for why it has to live at a
+    // scene-object-count-dependent index rather than a fixed one (same
+    // scheme the deleted phase-7 gatherHitSbtOffset used).
+    mergeHitSbtOffset = static_cast<unsigned int>(objects.size());
+    std::vector<HitGroupRecord> hitRecords(objects.size() + 1);
     for (size_t i = 0; i < objects.size(); ++i) {
       OptixProgramGroup pg;
       switch (objects[i].kind) {
@@ -1363,6 +1604,11 @@ struct OptixRenderer::Impl {
       OPTIX_CHECK(optixSbtRecordPackHeader(pg, &hitRecords[i]));
       hitRecords[i].data = objects[i].material;
     }
+    // Merge hit-group record: __anyhit__merge never reads
+    // optixGetSbtDataPointer() (it indexes params.lightVertices by
+    // optixGetPrimitiveIndex() instead), so the data payload is left
+    // zero-initialized — nothing to fill in.
+    OPTIX_CHECK(optixSbtRecordPackHeader(mergeHitPG, &hitRecords[mergeHitSbtOffset]));
     CUdeviceptr d_hit;
     const size_t hitBytes = hitRecords.size() * sizeof(HitGroupRecord);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_hit), hitBytes));
@@ -1371,7 +1617,7 @@ struct OptixRenderer::Impl {
     sbt.raygenRecord = d_rg;
     sbt.missRecordBase = d_miss;
     sbt.missRecordStrideInBytes = sizeof(MissRecord);
-    sbt.missRecordCount = 2;
+    sbt.missRecordCount = 3;
     sbt.hitgroupRecordBase = d_hit;
     sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
     sbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
@@ -1549,6 +1795,19 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
     const unsigned int deposited = impl_->traceLightSubpathPass();
     params.lightVertexCount = deposited;
     params.totalLightPathsEmitted = impl_->totalLightPathsEmitted; // now includes this pass, for the main launch
+    // VCM Step 2: traceLightSubpathPass() just advanced the PPM decay
+    // schedule (see Impl::mergeRadius' doc comment) — read the updated value
+    // back for the main launch's merge estimate. 0 when lightSubpaths is
+    // off (Params{} value-init, not written on that path) already disables
+    // merging in __closesthit__radiance's `mergeRadius > 0.0f` check.
+    params.mergeRadius = impl_->mergeRadius;
+    // Perf rework: rebuild the merge-query GAS now that this pass's
+    // deposited count and decayed mergeRadius are both known — see
+    // buildMergeGas()'s doc comment for why it can't run any earlier.
+    // mergeGasHandle stays 0 (query becomes a no-op) when deposited==0.
+    impl_->buildMergeGas(deposited);
+    params.vertexMergeHandle = impl_->mergeGasHandle;
+    params.mergeHitSbtOffset = impl_->mergeHitSbtOffset;
   }
 
   CUDA_CHECK(cudaGraphicsMapResources(1, &impl_->cudaPbo, impl_->stream));

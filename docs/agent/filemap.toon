@@ -1,0 +1,42 @@
+files[41]{path,purpose,includes}:
+  src/app/app_window.cpp,"",app/app_window.h
+  src/app/app_window.h,"One independent OS window: its own GLFWwindow + its own ImGuiContext, sharing a GL context/object-namespace with whichever window it was told to share with (see AppWindow's constructor comment in app_…",""
+  src/app/main.cpp,"Phase 9: live ImGui controls — load a GLB, switch mesh/voxel/SDF representation, pick an HDRI preset, tune exposure/samples-per-launch — on top of the phase 2 window/camera/viewport shell.",app/app_window.h|convert/sdf_baker.h|convert/voxelize.h|core/orbit_camera.h|io/gltf_loader.h|io/gsplat_ply_loader.h|io/mesh_validate.h|render/environment.h|render/optix_renderer.h|render/procedural_sky.h
+  src/convert/gsplat_bounds.h,"",""
+  src/convert/sdf_baker.cpp,"",convert/sdf_baker.h|convert/tri_box_overlap.h|render/kernels/sdf_bake_params.h|render/optix_check.h|render_config.h
+  src/convert/sdf_baker.h,"",convert/sdf_grid.h|io/mesh_asset.h
+  src/convert/sdf_grid.h,"",""
+  src/convert/tri_box_overlap.h,"Shared by voxelize.cpp (per-voxel-cell mesh resampling) and sdf_baker.cpp (unified-SDF acceleration Phase 1's per-cell material bake, see SdfGrid::baseColor's doc comment) — both need \"does this trian…",""
+  src/convert/voxel_grid.h,"",""
+  src/convert/voxelize.cpp,"",convert/voxelize.h|convert/tri_box_overlap.h
+  src/convert/voxelize.h,"",convert/voxel_grid.h|io/mesh_asset.h
+  src/core/orbit_camera.cpp,"",core/orbit_camera.h
+  src/core/orbit_camera.h,"",""
+  src/io/gltf_loader.cpp,tinygltf's header declares stb_image/stb_image_write usage but doesn't define their IMPLEMENTATION macros itself — that's on the includer.,io/gltf_loader.h
+  src/io/gltf_loader.h,"",io/mesh_asset.h
+  src/io/gsplat_asset.h,"",""
+  src/io/gsplat_ply_loader.cpp,"",io/gsplat_ply_loader.h
+  src/io/gsplat_ply_loader.h,"",io/gsplat_asset.h
+  src/io/mesh_asset.h,"",""
+  src/io/mesh_validate.cpp,"",io/mesh_validate.h
+  src/io/mesh_validate.h,"",io/mesh_asset.h
+  src/render/environment.cpp,"",render/environment.h
+  src/render/environment.h,"",""
+  src/render/gl_ext.h,"Manually-resolved OpenGL buffer-object entry points (GL_ARB_vertex_buffer_ object, core since GL 1.5) needed for the CUDA-GL interop PBO.",""
+  src/render/kernels/device_onb.h,Shared by pathtracer.cu (cosine-hemisphere sampling around a shading normal) and sdf_bake.cu (jittering sample directions around a base direction) — same orthonormal-basis-around-a-vector construction…,""
+  src/render/kernels/pathtracer.cu,"Phase 2 bring-up path tracer: unidirectional, next-event estimation toward a single quad light, multiple importance sampling (power heuristic) between light- and BSDF-sampling, Russian roulette termin…",device_onb.h|pathtracer_params.h
+  src/render/kernels/pathtracer_params.h,Shared between host (optix_renderer.cpp) and device (pathtracer.cu) code.,""
+  src/render/kernels/sdf_bake.cu,"One-shot SDF bake: for each grid cell, estimate unsigned distance to the mesh surface as the minimum hit distance over a fixed set of sample directions (OptiX has no native \"closest point\" query — thi…",sdf_bake_params.h
+  src/render/kernels/sdf_bake_params.h,"Own tiny module/pipeline, separate from pathtracer_params.h/pathtracer.cu — baking is a one-shot preprocess with a totally different program shape (3D launch over grid cells, no path tracing) and gain…",""
+  src/render/optix_check.h,Tiny throw-on-error wrappers for OptiX/CUDA calls.,""
+  src/render/optix_renderer.cpp,"",render/optix_renderer.h|convert/gsplat_bounds.h|convert/voxel_grid.h|io/gsplat_asset.h|render/gl_ext.h|render/kernels/pathtracer_params.h|render/optix_check.h|render_config.h
+  src/render/optix_renderer.h,"This is the RHI seam for phase 2: everything above this class (app/, core/) talks to italy::OptixRenderer only — nothing outside src/render/ includes optix.h or cuda_runtime.h directly.",convert/sdf_grid.h|convert/voxel_grid.h|core/orbit_camera.h|io/gsplat_asset.h|io/mesh_asset.h|render/environment.h
+  src/render/procedural_sky.cpp,"",render/procedural_sky.h
+  src/render/procedural_sky.h,"",render/environment.h
+  tests/environment_cdf_test.cpp,"Standalone sanity check for the HDRI importance-sampling CDF build (render/environment.cpp), matching voxelize_test.cpp's tool-scale: no framework, just asserts, run via the `environment_cdf_test` CMa…",render/environment.h
+  tests/gsplat_ply_loader_test.cpp,"Standalone sanity check for the gsplat .ply loader (io/gsplat_ply_loader.cpp) and its AABB helper (convert/gsplat_bounds.h), matching this repo's other tests' tool-scale: no framework, just asserts.",convert/gsplat_bounds.h|io/gsplat_ply_loader.h
+  tests/mesh_validate_test.cpp,"Standalone sanity check for the watertightness gate (io/mesh_validate.cpp), matching this repo's other tests' tool-scale: no framework, just asserts, run via the `mesh_validate_test` CMake target.",io/mesh_validate.h
+  tests/procedural_sky_test.cpp,"Standalone sanity check for the Preetham procedural sky generator (render/procedural_sky.cpp) — host-side only, no GPU/OptiX needed, same as environment_cdf_test.cpp.",render/environment.h|render/procedural_sky.h
+  tests/sdf_sign_test.cpp,"Sanity check for sdf_baker.cpp's sign/magnitude correctness against a primitive with a known analytic SDF (a unit sphere), per the original plan doc's verification ask.",convert/sdf_baker.h|io/mesh_asset.h
+  tests/stb_image_impl.cpp,"environment_cdf_test links environment.cpp, which declares (but per its own comment deliberately doesn't define) stb_image's implementation — that's normally provided elsewhere in the italy-rs binary…",""
+  tests/voxelize_test.cpp,"Standalone sanity check for the triangle-box SAT voxelizer — no framework, just asserts, matching this repo's tool-scale rather than pulling in a test runner for one file.",convert/voxelize.h

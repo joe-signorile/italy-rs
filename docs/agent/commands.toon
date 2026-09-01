@@ -1,0 +1,31 @@
+build[3]{step,command}:
+  configure,"cmake -B build -G Ninja"
+  build,"cmake --build build"
+  run,"./build/italy-rs"
+
+test[1]{step,command}:
+  ctest,"ctest --test-dir build"
+
+run_flags[6]{flag,effect}:
+  "(no flags)","renders built-in test scene / assets/test.glb"
+  "path/to/asset.glb","render a GLB as textured triangles"
+  "path/to/asset.glb --voxel=64","voxelize mesh at 64 cells/longest-axis"
+  "path/to/asset.glb --sdf=56","bake SDF at 56 cells/longest-axis (wins over --voxel if both given)"
+  "--gsplat=path/to/scene.ply","render an imported 3D Gaussian Splat scene (distinct load source, not combined with GLB flags)"
+  "path/to/asset.glb --env=overcast|midnight|noon|sky, or --hdri=path/to/custom.hdr","HDRI/procedural-sky lighting instead of the built-in quad light"
+
+env_hooks[8]{var,effect}:
+  ITALY_DUMP_FRAME,"=/path/to/out.png — write accumulated render to PNG after 128 subframes and exit (headless verification)"
+  ITALY_DUMP_AFTER_SUBFRAME,"=<n> — subframes to accumulate before ITALY_DUMP_FRAME writes"
+  ITALY_FORCE_DENOISE,"=1 — force OptiX AI denoiser on"
+  ITALY_TONEMAP,"=<agx|reinhard|aces|hable|clamp> — select tonemap operator"
+  ITALY_FIREFLY_CLAMP,"=<value> — clamp bright outliers (0 disables)"
+  ITALY_SKY_TURBIDITY,"seed procedural sky turbidity (see --env=sky)"
+  ITALY_SKY_ELEVATION,"seed procedural sky sun elevation"
+  ITALY_SKY_AZIMUTH,"seed procedural sky sun azimuth"
+
+hybrid_gpu_laptop[1]{note}:
+  "Intel iGPU + NVIDIA dGPU (e.g. Iris Xe + RTX 4080 Laptop): GLX defaults to iGPU, breaks CUDA-GL interop. Prefix run with: __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia"
+
+notes[1]{note}:
+  "This file is hand-maintained: update it when humans.md's Quick start/Build/Status command examples change. Full prose + rationale lives in humans.md."

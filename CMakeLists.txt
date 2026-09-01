@@ -130,6 +130,17 @@ add_dependencies(italy-rs italy_optixir_pathtracer italy_optixir_sdf_bake)
 target_include_directories(italy-rs PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
 target_link_libraries(italy-rs PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
 
+# Agent-facing file map (docs/agent/filemap.toon) — regenerated every
+# build so it can't go stale; the script is a cheap regex pass over ~40
+# small files, not worth a fine-grained DEPENDS glob at this repo's size.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_target(agent_filemap ALL
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen_filemap.py
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Regenerating docs/agent/filemap.toon"
+  VERBATIM
+)
+
 enable_testing()
 add_executable(voxelize_test tests/voxelize_test.cpp src/convert/voxelize.cpp)
 target_include_directories(voxelize_test PRIVATE src)

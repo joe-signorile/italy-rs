@@ -1,0 +1,16 @@
+phases[10]{phase,feature,state}:
+  1,watertight-mesh import gate + caustics on loaded meshes,done
+  2,path tracer core (NEE+MIS+RR) + procedural sky (Preetham/Perez),done
+  3,GLB loading + Gaussian-splat (.ply) import,done
+  4,mesh -> sparse voxel grid (MATERIAL_VOXEL),done
+  5,mesh -> dense signed distance field (MATERIAL_SDF),done
+  6,HDRI/environment lighting + importance sampling,done
+  7,caustics via progressive photon map,done
+  8,selectable tonemap operator (AgX default),done
+  9,live ImGui controls replacing CLI-only workflow,done
+  10,OptiX AI denoiser (color-only),done
+
+notes[3]{note}:
+  "All 10 planned MVP phases done as of the correctness+doctrine pass; see humans.md Status for full narrative/war-stories per phase."
+  "Deferred, not forgotten: mesh->3DGS fitting, full VCM/ReSTIR caustics, Metal backend — see the external design plan doc referenced in humans.md."
+  "This file is hand-maintained: update it when humans.md's ## Status section changes. Source of truth is humans.md prose; this is the compact index."

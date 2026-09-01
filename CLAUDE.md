@@ -64,3 +64,31 @@ Read before touching `src/`:
   and not before — there is nothing to abstract with one backend and one
   call site. Marked in `optix_renderer.h`.
 - Build: `cmake -B build -G Ninja && cmake --build build`.
+
+## Agent context docs (`docs/agent/`)
+
+Cold-start orientation without reading full prose:
+- `filemap.toon` — every `src/`/`tests/` file: path, one-line purpose (from
+  its header comment, where one exists), local `#include` edges.
+  Auto-regenerated on every build by the `agent_filemap` CMake target
+  (`scripts/gen_filemap.py`) — never hand-edit, never goes stale relative
+  to a built tree. Also flags any file outside `src/render/` and
+  `src/convert/sdf_baker.cpp` that includes `optix.h`/`cuda_runtime.h` (the
+  seam rule above) as a build-time error.
+- `status.toon` / `commands.toon` — compact phase-status table and
+  build/run/test/env-var command reference. Hand-maintained, not
+  generated (source is `humans.md` prose, not code) — update these when
+  `humans.md`'s Status/Build/Quick-start sections change.
+
+Considered clangd/LSP instead of the generated file map: more accurate, but
+needs a running server and an MCP/tool bridge this project has no access
+to, and pays indexing cost on every cold start. Not worth it at ~40 source
+files with one OptiX call-site to track — see the `claudia:` marker at the
+top of `scripts/gen_filemap.py` for the upgrade trigger.
+
+Format: [TOON](https://github.com/toon-format/spec) (`NAME[count]{fields}:`
+tabular header, comma rows) — checked against benchmarks before adopting:
+~40% fewer tokens than JSON on uniform tabular data like this, and its
+explicit field schema + row count catch truncation/drift a plain CSV
+wouldn't. `gen_filemap.py`'s writer follows the real spec's quoting rules
+(§7.1/§7.2), not an ad hoc guess.

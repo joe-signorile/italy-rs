@@ -57,9 +57,9 @@ enum MaterialType : unsigned int {
   // Diffuse BRDF, single custom-AABB primitive covering the whole SDF grid's
   // bounding box; __intersection__sdf sphere-traces through a trilinearly
   // sampled distance field, shading normal is the field's gradient — phase-5
-  // SDF-resampled meshes. Albedo is a single flat tint (the source mesh's
-  // baseColorFactor) — no per-surface-point color field is baked, unlike the
-  // voxel path; see sdf_baker.h for why.
+  // SDF-resampled meshes. Albedo is a per-cell nearest-lookup color (unified-
+  // SDF acceleration Phase 1 — see HitGroupData::sdfBaseColor's doc comment;
+  // was a single flat scene-wide tint before that phase).
   MATERIAL_SDF = 6,
   // Custom-AABB-per-splat primitive (one 3-sigma ellipsoid bound per splat,
   // see gsplat_bounds.h) — roadmap phase 3, imported 3D Gaussian Splatting
@@ -111,15 +111,23 @@ struct LightVertex {
   // Photon::power for clarity: it's the light-path analogue of RadiancePRD's
   // `attenuation`, not a physical power/flux value on its own).
   float3 throughput;
-  // claudia: Lambertian-diffuse-only for Step 1 — the BDPT connection eval
-  // in __closesthit__radiance treats every stored vertex as a pure Lambert
-  // BRDF (albedo/pi) regardless of what material it actually came from, so a
-  // MATERIAL_TEXTURED_DIFFUSE vertex's GGX specular lobe is silently dropped
-  // from the connection term (only its diffuse albedo is used, here and at
-  // storage time). Full glossy/dielectric light-side BSDF support is Step
-  // 3's job (see the VCM plan's sub-phase breakdown) — this field only ever
-  // needs to be a diffuse albedo until then.
-  float3 albedo;
+  // VCM Step 3: full material coverage. Was a single flat Lambertian
+  // `albedo` through Step 1/2 (see the removed claudia: marker this
+  // replaced) — the connection/merge eval in __closesthit__radiance now
+  // reconstructs a real ShadingMaterial from these three fields and calls
+  // evalBsdf() on the light side too, so a glossy MATERIAL_TEXTURED_DIFFUSE
+  // vertex's GGX lobe is no longer silently dropped from the connection
+  // term. MATERIAL_DIFFUSE (the fixed test scene's flat-albedo objects, no
+  // metallic/roughness data at all) deposits baseColorFactor=albedo,
+  // metallic=0, roughness=1 — degenerates to the same pure-Lambert
+  // evaluation Step 1/2 always gave it. Delta materials (mirror/glass/
+  // mirror-like-metallic) are still excluded from storage entirely — Step 3
+  // only changes what happens to materials already on the connectable side
+  // of kCausticMirrorMetallic/kCausticMirrorRoughness, not that boundary
+  // itself.
+  float3 baseColorFactor;
+  float metallic;
+  float roughness;
 };
 
 struct Params {
@@ -209,11 +217,13 @@ struct Params {
   // diffuse eye vertex and attempts a BDPT connection (traceOcclusion() +
   // BSDF*BSDF*geometry-term contribution) to each stored vertex.
   //
-  // Deliberately no acceleration structure over these vertices yet, and no
-  // `vertexMergeHandle`/dVCM-dVC-dVM accumulator fields — that's vertex
-  // *merging*, Step 2's job. Adding that machinery now, before it does
-  // anything, would leave a phantom half-finished weight term for no
-  // benefit; see the VCM plan's sub-phase breakdown.
+  // Still no dVCM/dVC/dVM accumulator fields — the full recursive Georgiev
+  // MIS weight stays out of scope, see the claudia: marker on mergeRadius
+  // below. There IS now an acceleration structure over these vertices
+  // (`vertexMergeHandle`, below): vertex *merging* needs a real spatial
+  // near-neighbor query, and this array alone can't answer "what's within
+  // mergeRadius of P" without an O(count) scan — see vertexMergeHandle's
+  // doc comment for why that scan was replaced with a GAS query.
   //
   // lightVertexCount == 0 means "no light subpaths this frame" (either the
   // scene has nothing connectable, or the caller zero-weighted it for an
@@ -232,6 +242,70 @@ struct Params {
   // being-appended-to, from its perspective already-finalized) counter
   // itself, so every eye thread agrees on the same bound.
   unsigned int lightVertexCount;
+
+  // Perf rework (see /home/joe/.claude/plans/looks-like-vcm-caustics-is-
+  // silly-hennessy.md, "sub-phase A"): a standalone GAS of uniform-radius
+  // spheres, one per this frame's stored LightVertex, rebuilt every frame
+  // by Impl::buildMergeGas() right after the light-subpath emission pass —
+  // mirrors the old phase-7 photon-gather pattern (see __anyhit__merge's
+  // doc comment) rather than the O(lightVertexCount) brute-force scan this
+  // replaced. 0 when there are no vertices this frame or mergeRadius isn't
+  // yet initialized — same "handle == 0 means no-op" convention
+  // params.handle's photon-era ancestor used, so __closesthit__radiance's
+  // merge query is skipped entirely rather than tracing into a null GAS.
+  OptixTraversableHandle vertexMergeHandle;
+  // Index into the main sbt's hitgroup-record table where the merge
+  // hit-group (packed against __anyhit__merge) lives — one record past the
+  // last scene object's, same "offset = objects.size()" scheme the deleted
+  // phase-7 gatherHitSbtOffset used. Meaningless when vertexMergeHandle==0.
+  unsigned int mergeHitSbtOffset;
+
+  // VCM Step 2: vertex merging.
+  //
+  // claudia: scoped down from the plan doc's full Georgiev et al. 2012
+  // recursive combined-MIS weight (dVCM/dVC/dVM pdf-history accumulators
+  // threaded through every bounce of both subpaths) to a radius-partition
+  // scheme: __closesthit__radiance's connection loop skips any stored
+  // vertex within mergeRadius of the eye hit point (covered by the
+  // vertexMergeHandle GAS query instead), which separately sums a classic
+  // photon-mapping-style density estimate — f(x,y)*throughput(y)/(pi*
+  // mergeRadius^2) — over vertices within that radius. This is provably
+  // non-double-counting (the two sums partition the vertex set, they never
+  // both count the same vertex) and, combined with the existing PPM
+  // radius-decay schedule (mergeRadius *= sqrt((pass+kPpmAlpha)/(pass+1))),
+  // converges to the same unbiased answer as pass count grows — the same
+  // progressive-photon-mapping consistency argument the deleted phase-7
+  // SPPM pass already relied on, just applied at every non-delta bounce
+  // instead of only the first. Reason for the scope-down: the full
+  // recursive MIS weight is real variance-reduction value on top of this,
+  // but getting its sign/reciprocal conventions right is a correctness-
+  // risk piece of work independent of the perf rework above — a wrong
+  // recursive weight would silently bias the renderer, which is worse than
+  // the (merely suboptimal-variance) estimator shipped here. Revisit for
+  // the full smooth MIS blend as a separate, deliberately-scoped change.
+  //
+  // No vmNormalization field needed under this scheme: each LightVertex's
+  // throughput already carries the 1/lightSubpathBatchSize emission-average
+  // factor (see emitFromQuadLight/emitFromEnvironment in pathtracer.cu), so
+  // the merge estimate only needs the disk-area division below — the same
+  // normalization the deleted phase-7 gather already used.
+  float mergeRadius;
+
+  // VCM Step 4: connection-count cap. The connection/merge loop in
+  // __closesthit__radiance is O(lightVertexCount) per diffuse eye hit — 0
+  // (default) means uncapped, unchanged from Steps 1-3. When nonzero and
+  // lightVertexCount exceeds it, the loop switches to drawing exactly this
+  // many uniformly-random vertex indices (with replacement) instead of
+  // iterating every stored vertex, and reweights the sum by
+  // lightVertexCount/maxConnectionsPerVertex — unbiased in expectation
+  // (the same "probability-weighted subset, reweighted by 1/p" idea Russian
+  // roulette and the stochastic-transmission mix elsewhere in this renderer
+  // already use), at the cost of extra variance versus the full sum.
+  // Defaulted to 0/uncapped rather than some chosen N: picking a good cap
+  // needs a frame-time benchmark against a live render, which the
+  // environment this was written in doesn't have — see optix_renderer.cpp's
+  // kLightSubpathBatchSize doc comment for the same caveat.
+  unsigned int maxConnectionsPerVertex;
 };
 
 // One glTF material, device side. Texture handles are 0 when absent.
@@ -324,6 +398,18 @@ struct HitGroupData {
   float3 sdfOrigin{};
   float sdfVoxelSize = 1.0f;
   int sdfNx = 0, sdfNy = 0, sdfNz = 0;
+  // Unified-SDF acceleration, Phase 1: per-cell material, same (z*ny+y)*nx+x
+  // dense addressing as sdfDistances — see SdfGrid::baseColor's doc comment
+  // (convert/sdf_grid.h) for how these are populated. Nearest-cell lookup at
+  // the shading point, not trilinear like the distance field itself — the
+  // distance field needs smooth interpolation for sphere-tracing to step
+  // correctly, but material doesn't need that continuity, and a filtered
+  // material lookup across cells with very different colors would blur
+  // texture-derived detail that isn't there to blur (unlike distances, which
+  // are smooth by construction).
+  float3 *sdfBaseColor = nullptr;
+  float *sdfMetallic = nullptr;
+  float *sdfRoughness = nullptr;
 
   // Only used when materialType == MATERIAL_GSPLAT, indexed by
   // optixGetPrimitiveIndex() — one custom AABB per splat feeds the BVH build
