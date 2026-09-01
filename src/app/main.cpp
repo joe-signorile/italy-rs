@@ -143,6 +143,13 @@ struct AppState {
   int exportSamples = 512;
   bool exportPending = false; // set by the UI, serviced by the viewport callback
 
+  // Start/stop toggle for progressive sampling. Continuous accumulation
+  // otherwise burns GPU (and shares the one GPU with s-rank's services, per
+  // CLAUDE.md) even while just looking at a converged frame. Orbiting while
+  // paused auto-resumes (see Viewport's draw callback) rather than leaving a
+  // stale, wrong-camera image on screen looking current.
+  bool isSampling = true;
+
   std::string statusLine = "Showing the built-in test scene.";
 };
 
@@ -434,20 +441,62 @@ int main(int argc, char **argv) {
         mouse.lastX = x;
         mouse.lastY = y;
 
-        const ImGuiIO &io = ImGui::GetIO();
-        if (!io.WantCaptureMouse) {
-          const bool leftDown = glfwGetMouseButton(self.window(), GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-          const bool middleDown = glfwGetMouseButton(self.window(), GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
-          if (leftDown) camera.orbit(dx, dy);
-          if (middleDown) camera.pan(dx, dy);
-          camera.zoom(io.MouseWheel);
-        }
+        // Orbit/pan/zoom used to be gated on !io.WantCaptureMouse, but the
+        // viewport image fills the whole ImGui window it's drawn in, so
+        // ImGui treats hovering it as mouse capture and that gate never
+        // opened — orbiting silently did nothing. Fixed below: the image is
+        // wrapped in an InvisibleButton and drag/scroll is driven off that
+        // item's own active/hovered state instead, which ImGui's own mouse
+        // capture doesn't block. Placed before render()/resetAccumulation()
+        // so a drag this frame is reflected in this frame's render, not
+        // delayed a frame.
 
-        if (cameraChanged(camera, prevCamera)) {
+        // Fit the render to the available viewport area rather than drawing
+        // it at native pixel size — otherwise it's clipped when the OS
+        // window is smaller than the render resolution and leaves dead
+        // space when larger. Display-only scale: renderer->width()/height()
+        // (the accumulator's actual resolution) are untouched, so this never
+        // triggers a rebuild or changes render cost.
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float srcAspect = static_cast<float>(renderer->width()) / static_cast<float>(renderer->height());
+        ImVec2 imageSize = avail;
+        if (avail.x / avail.y > srcAspect)
+          imageSize.x = avail.y * srcAspect;
+        else
+          imageSize.y = avail.x / srcAspect;
+        const ImVec2 origin = ImGui::GetCursorPos();
+        ImGui::SetCursorPos(ImVec2(origin.x + (avail.x - imageSize.x) * 0.5f, origin.y + (avail.y - imageSize.y) * 0.5f));
+        const ImVec2 imagePos = ImGui::GetCursorScreenPos();
+
+        // Reserve the layout space and read input state via an
+        // InvisibleButton *before* rendering the frame below, so a drag this
+        // frame is reflected in this frame's render rather than delayed a
+        // frame. The actual image is drawn afterward, on top of this same
+        // rect, once render() below has refreshed the texture — see "Drive
+        // orbit/pan/zoom" comment above.
+        ImGui::InvisibleButton("##viewport_image", imageSize);
+        if (ImGui::IsItemActive()) {
+          if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) camera.orbit(dx, dy);
+          if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) camera.pan(dx, dy);
+        }
+        if (ImGui::IsItemHovered())
+          camera.zoom(ImGui::GetIO().MouseWheel);
+
+        if (state.isSampling) {
+          if (cameraChanged(camera, prevCamera)) {
+            renderer->resetAccumulation();
+            prevCamera = camera;
+          }
+          renderer->render(camera, state.render);
+        } else if (cameraChanged(camera, prevCamera)) {
+          // Orbiting while paused resumes sampling from the new pose rather
+          // than leaving a stale, wrong-camera accumulation on screen looking
+          // current.
+          state.isSampling = true;
           renderer->resetAccumulation();
           prevCamera = camera;
+          renderer->render(camera, state.render);
         }
-        renderer->render(camera, state.render);
 
         // Render-to-PNG: hold the UI while accumulation catches up to the
         // requested sample count, then write through the same path the
@@ -474,9 +523,11 @@ int main(int argc, char **argv) {
             glfwSetWindowShouldClose(w->window(), GLFW_TRUE);
         }
 
-        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())),
-                     ImVec2(static_cast<float>(renderer->width()), static_cast<float>(renderer->height())),
-                     ImVec2(0, 1), ImVec2(1, 0));
+        // Draw on top of the InvisibleButton's rect, now that render() above
+        // has refreshed the texture for this frame.
+        ImGui::SetCursorScreenPos(imagePos);
+        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())), imageSize, ImVec2(0, 1),
+                     ImVec2(1, 0));
       }));
 
   windows.push_back(std::make_unique<italy::AppWindow>(
@@ -497,8 +548,10 @@ int main(int argc, char **argv) {
         apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
         ImGui::SameLine();
         apply |= ImGui::RadioButton("Gsplat", reinterpret_cast<int *>(&state.representation), 3);
-        if (state.representation == Representation::Voxel || state.representation == Representation::Sdf)
-          ImGui::SliderInt("Resolution", &state.resolution, kMinResolution, kMaxResolution);
+        if (state.representation == Representation::Voxel || state.representation == Representation::Sdf) {
+          if (ImGui::InputInt("Resolution", &state.resolution))
+            state.resolution = std::clamp(state.resolution, kMinResolution, kMaxResolution);
+        }
 
         if (state.representation == Representation::Gsplat)
           ImGui::InputText("Gsplat .ply path", state.gsplatPathBuf, sizeof(state.gsplatPathBuf));
@@ -523,9 +576,18 @@ int main(int argc, char **argv) {
         if (state.envChoice == EnvChoice::Custom)
           ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
         if (state.envChoice == EnvChoice::ProceduralSky) {
-          apply |= ImGui::SliderFloat("Turbidity", &state.skyTurbidity, 1.9f, 10.0f);
-          apply |= ImGui::SliderFloat("Sun elevation", &state.skySunElevationDeg, -10.0f, 90.0f);
-          apply |= ImGui::SliderFloat("Sun azimuth", &state.skySunAzimuthDeg, 0.0f, 360.0f);
+          if (ImGui::InputFloat("Turbidity", &state.skyTurbidity)) {
+            state.skyTurbidity = std::clamp(state.skyTurbidity, 1.9f, 10.0f);
+            apply = true;
+          }
+          if (ImGui::InputFloat("Sun elevation", &state.skySunElevationDeg)) {
+            state.skySunElevationDeg = std::clamp(state.skySunElevationDeg, -10.0f, 90.0f);
+            apply = true;
+          }
+          if (ImGui::InputFloat("Sun azimuth", &state.skySunAzimuthDeg)) {
+            state.skySunAzimuthDeg = std::clamp(state.skySunAzimuthDeg, 0.0f, 360.0f);
+            apply = true;
+          }
         }
 
         apply |= ImGui::Checkbox("Ground plane", &state.groundPlane);
@@ -540,34 +602,44 @@ int main(int argc, char **argv) {
           applyRequested = true;
 
         ImGui::Separator();
-        ImGui::SliderFloat("Exposure", &state.render.exposure, 0.1f, 8.0f);
+        if (ImGui::InputFloat("Exposure", &state.render.exposure))
+          state.render.exposure = std::clamp(state.render.exposure, 0.1f, 8.0f);
         int spl = static_cast<int>(state.render.samplesPerLaunch);
-        if (ImGui::SliderInt("Samples/launch", &spl, 1, 16))
-          state.render.samplesPerLaunch = static_cast<unsigned int>(spl);
+        if (ImGui::InputInt("Samples/launch", &spl))
+          state.render.samplesPerLaunch = static_cast<unsigned int>(std::clamp(spl, 1, 16));
         ImGui::Checkbox("Denoiser", &state.render.denoise);
 
         // Unlike exposure/tonemap/denoise above, everything from here down
         // changes what is written into the accumulator rather than how it is
         // displayed, so each one has to restart accumulation.
-        if (ImGui::SliderFloat("Firefly clamp", &state.render.fireflyClamp, 0.0f, 50.0f, "%.1f (0 = off)"))
+        if (ImGui::InputFloat("Firefly clamp (0 = off)", &state.render.fireflyClamp)) {
+          state.render.fireflyClamp = std::clamp(state.render.fireflyClamp, 0.0f, 50.0f);
           renderer->resetAccumulation();
+        }
 
         ImGui::Separator();
         ImGui::Text("Lens");
-        // Aperture is a world-space radius, so a fixed slider range would be
+        // Aperture is a world-space radius, so a fixed field range would be
         // meaningless across scenes that differ in scale by orders of
         // magnitude. Derive it from the scene the camera is actually framing.
         const float apertureMax = renderer->sceneBoundsRadius() * 0.25f;
-        if (ImGui::SliderFloat("Aperture", &state.render.aperture, 0.0f, apertureMax, "%.4f (0 = pinhole)"))
+        if (ImGui::InputFloat("Aperture (0 = pinhole)", &state.render.aperture, 0.0f, 0.0f, "%.4f")) {
+          state.render.aperture = std::clamp(state.render.aperture, 0.0f, apertureMax);
           renderer->resetAccumulation();
-        if (ImGui::SliderFloat("Focus distance", &state.render.focusDistance, 0.0f,
-                                renderer->sceneBoundsRadius() * 8.0f, "%.3f (0 = orbit target)"))
+        }
+        if (ImGui::InputFloat("Focus distance (0 = orbit target)", &state.render.focusDistance, 0.0f, 0.0f, "%.3f")) {
+          state.render.focusDistance = std::clamp(state.render.focusDistance, 0.0f, renderer->sceneBoundsRadius() * 8.0f);
           renderer->resetAccumulation();
+        }
 
         if (state.haveEnvironment) {
           ImGui::Separator();
-          if (ImGui::SliderAngle("Environment rotation", &state.render.envRotation, 0.0f, 360.0f))
+          float envRotationDeg = glm::degrees(state.render.envRotation);
+          if (ImGui::InputFloat("Environment rotation (deg)", &envRotationDeg)) {
+            envRotationDeg = std::clamp(envRotationDeg, 0.0f, 360.0f);
+            state.render.envRotation = glm::radians(envRotationDeg);
             renderer->resetAccumulation();
+          }
         }
 
         ImGui::Text("Tonemap");
@@ -593,7 +665,8 @@ int main(int argc, char **argv) {
           applyRequested = true; // same all-or-nothing rebuild as everything else
 
         ImGui::InputText("PNG path", state.exportPathBuf, sizeof(state.exportPathBuf));
-        ImGui::SliderInt("Export samples", &state.exportSamples, 16, 4096);
+        if (ImGui::InputInt("Export samples", &state.exportSamples))
+          state.exportSamples = std::clamp(state.exportSamples, 16, 4096);
         if (state.exportPending) {
           ImGui::Text("Rendering... subframe %u / %d", renderer->subframeIndex(), state.exportSamples);
           if (ImGui::Button("Cancel export"))
@@ -604,6 +677,10 @@ int main(int argc, char **argv) {
         }
 
         ImGui::Separator();
+        if (ImGui::Button(state.isSampling ? "Pause" : "Resume"))
+          state.isSampling = !state.isSampling;
+        ImGui::SameLine();
+        ImGui::Text(state.isSampling ? "Sampling" : "Paused");
         const glm::vec3 pos = camera.position();
         ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
         ImGui::Text("Subframe: %u", renderer->subframeIndex());

@@ -200,9 +200,18 @@ struct OptixRenderer::Impl {
   // vertex merging, Step 2's job) — a batch this size keeps that loop
   // tractable for interactive use while Step 1 is unweighted/unpruned; Step
   // 4 is where a real connection-count cap or subsampling scheme lands.
+  //
+  // claudia: quick tuning pass (caustics reported too dim vs. sdf-noon.png)
+  // — raised 512->2048 (capacity kept at the same ~16x-of-batch headroom
+  // ratio) to feed more light subpaths into Step 1's unmerged BDPT
+  // connections per frame, at a proportional per-frame cost. This does not
+  // address the actual gap (no vertex merging / Lambertian-only connections,
+  // Steps 2-3 of the VCM plan) — it only strengthens what Step 1 already
+  // computes. Revert or retune once Step 2 lands and this loop gets spatial
+  // culling.
   bool enableLightSubpaths = false;
-  static constexpr unsigned int kLightSubpathBatchSize = 512;
-  static constexpr unsigned int kLightVertexCapacity = 8192; // headroom over batchSize * the 12-bounce depth cap
+  static constexpr unsigned int kLightSubpathBatchSize = 2048;
+  static constexpr unsigned int kLightVertexCapacity = 32768; // headroom over batchSize * the 12-bounce depth cap
   OptixShaderBindingTable lightSubpathSbt{};
   CUdeviceptr lightVertexBuffer = 0;        // LightVertex[kLightVertexCapacity]
   CUdeviceptr lightVertexCounterBuffer = 0; // single atomic uint
