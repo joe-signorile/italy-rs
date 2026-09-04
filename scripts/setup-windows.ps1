@@ -1,22 +1,4 @@
 #Requires -Version 5.1
-<#
-.SYNOPSIS
-  Bootstraps build prerequisites for italy-rs on Windows and runs the first
-  build. Mirrors humans.md's "Prerequisites"/"Build" sections for Linux —
-  keep this in sync if either changes. Not yet verified on a real Windows
-  machine (this project has only ever been built on Linux so far) — if a
-  step below turns out wrong on real hardware, fix the step, not the intent.
-
-.DESCRIPTION
-  What this does NOT do: download the OptiX SDK. NVIDIA gates that installer
-  behind a free Developer Program login, so it can't be scripted — this
-  script checks for it and prints the manual steps if it's missing.
-
-  Installs via winget: NVIDIA CUDA Toolkit, CMake, Ninja, and VS Build Tools'
-  C++ workload (needed as nvcc's host compiler on Windows). Requires winget
-  (ships with modern Windows 10/11; if missing, get "App Installer" from the
-  Microsoft Store).
-#>
 $ErrorActionPreference = 'Stop'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -28,13 +10,11 @@ if (-not (Test-Cmd winget)) {
   Fail "winget not found — install 'App Installer' from the Microsoft Store, then re-run."
 }
 
-# --- NVIDIA driver -------------------------------------------------------
 if (-not (Test-Cmd nvidia-smi)) {
   Fail "nvidia-smi not found — install the NVIDIA driver first (this project is NVIDIA-only: CUDA + OptiX, no AMD/Vulkan)."
 }
 Write-Step "NVIDIA driver OK: $(& nvidia-smi -L | Select-Object -First 1)"
 
-# --- CMake + Ninja ---------------------------------------------------------
 if (-not (Test-Cmd cmake)) {
   Write-Step "installing CMake"
   winget install --id Kitware.CMake -e --silent --accept-package-agreements --accept-source-agreements
@@ -50,7 +30,6 @@ if (-not (Test-Cmd ninja)) {
   }
 }
 
-# --- CUDA Toolkit ----------------------------------------------------------
 if (-not (Test-Cmd nvcc)) {
   Write-Step "installing NVIDIA CUDA Toolkit (winget id: Nvidia.CUDA)"
   winget install --id Nvidia.CUDA -e --silent --accept-package-agreements --accept-source-agreements
@@ -60,9 +39,7 @@ if (-not (Test-Cmd nvcc)) {
 }
 Write-Step "CUDA Toolkit OK: $((& nvcc --version | Select-Object -Last 1))"
 
-# --- MSVC (nvcc's Windows host compiler) -----------------------------------
-# claudia: picks whatever `vswhere -latest` reports; doesn't handle
-# multiple side-by-side VS installs or ARM64 Windows.
+# claudia: picks whatever `vswhere -latest` reports; doesn't handle multiple side-by-side VS installs or ARM64 Windows.
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vcToolsId = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
 $vsInstallPath = $null
@@ -81,12 +58,9 @@ if (-not $vsInstallPath) {
 }
 Write-Step "MSVC toolset OK: $vsInstallPath"
 
-# Import the VS dev environment into *this* process so cl.exe/INCLUDE/LIB
-# are on PATH for nvcc and for CMake's own compiler checks.
 Import-Module (Join-Path $vsInstallPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
 Enter-VsDevShell -VsInstallPath $vsInstallPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64' | Out-Null
 
-# --- OptiX SDK: cannot be scripted, only checked ---------------------------
 function Test-OptixRoot($optixPath) {
   if (-not $optixPath) { return $false }
   return (Test-Path (Join-Path $optixPath "include\optix.h")) -and
@@ -94,7 +68,6 @@ function Test-OptixRoot($optixPath) {
 }
 
 if (-not (Test-OptixRoot $env:OPTIX_ROOT)) {
-  # Default installer location; only auto-adopt it if exactly one is found.
   $candidates = @(Get-ChildItem "$env:ProgramData\NVIDIA Corporation" -Directory -Filter "OptiX SDK*" -ErrorAction SilentlyContinue)
   if ($candidates.Count -eq 1) {
     $env:OPTIX_ROOT = $candidates[0].FullName
@@ -117,7 +90,6 @@ this step is manual:
 }
 Write-Step "OptiX SDK OK: $env:OPTIX_ROOT"
 
-# --- Build -------------------------------------------------------------
 Write-Step "configuring"
 cmake -B build -G Ninja
 Write-Step "building"

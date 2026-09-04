@@ -1,8 +1,6 @@
-// Tiny throw-on-error wrappers for OptiX/CUDA calls. NVIDIA's own SDK ships
-// an equivalent (SDK/sutil/Exception.h) but it pulls in glad for its GL_CHECK
-// macro; we don't use glad (see gl_ext.h), and we only need the OptiX/CUDA
-// half, so this is a smaller self-contained copy of just that half.
 #pragma once
+
+// Tiny throw-on-error wrappers for OptiX/CUDA calls: a smaller self-contained copy of NVIDIA sutil/Exception.h's OptiX/CUDA half, without the glad dependency.
 
 #include <cuda_runtime_api.h>
 #include <optix.h>

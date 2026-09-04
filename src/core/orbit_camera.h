@@ -7,24 +7,14 @@
 
 namespace italy {
 
-// Maya/Blender-style orbit camera: yaw/pitch around a target point, with
-// distance for zoom. Kept dependency-free of any windowing library — callers
-// feed it raw drag/scroll deltas.
 class OrbitCamera {
 public:
   void orbit(float dxPixels, float dyPixels);
   void pan(float dxPixels, float dyPixels);
   void zoom(float scrollDelta);
 
-  // Point the camera at a loaded asset's bounding sphere — used right after
-  // loading a GLB, since its scale/position are arbitrary. Keeps the current
-  // yaw/pitch so re-framing doesn't spin the view around.
   void frame(const glm::vec3 &center, float boundingRadius) {
     target_ = center;
-    // 1.15, not 1.4. boundingRadius is the AABB half-diagonal, i.e. already
-    // the *circumscribed* sphere — for anything not roughly cubic (a bike, a
-    // bottle) that sphere is much larger than the object, so a further 40%
-    // margin on top left the subject small in frame.
     distance_ = std::max(boundingRadius / std::tan(fovYRadians * 0.5f) * 1.15f, kMinDistance);
   }
 

@@ -7,6 +7,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(OpenGL REQUIRED)
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_target(agent_filemap ALL
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen_filemap.py
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Regenerating docs/agent/filemap.toon"
+  VERBATIM
+)
+
 include(FetchContent)
 
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -45,9 +53,6 @@ set(TINYGLTF_HEADER_ONLY ON CACHE BOOL "" FORCE)
 set(TINYGLTF_INSTALL OFF CACHE BOOL "" FORCE)
 set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(tinygltf)
-# tinygltf's own CMakeLists (TINYGLTF_HEADER_ONLY) already defines the
-# `tinygltf` INTERFACE target, bundling its own stb_image/json.hpp copies —
-# nothing more to declare here.
 
 add_library(imgui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
@@ -73,12 +78,6 @@ endif()
 
 set(ITALY_CUDA_ARCH "89" CACHE STRING "Target GPU compute capability for the OptiX device kernel (89 = Ada/RTX 40-series)")
 
-# OptiX device programs are consumed at runtime by optixModuleCreate as
-# OptiX-IR text, not linked like normal objects — a direct nvcc invocation is
-# simpler than fighting CMake's native CUDA_ARCHITECTURES object pipeline for
-# these files. The result is read from disk at startup (see
-# render_config.h.in) rather than embedded via bin2c: this is a dev tool with
-# a fixed, known build-tree layout, so that's a fine simplification for now.
 function(italy_compile_optixir cu_file out_var)
   get_filename_component(name ${cu_file} NAME_WE)
   set(output "${CMAKE_BINARY_DIR}/optix_programs/${name}.optixir")
@@ -119,10 +118,13 @@ add_executable(italy-rs
   src/core/orbit_camera.cpp
   src/render/optix_renderer.cpp
   src/io/gltf_loader.cpp
+  src/io/mesh_weld.cpp
   src/io/mesh_validate.cpp
+  src/io/mesh_primitive_classify.cpp
   src/io/gsplat_ply_loader.cpp
   src/convert/voxelize.cpp
   src/convert/sdf_baker.cpp
+  src/convert/sdf_procedural.cpp
   src/render/environment.cpp
   src/render/procedural_sky.cpp
 )
@@ -130,57 +132,40 @@ add_dependencies(italy-rs italy_optixir_pathtracer italy_optixir_sdf_bake)
 target_include_directories(italy-rs PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
 target_link_libraries(italy-rs PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
 
-# Agent-facing file map (docs/agent/filemap.toon) — regenerated every
-# build so it can't go stale; the script is a cheap regex pass over ~40
-# small files, not worth a fine-grained DEPENDS glob at this repo's size.
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-add_custom_target(agent_filemap ALL
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/gen_filemap.py
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  COMMENT "Regenerating docs/agent/filemap.toon"
-  VERBATIM
-)
-
 enable_testing()
 add_executable(voxelize_test tests/voxelize_test.cpp src/convert/voxelize.cpp)
 target_include_directories(voxelize_test PRIVATE src)
 target_link_libraries(voxelize_test PRIVATE glm::glm)
 add_test(NAME voxelize_test COMMAND voxelize_test)
 
-# Host-side only (no GPU/OptiX needed): tests the importance-sampling CDF
-# build split out of environment.cpp's loadEnvironmentMap.
 add_executable(environment_cdf_test tests/environment_cdf_test.cpp tests/stb_image_impl.cpp src/render/environment.cpp)
 target_include_directories(environment_cdf_test PRIVATE src)
 target_link_libraries(environment_cdf_test PRIVATE stb)
 add_test(NAME environment_cdf_test COMMAND environment_cdf_test)
 
-# Needs a real GPU/OptiX SDK at run time, same as italy-rs itself — exercises
-# the actual bake pipeline in sdf_baker.cpp against a primitive with a known
-# analytic SDF (see tests/sdf_sign_test.cpp).
 add_executable(sdf_sign_test tests/sdf_sign_test.cpp src/convert/sdf_baker.cpp)
 add_dependencies(sdf_sign_test italy_optixir_sdf_bake)
 target_include_directories(sdf_sign_test PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
 target_link_libraries(sdf_sign_test PRIVATE glm::glm CUDA::cudart)
 add_test(NAME sdf_sign_test COMMAND sdf_sign_test)
 
-# Host-side only (no GPU/OptiX needed): tests the watertightness gate added
-# for the transmissive-material work (see tests/mesh_validate_test.cpp).
-add_executable(mesh_validate_test tests/mesh_validate_test.cpp src/io/mesh_validate.cpp)
+add_executable(mesh_validate_test tests/mesh_validate_test.cpp src/io/mesh_validate.cpp src/io/mesh_weld.cpp)
 target_include_directories(mesh_validate_test PRIVATE src)
 target_link_libraries(mesh_validate_test PRIVATE glm::glm)
 add_test(NAME mesh_validate_test COMMAND mesh_validate_test)
 
-# Host-side only (no GPU/OptiX needed): tests the Preetham procedural sky
-# generator added for the sky-model roadmap phase (see procedural_sky.cpp).
+add_executable(mesh_primitive_classify_test tests/mesh_primitive_classify_test.cpp
+                                             src/io/mesh_primitive_classify.cpp src/io/mesh_weld.cpp)
+target_include_directories(mesh_primitive_classify_test PRIVATE src)
+target_link_libraries(mesh_primitive_classify_test PRIVATE glm::glm)
+add_test(NAME mesh_primitive_classify_test COMMAND mesh_primitive_classify_test)
+
 add_executable(procedural_sky_test tests/procedural_sky_test.cpp tests/stb_image_impl.cpp
                                     src/render/procedural_sky.cpp src/render/environment.cpp)
 target_include_directories(procedural_sky_test PRIVATE src)
 target_link_libraries(procedural_sky_test PRIVATE glm::glm stb)
 add_test(NAME procedural_sky_test COMMAND procedural_sky_test)
 
-# Host-side only (no GPU/OptiX needed): tests the gsplat .ply loader and its
-# AABB helper, added for the Gaussian-splat-import roadmap phase (see
-# io/gsplat_ply_loader.cpp and convert/gsplat_bounds.h).
 add_executable(gsplat_ply_loader_test tests/gsplat_ply_loader_test.cpp src/io/gsplat_ply_loader.cpp)
 target_include_directories(gsplat_ply_loader_test PRIVATE src)
 target_link_libraries(gsplat_ply_loader_test PRIVATE glm::glm)

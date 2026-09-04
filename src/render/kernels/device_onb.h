@@ -1,7 +1,4 @@
-// Shared by pathtracer.cu (cosine-hemisphere sampling around a shading
-// normal) and sdf_bake.cu (jittering sample directions around a base
-// direction) — same orthonormal-basis-around-a-vector construction either
-// way, no reason to duplicate it in both device files.
+// Orthonormal-basis-around-a-vector construction shared by pathtracer.cu (cosine-hemisphere sampling) and sdf_bake.cu (sample-direction jittering).
 #pragma once
 
 #include <sutil/vec_math.h>
@@ -22,10 +19,6 @@ struct Onb {
     return p.x * m_tangent + p.y * m_binormal + p.z * m_normal;
   }
 
-  // Inverse of toWorld. The basis is orthonormal, so the inverse is the
-  // transpose — three dot products, no matrix inversion. Needed by GGX
-  // visible-normal sampling, which is defined in a local frame with the
-  // shading normal along +Z.
   __forceinline__ __device__ float3 toLocal(const float3 &v) const {
     return make_float3(dot(v, m_tangent), dot(v, m_binormal), dot(v, m_normal));
   }

@@ -1,13 +1,10 @@
-// Phase 9: live ImGui controls — load a GLB, switch mesh/voxel/SDF
-// representation, pick an HDRI preset, tune exposure/samples-per-launch —
-// on top of the phase 2 window/camera/viewport shell. CLI args (still
-// supported, mainly for scripted verification/ITALY_DUMP_FRAME use) seed
-// the same state the UI edits, then both go through one shared rebuild
-// path so they can't drift out of sync with each other.
-
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <functional>
 #include <memory>
 #include <algorithm>
 #include <string>
@@ -21,10 +18,12 @@
 
 #include "app/app_window.h"
 #include "convert/sdf_baker.h"
+#include "convert/sdf_procedural.h"
 #include "convert/voxelize.h"
 #include "core/orbit_camera.h"
 #include "io/gltf_loader.h"
 #include "io/gsplat_ply_loader.h"
+#include "io/mesh_primitive_classify.h"
 #include "io/mesh_validate.h"
 #include "render/environment.h"
 #include "render/optix_renderer.h"
@@ -32,8 +31,6 @@
 
 namespace {
 
-// Polled once per frame rather than via GLFW callbacks — simpler than wiring
-// a user-pointer + callback for what's just "delta since last frame".
 struct MouseState {
   double lastX = 0.0;
   double lastY = 0.0;
@@ -45,9 +42,33 @@ bool cameraChanged(const italy::OrbitCamera &a, const italy::OrbitCamera &b) {
   return glm::dot(da, da) > 1e-10f || glm::dot(dt, dt) > 1e-10f;
 }
 
-// Reads the renderer's GL texture back and writes it as a PNG. Shared by the
-// scripted ITALY_DUMP_FRAME hook and the UI's Render-to-PNG button, so the
-// image you export by hand is byte-identical to the one a script captures.
+bool hasExtension(const char *path, const char *ext) {
+  const size_t n = std::strlen(path), m = std::strlen(ext);
+  if (n < m)
+    return false;
+  for (size_t i = 0; i < m; ++i)
+    if (std::tolower(static_cast<unsigned char>(path[n - m + i])) != ext[i])
+      return false;
+  return true;
+}
+
+bool writeFrameHdr(const italy::OptixRenderer &renderer, const char *path) {
+  const int w = renderer.width();
+  const int h = renderer.height();
+  std::vector<float> rgb;
+  if (!renderer.readAccumulationRgb(rgb)) {
+    std::fprintf(stderr, "italy: FAILED to write %dx%d frame to %s (nothing accumulated yet)\n", w, h, path);
+    return false;
+  }
+  std::vector<float> flipped(rgb.size());
+  for (int row = 0; row < h; ++row)
+    std::memcpy(&flipped[static_cast<size_t>(row) * w * 3], &rgb[static_cast<size_t>(h - 1 - row) * w * 3],
+                static_cast<size_t>(w) * 3 * sizeof(float));
+  const bool ok = stbi_write_hdr(path, w, h, 3, flipped.data()) != 0;
+  std::fprintf(stderr, "italy: %s %dx%d linear frame to %s\n", ok ? "wrote" : "FAILED to write", w, h, path);
+  return ok;
+}
+
 bool writeFramePng(const italy::OptixRenderer &renderer, const char *path) {
   const int w = renderer.width();
   const int h = renderer.height();
@@ -55,8 +76,6 @@ bool writeFramePng(const italy::OptixRenderer &renderer, const char *path) {
   glBindTexture(GL_TEXTURE_2D, renderer.glTextureId());
   glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
   glBindTexture(GL_TEXTURE_2D, 0);
-  // Texture was uploaded with V flipped for ImGui (uv0=(0,1),uv1=(1,0)); flip
-  // rows back here so the PNG reads right-side-up.
   std::vector<unsigned char> flipped(pixels.size());
   for (int row = 0; row < h; ++row)
     std::memcpy(&flipped[static_cast<size_t>(row) * w * 4], &pixels[static_cast<size_t>(h - 1 - row) * w * 4],
@@ -66,45 +85,37 @@ bool writeFramePng(const italy::OptixRenderer &renderer, const char *path) {
   return ok;
 }
 
-// Debug/verification aid: set ITALY_DUMP_FRAME=path.png to write out the
-// accumulated render and exit — lets a render-correctness check happen
-// without eyeballing a live window.
+bool writeFrame(const italy::OptixRenderer &renderer, const char *path) {
+  return hasExtension(path, ".hdr") ? writeFrameHdr(renderer, path) : writeFramePng(renderer, path);
+}
+
 void dumpFrameIfRequested(const italy::OptixRenderer &renderer, GLFWwindow *window) {
   const char *path = std::getenv("ITALY_DUMP_FRAME");
   if (!path)
     return;
-  writeFramePng(renderer, path);
+  writeFrame(renderer, path);
   glfwSetWindowShouldClose(window, GLFW_TRUE);
 }
 
-// Explicit `int` underlying type: ImGui::RadioButton takes an `int*`, and
-// the UI loop below reinterpret_casts &state.representation/&state.envChoice
-// to one — relying on the (already-guaranteed-by-the-standard-for-scoped-
-// enums-with-no-explicit-type) size/alignment match to work is the kind of
-// thing worth spelling out rather than leaving implicit.
-// Shared by the UI slider and the CLI parser so the two can't disagree about
-// what a legal resampling resolution is.
-constexpr int kMinResolution = 8;
-constexpr int kMaxResolution = 512;
+constexpr int kMinResolution = 1;
 
-// Gsplat is a distinct load source, not a resampling of the loaded GLB mesh
-// like Voxel/Sdf are — see rebuildScene()'s dispatch.
 enum class Representation : int { Mesh, Voxel, Sdf, Gsplat };
 enum class EnvChoice : int { None, Overcast, Midnight, Noon, Custom, ProceduralSky };
 
-// Everything the UI edits, plus the loaded/resampled assets those edits
-// produce. Assets are kept here (not as OptixRenderer members) because
-// SceneSource only borrows pointers into them for the duration of the
-// OptixRenderer constructor call — this struct is what actually owns them,
-// and must outlive whatever SceneSource is built from it.
 struct AppState {
   italy::MeshAsset meshAsset;
   bool haveMesh = false;
   italy::VoxelGrid voxelGrid;
   italy::SdfGrid sdfGrid;
-  // Roadmap phase 3: an imported Gaussian-splat scene — a distinct load
-  // source, not a resampling of meshAsset, so it gets its own path/asset/
-  // flag rather than reusing glbPathBuf/meshAsset/haveMesh.
+  italy::SdfGrid cupGrid;
+  bool wantCup = false;
+  static constexpr int kCupResolution = 96;
+  italy::SdfGrid glassCupGrid;
+  bool wantGlassCup = false;
+  static constexpr int kGlassCupResolution = 320;
+  std::vector<italy::SdfGrid> materialProbeGrids;
+  bool wantMaterialProbe = false;
+  static constexpr int kMaterialProbeResolution = 48;
   italy::GsplatAsset splatAsset;
   bool haveSplats = false;
   char gsplatPathBuf[512] = "";
@@ -113,66 +124,74 @@ struct AppState {
 
   char glbPathBuf[512] = "";
   Representation representation = Representation::Mesh;
-  // 128, not 64. The SDF grid is sized from the mesh's actual extents rather
-  // than resolution^3, so raising this is close to free (measured on a 1.9M
-  // triangle asset: 6.5s at 64 vs 6.8s at 160) while 64 leaves any structure
-  // thinner than a cell — spokes, cables, thin brackets — to break up into
-  // floating fragments. Voxel occupancy is sparse, so it scales gently too.
   int resolution = 128;
   EnvChoice envChoice = EnvChoice::None;
+  bool envChoiceExplicit = false;
   char hdriPathBuf[512] = "";
   bool groundPlane = true;
 
-  // Procedural sky (Preetham/Perez) params — only shown/used when envChoice
-  // == ProceduralSky. Defaults are an ordinary clear midday sky.
   float skyTurbidity = 3.0f;
   float skySunElevationDeg = 45.0f;
   float skySunAzimuthDeg = 0.0f;
-  static constexpr int kSkyResolution = 1024; // matches the bundled HDRI presets' rough scale
+  static constexpr int kSkyResolution = 1024;
+
+  bool sunEnabled = false;
+  float sunAngularRadiusDeg = 2.0f;
+  glm::vec3 sunColor{1.0f, 0.95f, 0.85f};
+  float sunIntensity = 10000.0f;
+  glm::vec3 backgroundColor{0.05f, 0.06f, 0.08f};
 
   italy::RenderSettings render;
 
-  // Render resolution. Changing it goes through the same all-or-nothing
-  // rebuildScene() as everything else, because OptixRenderer owns the
-  // accumulator, PBO, GL texture and denoiser and sizes all four at
-  // construction — one rebuild path beats a second, parallel resize path.
   int renderWidth = 960;
   int renderHeight = 540;
 
   char exportPathBuf[512] = "render.png";
   int exportSamples = 512;
-  bool exportPending = false; // set by the UI, serviced by the viewport callback
+  bool exportPending = false;
 
-  // Start/stop toggle for progressive sampling. Continuous accumulation
-  // otherwise burns GPU (and shares the one GPU with s-rank's services, per
-  // CLAUDE.md) even while just looking at a converged frame. Orbiting while
-  // paused auto-resumes (see Viewport's draw callback) rather than leaving a
-  // stale, wrong-camera image on screen looking current.
   bool isSampling = true;
 
   std::string statusLine = "Showing the built-in test scene.";
 };
 
-// Re-loads/re-resamples everything from the current UI state and rebuilds
-// the renderer from scratch. Deliberately one all-or-nothing "apply" step
-// rather than incrementally patching the live scene — OptixRenderer has no
-// partial-rebuild API (see its header), and voxelizing/SDF-baking large
-// meshes isn't cheap enough to redo on every slider tick anyway, so a single
-// explicit rebuild point keeps the cost visible and predictable. Shared by
-// startup (seeded from CLI args) and the UI's "Apply" button so the two
-// entry points can't drift out of sync with each other.
-void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer, italy::OrbitCamera &camera) {
+struct ProjectBakeState {
+  enum class Step { Load, Classify, Representation, Environment, ConstructRenderer };
+  bool active = false;
+  Step step = Step::Load;
+  bool rawMeshLoaded = false;
+  int selected = 0;
+  std::vector<std::string> log;
+};
+
+void syncSunRenderSettings(AppState &state) {
+  const float elevRad = glm::radians(state.skySunElevationDeg);
+  const float azRad = glm::radians(state.skySunAzimuthDeg);
+  state.render.sunDirection = glm::normalize(glm::vec3(std::cos(elevRad) * std::cos(azRad), std::sin(elevRad),
+                                                         std::cos(elevRad) * std::sin(azRad)));
+  state.render.sunAngularRadiusDeg = state.sunAngularRadiusDeg;
+  state.render.sunRadiance = state.sunColor * state.sunIntensity;
+  state.render.sunEnabled = state.sunEnabled;
+  state.render.backgroundColor = state.backgroundColor;
+}
+
+void logBakeLine(ProjectBakeState &bake, const std::string &message) {
+  const std::time_t now = std::time(nullptr);
+  char stamp[16];
+  std::strftime(stamp, sizeof(stamp), "%H:%M:%S", std::localtime(&now));
+  bake.log.push_back(std::string("[") + stamp + "] " + message);
+  std::fprintf(stderr, "italy: %s\n", message.c_str());
+}
+
+void bakeStepLoad(AppState &state, ProjectBakeState &bake) {
   state.haveMesh = false;
   state.haveSplats = false;
+  bake.rawMeshLoaded = false;
   if (state.representation == Representation::Gsplat) {
-    // A distinct load source, not a resampling of a loaded GLB — see
-    // AppState::splatAsset's doc comment. No watertightness gate: that check
-    // is mesh-specific (2-manifold edges) and doesn't apply to a point set.
     if (state.gsplatPathBuf[0] != '\0') {
       std::string err;
       if (!italy::loadGsplatPly(state.gsplatPathBuf, state.splatAsset, err)) {
         state.statusLine = "Failed to load " + std::string(state.gsplatPathBuf) + ": " + err;
-        std::fprintf(stderr, "italy: %s\n", state.statusLine.c_str());
       } else {
         state.haveSplats = true;
         state.statusLine =
@@ -185,38 +204,62 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
     std::string err;
     if (!italy::loadGlb(state.glbPathBuf, state.meshAsset, err)) {
       state.statusLine = "Failed to load " + std::string(state.glbPathBuf) + ": " + err;
-      std::fprintf(stderr, "italy: %s\n", state.statusLine.c_str());
+    } else {
+      bake.rawMeshLoaded = true;
+      state.statusLine = "Loaded raw " + std::string(state.glbPathBuf) + ", classifying...";
+    }
+  } else if (!state.wantMaterialProbe && !state.wantGlassCup && !state.wantCup) {
+    state.statusLine = "Showing the built-in test scene.";
+  }
+  logBakeLine(bake, "Load: " + state.statusLine);
+}
+
+void bakeStepClassify(AppState &state, ProjectBakeState &bake) {
+  if (bake.rawMeshLoaded) {
+    std::string primDetail;
+    std::string err;
+    if (italy::classifyPrimitive(state.meshAsset, primDetail) == italy::PrimitiveKind::None) {
+      state.statusLine = "Rejected " + std::string(state.glbPathBuf) + ": not a primitive shape (" + primDetail +
+                         "). GLB import is limited to box/sphere/cylinder prims — use procedural SDF / gsplat "
+                         "for other content.";
     } else if (!italy::isWatertight(state.meshAsset, err)) {
-      // Rejected, not just warned: SDF baking's sign vote and (once loaded
-      // meshes can carry a transmissive material) refraction both depend on
-      // a well-defined inside/outside, which only a closed mesh guarantees.
       state.statusLine = "Rejected " + std::string(state.glbPathBuf) + ": " + err;
-      std::fprintf(stderr, "italy: %s\n", state.statusLine.c_str());
     } else {
       state.haveMesh = true;
       state.statusLine = "Loaded " + std::string(state.glbPathBuf) + " (" +
                           std::to_string(state.meshAsset.triangleCount()) + " tris, " +
                           std::to_string(state.meshAsset.materials.size()) + " materials, " +
-                          std::to_string(state.meshAsset.textures.size()) + " textures)";
+                          std::to_string(state.meshAsset.textures.size()) + " textures) — " + primDetail;
     }
+    logBakeLine(bake, "Classify/validate: " + state.statusLine);
   } else {
-    state.statusLine = "Showing the built-in test scene.";
+    logBakeLine(bake, "Classify/validate: nothing to classify.");
   }
+}
 
-  bool haveVoxels = false, haveSdf = false;
+void bakeStepRepresentation(AppState &state, ProjectBakeState &bake) {
   if (state.haveMesh) {
     if (state.representation == Representation::Voxel) {
       state.voxelGrid = italy::voxelizeMesh(state.meshAsset, state.resolution);
-      haveVoxels = true;
       state.statusLine += " -> voxelized (" + std::to_string(state.voxelGrid.cells.size()) + " cells)";
     } else if (state.representation == Representation::Sdf) {
       state.sdfGrid = italy::bakeSdf(state.meshAsset, state.resolution);
-      haveSdf = true;
       state.statusLine += " -> SDF (" + std::to_string(state.sdfGrid.nx) + "x" + std::to_string(state.sdfGrid.ny) +
                            "x" + std::to_string(state.sdfGrid.nz) + ")";
     }
+  } else if (state.wantGlassCup) {
+    state.glassCupGrid = italy::makeGlassCupSdf(AppState::kGlassCupResolution, -1.0f, glm::vec2(0.0f));
+    state.statusLine += " -> baked glass cup SDF (" + std::to_string(state.glassCupGrid.nx) + "x" +
+                         std::to_string(state.glassCupGrid.ny) + "x" + std::to_string(state.glassCupGrid.nz) + ")";
+  } else if (state.wantMaterialProbe) {
+    state.materialProbeGrids = italy::makeMaterialProbeSdfs(AppState::kMaterialProbeResolution);
+    state.statusLine += " -> baked " + std::to_string(state.materialProbeGrids.size()) + " material probe grids at " +
+                         std::to_string(AppState::kMaterialProbeResolution) + "^3";
   }
+  logBakeLine(bake, "Bake representation: " + state.statusLine);
+}
 
+void bakeStepEnvironment(AppState &state, ProjectBakeState &bake) {
   state.haveEnvironment = false;
   std::string hdriPath;
   switch (state.envChoice) {
@@ -242,37 +285,165 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
       state.haveEnvironment = true;
     } else {
       state.statusLine += " | environment failed: " + err;
-      std::fprintf(stderr, "italy: failed to load environment %s: %s\n", hdriPath.c_str(), err.c_str());
     }
   } else if (state.envChoice == EnvChoice::ProceduralSky) {
-    // Populates state.environment directly (no file path involved) — feeds
-    // the exact same SceneSource::environment field a loaded HDRI would.
     std::string err;
     if (italy::buildProceduralSky(AppState::kSkyResolution, AppState::kSkyResolution / 2, state.skySunElevationDeg,
-                                   state.skySunAzimuthDeg, state.skyTurbidity, state.environment, err)) {
+                                   state.skySunAzimuthDeg, state.skyTurbidity, state.environment, err,
+                                   !state.sunEnabled)) {
       state.haveEnvironment = true;
     } else {
       state.statusLine += " | procedural sky failed: " + err;
-      std::fprintf(stderr, "italy: procedural sky failed: %s\n", err.c_str());
     }
   }
+  logBakeLine(bake, std::string("Build environment: ") + (state.haveEnvironment ? "ready" : "none") +
+                         (state.envChoice == EnvChoice::None ? "" : (" (" + state.statusLine + ")")));
+}
 
+void bakeStepConstructRenderer(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer,
+                                italy::OrbitCamera &camera, ProjectBakeState &bake, bool reframeCamera = true) {
   italy::SceneSource source;
+  const bool haveSdfRepr = state.haveMesh && state.representation == Representation::Sdf;
+  const bool haveVoxelRepr = state.haveMesh && state.representation == Representation::Voxel;
   if (state.haveSplats)
     source.splats = &state.splatAsset;
-  else if (haveSdf)
+  else if (haveSdfRepr)
     source.sdf = &state.sdfGrid;
-  else if (haveVoxels)
+  else if (haveVoxelRepr)
     source.voxels = &state.voxelGrid;
   else if (state.haveMesh)
     source.mesh = &state.meshAsset;
+  else if (state.wantGlassCup)
+    source.sdf = &state.glassCupGrid;
   if (state.haveEnvironment)
     source.environment = &state.environment;
   source.groundPlane = state.groundPlane;
+  if (state.wantCup) {
+    state.cupGrid = italy::makeCupSdf(AppState::kCupResolution, -1.0f, glm::vec2(-1.6f, 1.6f));
+    source.extraSdf = {&state.cupGrid};
+  } else if (state.wantMaterialProbe) {
+    source.extraSdf.reserve(state.materialProbeGrids.size());
+    for (const italy::SdfGrid &grid : state.materialProbeGrids)
+      source.extraSdf.push_back(&grid);
+    source.emptyBase = true;
+  }
+  if (state.wantGlassCup) {
+    constexpr float kGlassCupOuterRadius = 0.55f;
+    source.groundOffset = 0.2f * kGlassCupOuterRadius;
+  }
+
+  syncSunRenderSettings(state);
 
   renderer = std::make_unique<italy::OptixRenderer>(state.renderWidth, state.renderHeight, source);
-  if (state.haveMesh || state.haveSplats)
+
+  const bool sceneHasSdf = source.sdf != nullptr || !source.extraSdf.empty();
+  if (reframeCamera && (state.haveMesh || state.haveSplats || sceneHasSdf))
     camera.frame(renderer->sceneBoundsCenter(), renderer->sceneBoundsRadius());
+
+  logBakeLine(bake, "Constructed renderer at " + std::to_string(state.renderWidth) + "x" +
+                         std::to_string(state.renderHeight) + ". Handing off to viewport.");
+}
+
+void rebuildEnvironmentLive(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer,
+                             italy::OrbitCamera &camera) {
+  ProjectBakeState localBake;
+  bakeStepEnvironment(state, localBake);
+  bakeStepConstructRenderer(state, renderer, camera, localBake, /*reframeCamera=*/false);
+}
+
+void advanceBake(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer, italy::OrbitCamera &camera,
+                  ProjectBakeState &bake, bool &wantProject, bool &wantViewport, bool &wantSettings) {
+  switch (bake.step) {
+  case ProjectBakeState::Step::Load:
+    bakeStepLoad(state, bake);
+    bake.step = ProjectBakeState::Step::Classify;
+    break;
+  case ProjectBakeState::Step::Classify:
+    bakeStepClassify(state, bake);
+    bake.step = ProjectBakeState::Step::Representation;
+    break;
+  case ProjectBakeState::Step::Representation:
+    bakeStepRepresentation(state, bake);
+    bake.step = ProjectBakeState::Step::Environment;
+    break;
+  case ProjectBakeState::Step::Environment:
+    bakeStepEnvironment(state, bake);
+    bake.step = ProjectBakeState::Step::ConstructRenderer;
+    break;
+  case ProjectBakeState::Step::ConstructRenderer:
+    bakeStepConstructRenderer(state, renderer, camera, bake);
+    bake.active = false;
+    bake.step = ProjectBakeState::Step::Load;
+    wantProject = false;
+    wantViewport = true;
+    wantSettings = true;
+    break;
+  }
+}
+
+struct SceneDescriptor {
+  const char *name;
+  const char *description;
+  std::function<void(AppState &)> configure;
+};
+
+std::vector<SceneDescriptor> makeSceneRegistry() {
+  return {
+      {"Bring-up scene",
+       "The existing fixed test geometry with mesh/voxel/SDF/gsplat representation controls — loads instantly, "
+       "known-good transport baseline.",
+       [](AppState &state) {
+         state.glbPathBuf[0] = '\0';
+         state.gsplatPathBuf[0] = '\0';
+         state.representation = Representation::Mesh;
+         state.wantCup = false;
+         state.wantGlassCup = false;
+         state.wantMaterialProbe = false;
+         state.envChoice = EnvChoice::None;
+         state.statusLine = "Showing the built-in test scene.";
+       }},
+      {"Material probe",
+       "Row of spheres sweeping roughness and IOR under the sun disk — dials in tonemap/exposure by eye.",
+       [](AppState &state) {
+         state.glbPathBuf[0] = '\0';
+         state.representation = Representation::Mesh;
+         state.wantCup = false;
+         state.wantGlassCup = false;
+         state.wantMaterialProbe = true;
+         state.envChoice = EnvChoice::ProceduralSky;
+         state.sunEnabled = true;
+         state.groundPlane = true;
+         state.statusLine = "Material probe scene.";
+       }},
+      {"Glass cup",
+       "Borosilicate glass shell with light-blue liquid, HDRI + sun disk, real caustics onto a receiving floor — "
+       "the north star scene.",
+       [](AppState &state) {
+         state.glbPathBuf[0] = '\0';
+         state.representation = Representation::Mesh;
+         state.wantCup = false;
+         state.wantMaterialProbe = false;
+         state.wantGlassCup = true;
+         state.envChoice = EnvChoice::ProceduralSky;
+         state.sunEnabled = true;
+         state.groundPlane = true;
+         state.statusLine = "Glass cup scene.";
+       }},
+      {"Caustics cup",
+       "Ceramic bowl layered onto the bring-up scene's glass/mirror spheres — a caustic stress test, not a "
+       "beauty shot.",
+       [](AppState &state) {
+         state.glbPathBuf[0] = '\0';
+         state.representation = Representation::Mesh;
+         state.wantGlassCup = false;
+         state.wantMaterialProbe = false;
+         state.wantCup = true;
+         state.envChoice = EnvChoice::ProceduralSky;
+         state.sunEnabled = true;
+         state.groundPlane = true;
+         state.statusLine = "Caustics cup scene.";
+       }},
+  };
 }
 
 } // namespace
@@ -280,9 +451,6 @@ void rebuildScene(AppState &state, std::unique_ptr<italy::OptixRenderer> &render
 int main(int argc, char **argv) {
   AppState state;
 
-  // CLI args seed the same UI state rebuildScene() reads — kept mainly for
-  // scripted verification (ITALY_DUMP_FRAME runs, README examples) rather
-  // than as the primary way to drive the app now that the UI can do this.
   if (argc > 1 && std::string(argv[1]).rfind("--", 0) != 0)
     std::snprintf(state.glbPathBuf, sizeof(state.glbPathBuf), "%s", argv[1]);
   for (int i = 1; i < argc; ++i) {
@@ -290,24 +458,19 @@ int main(int argc, char **argv) {
     const size_t eq = arg.find('=');
     const std::string key = eq != std::string::npos ? arg.substr(0, eq) : arg;
     const std::string value = eq != std::string::npos ? arg.substr(eq + 1) : std::string();
-    // Resampling resolution is clamped, not trusted: --voxel=0 reached
-    // glm::clamp(v, 0, resolution - 1) with a negative upper bound, and
-    // absurdly large values allocate a dense SDF grid before anything can
-    // report a problem. Same bounds the UI slider enforces.
     auto parseResolution = [&](const std::string &v) {
       if (v.empty())
         return state.resolution;
       const int n = std::atoi(v.c_str());
-      if (n < kMinResolution || n > kMaxResolution) {
-        std::fprintf(stderr, "italy: resolution %d out of range [%d, %d], clamping\n", n, kMinResolution,
-                     kMaxResolution);
+      if (n < kMinResolution) {
+        std::fprintf(stderr, "italy: resolution %d below the minimum of %d, clamping\n", n, kMinResolution);
       }
-      return std::clamp(n, kMinResolution, kMaxResolution);
+      return std::max(n, kMinResolution);
     };
     auto parseDimension = [&](const std::string &v, int fallback, const char *what) {
       const int n = std::atoi(v.c_str());
-      if (n < 64 || n > 8192) {
-        std::fprintf(stderr, "italy: %s %d out of range [64, 8192], keeping %d\n", what, n, fallback);
+      if (n < 1) {
+        std::fprintf(stderr, "italy: %s %d must be at least 1, keeping %d\n", what, n, fallback);
         return fallback;
       }
       return n;
@@ -323,6 +486,7 @@ int main(int argc, char **argv) {
     } else if (key == "--height") {
       state.renderHeight = parseDimension(value, state.renderHeight, "--height");
     } else if (key == "--env") {
+      state.envChoiceExplicit = true;
       if (value == "overcast")
         state.envChoice = EnvChoice::Overcast;
       else if (value == "midnight")
@@ -331,9 +495,12 @@ int main(int argc, char **argv) {
         state.envChoice = EnvChoice::Noon;
       else if (value == "sky")
         state.envChoice = EnvChoice::ProceduralSky;
-      else
+      else {
+        state.envChoiceExplicit = false;
         std::fprintf(stderr, "italy: unknown --env preset '%s' (try overcast, midnight, noon, sky)\n", value.c_str());
+      }
     } else if (key == "--hdri") {
+      state.envChoiceExplicit = true;
       state.envChoice = EnvChoice::Custom;
       std::snprintf(state.hdriPathBuf, sizeof(state.hdriPathBuf), "%s", value.c_str());
     } else if (key == "--gsplat") {
@@ -353,39 +520,18 @@ int main(int argc, char **argv) {
   italy::OrbitCamera prevCamera = camera;
   MouseState mouse;
   std::unique_ptr<italy::OptixRenderer> renderer;
-  // Starts true so Viewport's draw callback below performs the initial
-  // CLI-seeded rebuildScene() itself, on its own GL context, the first time
-  // it runs — same mechanism the Apply button uses, just pre-armed.
-  bool applyRequested = true;
 
-  // Testing hooks, same spirit as ITALY_DUMP_FRAME: these toggles are UI-only
-  // otherwise, so scripted before/after verification needs a way in that
-  // doesn't require actually clicking the checkbox/radio button.
-  // Temporary verification aid (VCM energy-check, see humans.md) — points
-  // the camera straight down at the fixed test scene's ground point directly
-  // under the quad light, so the image *center* pixel is exactly the point a
-  // closed-form irradiance prediction is computed for, with no camera-ray
-  // trig required to find it. Not a permanent feature; safe to delete once
-  // the energy check is re-run after any future change to that scene.
   if (std::getenv("ITALY_DEBUG_LOOKDOWN")) {
-    // Retargets at a ground point in the far corner from every sphere (and
-    // its shadow/caustic footprint) — default yaw/pitch already gives a
-    // clean, unoccluded, low-GI-contamination view of it (confirmed by
-    // render: smooth monotonic irradiance gradient, no silhouette/penumbra
-    // edges nearby), unlike the point directly under the light, which sits
-    // close enough to the mirror/glass spheres for this scene's default
-    // orbit angles to clip one of them or land in a soft-shadow penumbra.
     camera.frame(glm::vec3(-2.2f, -1.0f, -2.2f), 3.0f);
   }
   if (std::getenv("ITALY_FORCE_DENOISE"))
     state.render.denoise = true;
   if (const char *fc = std::getenv("ITALY_FIREFLY_CLAMP"))
     state.render.fireflyClamp = static_cast<float>(std::atof(fc));
-  // VCM Step 1 A/B verification switch — see RenderSettings::lightSubpaths'
-  // doc comment: 0 zero-weights BDPT connections back to today's NEE-only
-  // behaviour, for comparing against the closed-form energy-check scene.
   if (const char *ls = std::getenv("ITALY_LIGHT_SUBPATHS"))
     state.render.lightSubpaths = std::atoi(ls) != 0;
+  if (const char *mc = std::getenv("ITALY_MAX_CONNECTIONS"))
+    state.render.maxConnectionsPerVertex = static_cast<unsigned int>(std::max(0, std::atoi(mc)));
   if (std::getenv("ITALY_NO_GROUND"))
     state.groundPlane = false;
   if (const char *ap = std::getenv("ITALY_APERTURE"))
@@ -414,300 +560,368 @@ int main(int argc, char **argv) {
     else std::fprintf(stderr, "italy: unknown ITALY_TONEMAP '%s'\n", v.c_str());
   }
 
-  std::vector<std::unique_ptr<italy::AppWindow>> windows;
+  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+  GLFWwindow *shareAnchor = glfwCreateWindow(1, 1, "italy-rs GL anchor", nullptr, nullptr);
+  if (!shareAnchor) {
+    std::fprintf(stderr, "glfwCreateWindow failed for the hidden GL-share anchor\n");
+    return 1;
+  }
+  glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
 
-  // Viewport is built first, with shareContext=nullptr, making it the root
-  // of the shared GL object namespace: it's the window that owns/samples
-  // OptixRenderer's GL texture, so "context of record for the renderer" and
-  // "shared-group root" are deliberately the same window.
-  windows.push_back(std::make_unique<italy::AppWindow>(
-      "Viewport", 980, 580, nullptr, [&](italy::AppWindow &self) {
-        // Apply-button subtlety: rebuildScene() constructs a fresh
-        // OptixRenderer (owns the GL texture + CUDA-GL PBO interop), which
-        // must happen with Viewport's context current. The Apply button
-        // lives in Controls' draw callback (a different context), so it only
-        // raises applyRequested; this callback — already running under its
-        // own context, per AppWindow::frame() — does the actual rebuild.
-        if (applyRequested) {
-          rebuildScene(state, renderer, camera);
-          prevCamera = camera;
-          applyRequested = false;
-        }
+  const std::vector<SceneDescriptor> sceneRegistry = makeSceneRegistry();
+  ProjectBakeState bake;
 
-        double x, y;
-        glfwGetCursorPos(self.window(), &x, &y);
-        const float dx = static_cast<float>(x - mouse.lastX);
-        const float dy = static_cast<float>(y - mouse.lastY);
-        mouse.lastX = x;
-        mouse.lastY = y;
+  bool wantProject = true;
+  bool wantViewport = false;
+  bool wantSettings = false;
 
-        // Orbit/pan/zoom used to be gated on !io.WantCaptureMouse, but the
-        // viewport image fills the whole ImGui window it's drawn in, so
-        // ImGui treats hovering it as mouse capture and that gate never
-        // opened — orbiting silently did nothing. Fixed below: the image is
-        // wrapped in an InvisibleButton and drag/scroll is driven off that
-        // item's own active/hovered state instead, which ImGui's own mouse
-        // capture doesn't block. Placed before render()/resetAccumulation()
-        // so a drag this frame is reflected in this frame's render, not
-        // delayed a frame.
-
-        // Fit the render to the available viewport area rather than drawing
-        // it at native pixel size — otherwise it's clipped when the OS
-        // window is smaller than the render resolution and leaves dead
-        // space when larger. Display-only scale: renderer->width()/height()
-        // (the accumulator's actual resolution) are untouched, so this never
-        // triggers a rebuild or changes render cost.
-        const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float srcAspect = static_cast<float>(renderer->width()) / static_cast<float>(renderer->height());
-        ImVec2 imageSize = avail;
-        if (avail.x / avail.y > srcAspect)
-          imageSize.x = avail.y * srcAspect;
-        else
-          imageSize.y = avail.x / srcAspect;
-        const ImVec2 origin = ImGui::GetCursorPos();
-        ImGui::SetCursorPos(ImVec2(origin.x + (avail.x - imageSize.x) * 0.5f, origin.y + (avail.y - imageSize.y) * 0.5f));
-        const ImVec2 imagePos = ImGui::GetCursorScreenPos();
-
-        // Reserve the layout space and read input state via an
-        // InvisibleButton *before* rendering the frame below, so a drag this
-        // frame is reflected in this frame's render rather than delayed a
-        // frame. The actual image is drawn afterward, on top of this same
-        // rect, once render() below has refreshed the texture — see "Drive
-        // orbit/pan/zoom" comment above.
-        ImGui::InvisibleButton("##viewport_image", imageSize);
-        if (ImGui::IsItemActive()) {
-          if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) camera.orbit(dx, dy);
-          if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) camera.pan(dx, dy);
-        }
-        if (ImGui::IsItemHovered())
-          camera.zoom(ImGui::GetIO().MouseWheel);
-
-        if (state.isSampling) {
-          if (cameraChanged(camera, prevCamera)) {
-            renderer->resetAccumulation();
-            prevCamera = camera;
-          }
-          renderer->render(camera, state.render);
-        } else if (cameraChanged(camera, prevCamera)) {
-          // Orbiting while paused resumes sampling from the new pose rather
-          // than leaving a stale, wrong-camera accumulation on screen looking
-          // current.
-          state.isSampling = true;
-          renderer->resetAccumulation();
-          prevCamera = camera;
-          renderer->render(camera, state.render);
-        }
-
-        // Render-to-PNG: hold the UI while accumulation catches up to the
-        // requested sample count, then write through the same path the
-        // scripted hook uses. Deliberately not a separate offline render —
-        // the accumulator already converges progressively, so "keep going
-        // until subframe N" is the whole feature.
-        if (state.exportPending) {
-          if (renderer->subframeIndex() >= static_cast<unsigned int>(state.exportSamples)) {
-            state.statusLine = writeFramePng(*renderer, state.exportPathBuf)
-                                   ? "Wrote " + std::string(state.exportPathBuf)
-                                   : "Failed to write " + std::string(state.exportPathBuf);
-            state.exportPending = false;
-          }
-        }
-
-        const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
-        const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
-        if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= dumpThreshold) {
-          dumpFrameIfRequested(*renderer, self.window());
-          // dumpFrameIfRequested only closes Viewport; close every window so
-          // the scripted ITALY_DUMP_FRAME flow still exits the process, same
-          // external behavior as when there was only one OS window.
-          for (auto &w : windows)
-            glfwSetWindowShouldClose(w->window(), GLFW_TRUE);
-        }
-
-        // Draw on top of the InvisibleButton's rect, now that render() above
-        // has refreshed the texture for this frame.
-        ImGui::SetCursorScreenPos(imagePos);
-        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())), imageSize, ImVec2(0, 1),
-                     ImVec2(1, 0));
-      }));
-
-  windows.push_back(std::make_unique<italy::AppWindow>(
-      "Italy R/S", 420, 800, windows.front()->window(), [&](italy::AppWindow &) {
-        ImGui::TextWrapped("%s", state.statusLine.c_str());
-        ImGui::Text("Lighting: %s", state.haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
-        ImGui::Separator();
-
-        ImGui::Text("Representation");
-        // Shown unconditionally (not gated on state.haveMesh like the old
-        // Mesh/Voxel/SDF-only version): Gsplat is a distinct load source, so
-        // the user needs to be able to pick it before anything is loaded, to
-        // know which path field below applies.
-        bool apply = ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Gsplat", reinterpret_cast<int *>(&state.representation), 3);
-        if (state.representation == Representation::Voxel || state.representation == Representation::Sdf) {
-          if (ImGui::InputInt("Resolution", &state.resolution))
-            state.resolution = std::clamp(state.resolution, kMinResolution, kMaxResolution);
-        }
-
-        if (state.representation == Representation::Gsplat)
-          ImGui::InputText("Gsplat .ply path", state.gsplatPathBuf, sizeof(state.gsplatPathBuf));
-        else
-          ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
-
-        apply |= ImGui::Button("Load / Apply");
-
-        ImGui::Separator();
-        ImGui::Text("HDRI");
-        apply |= ImGui::RadioButton("None", reinterpret_cast<int *>(&state.envChoice), 0);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Overcast", reinterpret_cast<int *>(&state.envChoice), 1);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Midnight", reinterpret_cast<int *>(&state.envChoice), 2);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Noon", reinterpret_cast<int *>(&state.envChoice), 3);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Custom", reinterpret_cast<int *>(&state.envChoice), 4);
-        ImGui::SameLine();
-        apply |= ImGui::RadioButton("Procedural Sky", reinterpret_cast<int *>(&state.envChoice), 5);
-        if (state.envChoice == EnvChoice::Custom)
-          ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf));
-        if (state.envChoice == EnvChoice::ProceduralSky) {
-          if (ImGui::InputFloat("Turbidity", &state.skyTurbidity)) {
-            state.skyTurbidity = std::clamp(state.skyTurbidity, 1.9f, 10.0f);
-            apply = true;
-          }
-          if (ImGui::InputFloat("Sun elevation", &state.skySunElevationDeg)) {
-            state.skySunElevationDeg = std::clamp(state.skySunElevationDeg, -10.0f, 90.0f);
-            apply = true;
-          }
-          if (ImGui::InputFloat("Sun azimuth", &state.skySunAzimuthDeg)) {
-            state.skySunAzimuthDeg = std::clamp(state.skySunAzimuthDeg, 0.0f, 360.0f);
-            apply = true;
-          }
-        }
-
-        apply |= ImGui::Checkbox("Ground plane", &state.groundPlane);
-
-        // Note: RadioButton edits above already trigger `apply` on click,
-        // same as the button — representation/HDRI changes need a full scene
-        // rebuild either way, so there's no cheaper "preview" path to offer
-        // here. This callback runs under Controls' own ImGui/GL context, so
-        // it can't call rebuildScene() itself (see the Apply-button comment
-        // in Viewport's draw callback above) — it only raises the flag.
-        if (apply)
-          applyRequested = true;
-
-        ImGui::Separator();
-        if (ImGui::InputFloat("Exposure", &state.render.exposure))
-          state.render.exposure = std::clamp(state.render.exposure, 0.1f, 8.0f);
-        int spl = static_cast<int>(state.render.samplesPerLaunch);
-        if (ImGui::InputInt("Samples/launch", &spl))
-          state.render.samplesPerLaunch = static_cast<unsigned int>(std::clamp(spl, 1, 16));
-        ImGui::Checkbox("Denoiser", &state.render.denoise);
-
-        // Unlike exposure/tonemap/denoise above, everything from here down
-        // changes what is written into the accumulator rather than how it is
-        // displayed, so each one has to restart accumulation.
-        if (ImGui::InputFloat("Firefly clamp (0 = off)", &state.render.fireflyClamp)) {
-          state.render.fireflyClamp = std::clamp(state.render.fireflyClamp, 0.0f, 50.0f);
-          renderer->resetAccumulation();
-        }
-
-        // VCM Step 4: live A/B toggle for RenderSettings::lightSubpaths —
-        // was env-var-only (ITALY_LIGHT_SUBPATHS, still supported at
-        // startup, see above) since Step 1. Same reset-on-change convention
-        // as every other render-affecting control on this panel.
-        if (ImGui::Checkbox("Light subpaths (VCM connections/merging)", &state.render.lightSubpaths))
-          renderer->resetAccumulation();
-
-        ImGui::Separator();
-        ImGui::Text("Lens");
-        // Aperture is a world-space radius, so a fixed field range would be
-        // meaningless across scenes that differ in scale by orders of
-        // magnitude. Derive it from the scene the camera is actually framing.
-        const float apertureMax = renderer->sceneBoundsRadius() * 0.25f;
-        if (ImGui::InputFloat("Aperture (0 = pinhole)", &state.render.aperture, 0.0f, 0.0f, "%.4f")) {
-          state.render.aperture = std::clamp(state.render.aperture, 0.0f, apertureMax);
-          renderer->resetAccumulation();
-        }
-        if (ImGui::InputFloat("Focus distance (0 = orbit target)", &state.render.focusDistance, 0.0f, 0.0f, "%.3f")) {
-          state.render.focusDistance = std::clamp(state.render.focusDistance, 0.0f, renderer->sceneBoundsRadius() * 8.0f);
-          renderer->resetAccumulation();
-        }
-
-        if (state.haveEnvironment) {
-          ImGui::Separator();
-          float envRotationDeg = glm::degrees(state.render.envRotation);
-          if (ImGui::InputFloat("Environment rotation (deg)", &envRotationDeg)) {
-            envRotationDeg = std::clamp(envRotationDeg, 0.0f, 360.0f);
-            state.render.envRotation = glm::radians(envRotationDeg);
-            renderer->resetAccumulation();
-          }
-        }
-
-        ImGui::Text("Tonemap");
-        ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.render.tonemap), 0);
-        ImGui::SameLine();
-        ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.render.tonemap), 1);
-        ImGui::SameLine();
-        ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.render.tonemap), 2);
-        ImGui::SameLine();
-        ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.render.tonemap), 3);
-        ImGui::SameLine();
-        ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.render.tonemap), 4);
-
-        ImGui::Separator();
-        ImGui::Text("Output");
-        int dims[2] = {state.renderWidth, state.renderHeight};
-        if (ImGui::InputInt2("Render size", dims)) {
-          state.renderWidth = std::clamp(dims[0], 64, 8192);
-          state.renderHeight = std::clamp(dims[1], 64, 8192);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Resize"))
-          applyRequested = true; // same all-or-nothing rebuild as everything else
-
-        ImGui::InputText("PNG path", state.exportPathBuf, sizeof(state.exportPathBuf));
-        if (ImGui::InputInt("Export samples", &state.exportSamples))
-          state.exportSamples = std::clamp(state.exportSamples, 16, 4096);
-        if (state.exportPending) {
-          ImGui::Text("Rendering... subframe %u / %d", renderer->subframeIndex(), state.exportSamples);
-          if (ImGui::Button("Cancel export"))
-            state.exportPending = false;
-        } else if (ImGui::Button("Render to PNG")) {
-          renderer->resetAccumulation();
-          state.exportPending = true;
-        }
-
-        ImGui::Separator();
-        if (ImGui::Button(state.isSampling ? "Pause" : "Resume"))
-          state.isSampling = !state.isSampling;
-        ImGui::SameLine();
-        ImGui::Text(state.isSampling ? "Sampling" : "Paused");
-        const glm::vec3 pos = camera.position();
-        ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
-        ImGui::Text("Subframe: %u", renderer->subframeIndex());
-        ImGui::Text("Drag left-click to orbit, middle-click to pan, scroll to zoom.");
-      }));
-
-  // App quits only once all windows are closed. Destroying the shared-context
-  // root window (Viewport) doesn't invalidate the GL object namespace for
-  // windows that shared with it (GL spec guarantee), so Controls stays fully
-  // functional — just inert, with nothing driving the renderer — if Viewport
-  // is closed first. Accepted v1 behavior: no "reopen a closed panel"
-  // mechanism exists yet.
-  while (!windows.empty()) {
-    glfwPollEvents();
-    for (auto &w : windows)
-      if (!w->shouldClose())
-        w->frame();
-    std::erase_if(windows, [](const std::unique_ptr<italy::AppWindow> &w) { return w->shouldClose(); });
+  if (std::getenv("ITALY_DUMP_FRAME")) {
+    if (const char *sceneEnv = std::getenv("ITALY_SCENE"))
+      bake.selected = std::clamp(std::atoi(sceneEnv), 0, static_cast<int>(sceneRegistry.size()) - 1);
+    const EnvChoice requestedEnv = state.envChoice;
+    sceneRegistry[bake.selected].configure(state);
+    if (state.envChoiceExplicit)
+      state.envChoice = requestedEnv;
+    bake.step = ProjectBakeState::Step::Load;
+    bake.active = true;
   }
 
+  std::unique_ptr<italy::AppWindow> projectWindow;
+  std::unique_ptr<italy::AppWindow> viewportWindow;
+  std::unique_ptr<italy::AppWindow> settingsWindow;
+
+  italy::AppWindow::DrawFn projectDraw = [&](italy::AppWindow &) {
+    ImGui::TextWrapped("Pick a scene, then Bake. Reopen this panel later via a checkbox in Viewport or Settings to "
+                        "bake something else — it won't tear down the current render until you do.");
+    ImGui::Separator();
+
+    for (int i = 0; i < static_cast<int>(sceneRegistry.size()); ++i) {
+      ImGui::RadioButton(sceneRegistry[i].name, &bake.selected, i);
+      ImGui::SameLine();
+      ImGui::TextDisabled("%s", sceneRegistry[i].description);
+    }
+
+    ImGui::Separator();
+    const bool bakeDisabled = bake.active;
+    if (bakeDisabled)
+      ImGui::BeginDisabled();
+    if (ImGui::Button("Bake")) {
+      const SceneDescriptor &scene = sceneRegistry[bake.selected];
+      scene.configure(state);
+      bake.log.clear();
+      bake.rawMeshLoaded = false;
+      bake.step = ProjectBakeState::Step::Load;
+      bake.active = true;
+      logBakeLine(bake, std::string("Baking '") + scene.name + "'.");
+      logBakeLine(bake, state.statusLine);
+    }
+    if (bakeDisabled)
+      ImGui::EndDisabled();
+
+    if (bake.active)
+      advanceBake(state, renderer, camera, bake, wantProject, wantViewport, wantSettings);
+
+    ImGui::Separator();
+    ImGui::Text("Bake log");
+    ImGui::BeginChild("bake_log", ImVec2(0, 220), true);
+    for (const std::string &line : bake.log)
+      ImGui::TextUnformatted(line.c_str());
+    if (bake.active)
+      ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+  };
+
+  italy::AppWindow::DrawFn viewportDraw = [&](italy::AppWindow &self) {
+    ImGui::Checkbox("Project", &wantProject);
+    ImGui::SameLine();
+    ImGui::Checkbox("Settings", &wantSettings);
+    ImGui::Separator();
+
+    double x, y;
+    glfwGetCursorPos(self.window(), &x, &y);
+    const float dx = static_cast<float>(x - mouse.lastX);
+    const float dy = static_cast<float>(y - mouse.lastY);
+    mouse.lastX = x;
+    mouse.lastY = y;
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float srcAspect = static_cast<float>(renderer->width()) / static_cast<float>(renderer->height());
+    ImVec2 imageSize = avail;
+    if (avail.x / avail.y > srcAspect)
+      imageSize.x = avail.y * srcAspect;
+    else
+      imageSize.y = avail.x / srcAspect;
+    const ImVec2 origin = ImGui::GetCursorPos();
+    ImGui::SetCursorPos(ImVec2(origin.x + (avail.x - imageSize.x) * 0.5f, origin.y + (avail.y - imageSize.y) * 0.5f));
+    const ImVec2 imagePos = ImGui::GetCursorScreenPos();
+
+    ImGui::InvisibleButton("##viewport_image", imageSize,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle |
+                               ImGuiButtonFlags_MouseButtonRight);
+    if (ImGui::IsItemActive()) {
+      if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) camera.orbit(dx, dy);
+      if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) || ImGui::IsMouseDown(ImGuiMouseButton_Right))
+        camera.pan(dx, dy);
+    }
+    if (ImGui::IsItemHovered())
+      camera.zoom(ImGui::GetIO().MouseWheel);
+
+    if (state.isSampling) {
+      if (cameraChanged(camera, prevCamera)) {
+        renderer->resetAccumulation();
+        prevCamera = camera;
+      }
+      renderer->render(camera, state.render);
+    } else if (cameraChanged(camera, prevCamera)) {
+      state.isSampling = true;
+      renderer->resetAccumulation();
+      prevCamera = camera;
+      renderer->render(camera, state.render);
+    }
+
+    if (state.exportPending) {
+      if (renderer->subframeIndex() >= static_cast<unsigned int>(state.exportSamples)) {
+        state.statusLine = writeFrame(*renderer, state.exportPathBuf)
+                               ? "Wrote " + std::string(state.exportPathBuf)
+                               : "Failed to write " + std::string(state.exportPathBuf);
+        state.exportPending = false;
+      }
+    }
+
+    const char *dumpAfter = std::getenv("ITALY_DUMP_AFTER_SUBFRAME");
+    const unsigned int dumpThreshold = dumpAfter ? static_cast<unsigned int>(std::atoi(dumpAfter)) : 128u;
+    if (std::getenv("ITALY_DUMP_FRAME") && renderer->subframeIndex() >= dumpThreshold) {
+      dumpFrameIfRequested(*renderer, self.window());
+      wantProject = false;
+      wantViewport = false;
+      wantSettings = false;
+    }
+
+    ImGui::SetCursorScreenPos(imagePos);
+    ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(renderer->glTextureId())), imageSize, ImVec2(0, 1),
+                 ImVec2(1, 0));
+  };
+
+  italy::AppWindow::DrawFn settingsDraw = [&](italy::AppWindow &) {
+    ImGui::Checkbox("Project", &wantProject);
+    ImGui::SameLine();
+    ImGui::Checkbox("Viewport", &wantViewport);
+    ImGui::Separator();
+
+    ImGui::TextWrapped("%s", state.statusLine.c_str());
+    ImGui::Text("Lighting: %s", state.haveEnvironment ? "environment (HDRI)" : "synthetic quad light");
+    ImGui::Separator();
+
+    ImGui::Text("Representation");
+    ImGui::RadioButton("Mesh", reinterpret_cast<int *>(&state.representation), 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Voxel", reinterpret_cast<int *>(&state.representation), 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("SDF", reinterpret_cast<int *>(&state.representation), 2);
+    ImGui::SameLine();
+    ImGui::RadioButton("Gsplat", reinterpret_cast<int *>(&state.representation), 3);
+    if (state.representation == Representation::Voxel || state.representation == Representation::Sdf) {
+      if (ImGui::InputInt("Resolution", &state.resolution))
+        state.resolution = std::max(state.resolution, kMinResolution);
+    }
+
+    if (state.representation == Representation::Gsplat)
+      ImGui::InputText("Gsplat .ply path", state.gsplatPathBuf, sizeof(state.gsplatPathBuf));
+    else
+      ImGui::InputText("GLB path", state.glbPathBuf, sizeof(state.glbPathBuf));
+
+    ImGui::TextDisabled("Changing representation/paths here takes effect next time you Bake in the Project "
+                         "window.");
+
+    ImGui::Separator();
+    ImGui::Text("HDRI");
+    bool envChanged = false;
+    envChanged |= ImGui::RadioButton("None", reinterpret_cast<int *>(&state.envChoice), 0);
+    ImGui::SameLine();
+    envChanged |= ImGui::RadioButton("Overcast", reinterpret_cast<int *>(&state.envChoice), 1);
+    ImGui::SameLine();
+    envChanged |= ImGui::RadioButton("Midnight", reinterpret_cast<int *>(&state.envChoice), 2);
+    ImGui::SameLine();
+    envChanged |= ImGui::RadioButton("Noon", reinterpret_cast<int *>(&state.envChoice), 3);
+    ImGui::SameLine();
+    envChanged |= ImGui::RadioButton("Custom", reinterpret_cast<int *>(&state.envChoice), 4);
+    ImGui::SameLine();
+    envChanged |= ImGui::RadioButton("Procedural Sky", reinterpret_cast<int *>(&state.envChoice), 5);
+    if (state.envChoice == EnvChoice::Custom)
+      envChanged |= ImGui::InputText("HDRI path", state.hdriPathBuf, sizeof(state.hdriPathBuf),
+                                     ImGuiInputTextFlags_EnterReturnsTrue);
+    if (envChanged && !(state.envChoice == EnvChoice::Custom && state.hdriPathBuf[0] == '\0'))
+      rebuildEnvironmentLive(state, renderer, camera);
+    if (state.envChoice == EnvChoice::ProceduralSky) {
+      if (ImGui::InputFloat("Turbidity", &state.skyTurbidity)) {
+        state.skyTurbidity = std::max(state.skyTurbidity, 1.9f);
+        rebuildEnvironmentLive(state, renderer, camera);
+      }
+      if (ImGui::InputFloat("Sun elevation", &state.skySunElevationDeg)) {
+        rebuildEnvironmentLive(state, renderer, camera);
+      }
+      if (ImGui::InputFloat("Sun azimuth", &state.skySunAzimuthDeg)) {
+        rebuildEnvironmentLive(state, renderer, camera);
+      }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Sun (analytic disk, live)");
+    if (ImGui::Checkbox("Sun enabled", &state.sunEnabled)) {
+      if (state.envChoice == EnvChoice::ProceduralSky)
+        rebuildEnvironmentLive(state, renderer, camera);
+      else {
+        syncSunRenderSettings(state);
+        renderer->resetAccumulation();
+      }
+    }
+    if (ImGui::InputFloat("Sun angular radius (deg)", &state.sunAngularRadiusDeg)) {
+      state.sunAngularRadiusDeg = std::clamp(state.sunAngularRadiusDeg, 1e-3f, 89.999f);
+      syncSunRenderSettings(state);
+      renderer->resetAccumulation();
+    }
+    if (ImGui::ColorEdit3("Sun color", &state.sunColor.x)) {
+      syncSunRenderSettings(state);
+      renderer->resetAccumulation();
+    }
+    if (ImGui::InputFloat("Sun intensity", &state.sunIntensity)) {
+      state.sunIntensity = std::max(state.sunIntensity, 0.0f);
+      syncSunRenderSettings(state);
+      renderer->resetAccumulation();
+    }
+    if (ImGui::ColorEdit3("Background color", &state.backgroundColor.x)) {
+      state.render.backgroundColor = state.backgroundColor;
+      renderer->resetAccumulation();
+    }
+    ImGui::TextDisabled("Sun elevation/azimuth are shared with the procedural sky above; angular radius/color/"
+                         "intensity/background are live RenderSettings, no re-bake needed. Turbidity/elevation/"
+                         "azimuth/enabled re-bake the sky texture automatically when the environment is the "
+                         "procedural sky, so the horizon glow always matches.");
+
+    ImGui::Checkbox("Ground plane", &state.groundPlane);
+
+    ImGui::Separator();
+    if (ImGui::InputFloat("Exposure", &state.render.exposure))
+      state.render.exposure = std::max(state.render.exposure, 0.0f);
+    int spl = static_cast<int>(state.render.samplesPerLaunch);
+    if (ImGui::InputInt("Samples/launch", &spl))
+      state.render.samplesPerLaunch = static_cast<unsigned int>(std::max(spl, 1));
+    ImGui::Checkbox("Denoiser", &state.render.denoise);
+
+    if (ImGui::InputFloat("Firefly clamp (0 = off)", &state.render.fireflyClamp)) {
+      state.render.fireflyClamp = std::max(state.render.fireflyClamp, 0.0f);
+      renderer->resetAccumulation();
+    }
+
+    if (ImGui::Checkbox("Light subpaths (VCM connections/merging)", &state.render.lightSubpaths))
+      renderer->resetAccumulation();
+
+    int maxConn = static_cast<int>(state.render.maxConnectionsPerVertex);
+    if (ImGui::InputInt("Max BDPT connections/vertex (0 = uncapped)", &maxConn)) {
+      state.render.maxConnectionsPerVertex = static_cast<unsigned int>(std::max(maxConn, 0));
+      renderer->resetAccumulation();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Lens");
+    if (ImGui::InputFloat("Aperture (0 = pinhole)", &state.render.aperture, 0.0f, 0.0f, "%.4f")) {
+      state.render.aperture = std::max(state.render.aperture, 0.0f);
+      renderer->resetAccumulation();
+    }
+    if (ImGui::InputFloat("Focus distance (0 = orbit target)", &state.render.focusDistance, 0.0f, 0.0f, "%.3f")) {
+      state.render.focusDistance = std::max(state.render.focusDistance, 0.0f);
+      renderer->resetAccumulation();
+    }
+
+    if (state.haveEnvironment) {
+      ImGui::Separator();
+      float envRotationDeg = glm::degrees(state.render.envRotation);
+      if (ImGui::InputFloat("Environment rotation (deg)", &envRotationDeg)) {
+        state.render.envRotation = glm::radians(envRotationDeg);
+        renderer->resetAccumulation();
+      }
+    }
+
+    ImGui::Text("Tonemap");
+    ImGui::RadioButton("AgX", reinterpret_cast<int *>(&state.render.tonemap), 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Reinhard", reinterpret_cast<int *>(&state.render.tonemap), 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("ACES", reinterpret_cast<int *>(&state.render.tonemap), 2);
+    ImGui::SameLine();
+    ImGui::RadioButton("Hable", reinterpret_cast<int *>(&state.render.tonemap), 3);
+    ImGui::SameLine();
+    ImGui::RadioButton("Clamp", reinterpret_cast<int *>(&state.render.tonemap), 4);
+
+    ImGui::Separator();
+    ImGui::Text("Output");
+    int dims[2] = {state.renderWidth, state.renderHeight};
+    if (ImGui::InputInt2("Render size", dims)) {
+      state.renderWidth = std::max(dims[0], 1);
+      state.renderHeight = std::max(dims[1], 1);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(re-bake in Project to apply)");
+
+    ImGui::InputText("PNG path", state.exportPathBuf, sizeof(state.exportPathBuf));
+    if (ImGui::InputInt("Export samples", &state.exportSamples))
+      state.exportSamples = std::max(state.exportSamples, 1);
+    if (state.exportPending) {
+      ImGui::Text("Rendering... subframe %u / %d", renderer->subframeIndex(), state.exportSamples);
+      if (ImGui::Button("Cancel export"))
+        state.exportPending = false;
+    } else if (ImGui::Button("Render to PNG")) {
+      renderer->resetAccumulation();
+      state.exportPending = true;
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button(state.isSampling ? "Pause" : "Resume"))
+      state.isSampling = !state.isSampling;
+    ImGui::SameLine();
+    ImGui::Text(state.isSampling ? "Sampling" : "Paused");
+    const glm::vec3 pos = camera.position();
+    ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
+    ImGui::Text("Subframe: %u", renderer->subframeIndex());
+    ImGui::Text("Drag left-click to orbit, right- or middle-click to pan, scroll to zoom.");
+  };
+
+  while (wantProject || wantViewport || wantSettings || projectWindow || viewportWindow || settingsWindow) {
+    glfwPollEvents();
+
+    if (wantProject && !projectWindow)
+      projectWindow = std::make_unique<italy::AppWindow>("Project", 620, 640, shareAnchor, projectDraw);
+    if (wantViewport && !viewportWindow)
+      viewportWindow = std::make_unique<italy::AppWindow>("Viewport", 980, 580, shareAnchor, viewportDraw);
+    if (wantSettings && !settingsWindow)
+      settingsWindow = std::make_unique<italy::AppWindow>("Italy R/S", 420, 800, shareAnchor, settingsDraw);
+
+    if (projectWindow && !projectWindow->shouldClose())
+      projectWindow->frame();
+    if (viewportWindow && !viewportWindow->shouldClose())
+      viewportWindow->frame();
+    if (settingsWindow && !settingsWindow->shouldClose())
+      settingsWindow->frame();
+
+    if (projectWindow && projectWindow->shouldClose())
+      wantProject = false;
+    if (viewportWindow && viewportWindow->shouldClose())
+      wantViewport = false;
+    if (settingsWindow && settingsWindow->shouldClose())
+      wantSettings = false;
+
+    if (projectWindow && !wantProject)
+      projectWindow.reset();
+    if (viewportWindow && !wantViewport)
+      viewportWindow.reset();
+    if (settingsWindow && !wantSettings)
+      settingsWindow.reset();
+  }
+
+  glfwDestroyWindow(shareAnchor);
   glfwTerminate();
   return 0;
 }

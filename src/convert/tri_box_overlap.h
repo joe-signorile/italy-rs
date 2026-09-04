@@ -1,11 +1,6 @@
 #pragma once
 
-// Shared by voxelize.cpp (per-voxel-cell mesh resampling) and sdf_baker.cpp
-// (unified-SDF acceleration Phase 1's per-cell material bake, see
-// SdfGrid::baseColor's doc comment) — both need "does this triangle overlap
-// this axis-aligned cell" and there is exactly one correct way to answer
-// that question, so it lives here once rather than as two copies that could
-// drift out of sync with each other.
+// Classic Akenine-Möller triangle/AABB separating-axis overlap test, shared by voxelize.cpp and sdf_baker.cpp.
 
 #include <algorithm>
 #include <cmath>
@@ -14,12 +9,6 @@
 
 namespace italy {
 
-// Classic Akenine-Möller triangle/AABB overlap test (separating axis theorem
-// over the box's 3 face normals, the triangle's normal, and the 9 cross
-// products of box-edge x triangle-edge). Reference:
-// "Fast 3D Triangle-Box Overlap Testing," Akenine-Möller 2001. Chosen over a
-// cheaper bbox-only test because a bbox-only test visibly over-thickens thin
-// or diagonal surfaces — the exact test costs little extra code.
 inline bool triBoxOverlapPlaneTest(const glm::vec3 &normal, const glm::vec3 &vert, const glm::vec3 &maxbox) {
   glm::vec3 vmin, vmax;
   for (int q = 0; q < 3; ++q) {
@@ -37,13 +26,6 @@ inline bool triBoxOverlapPlaneTest(const glm::vec3 &normal, const glm::vec3 &ver
   return glm::dot(normal, vmax) >= 0.0f;
 }
 
-// The six axis tests below transliterate Akenine-Möller's AXISTEST_{X01,X2,
-// Y02,Y1,Z12,Z0} macros directly (including their sign conventions, which
-// differ between the X/Z and Y families — that's not a typo, it falls out of
-// the cross-product expansion). Kept separate rather than one falsely-generic
-// helper: collapsing them into a single parameterized function risks
-// transcribing the sign wrong for exactly the case that's hardest to notice
-// in a quick visual check (a slightly-too-thick or slightly-too-thin result).
 inline bool triBoxAxisTestX01(float a, float b, float fa, float fb, const glm::vec3 &v0, const glm::vec3 &v2,
                                const glm::vec3 &boxHalf) {
   const float p0 = a * v0.y - b * v0.z, p2 = a * v2.y - b * v2.z;
@@ -120,7 +102,6 @@ inline bool triBoxOverlap(const glm::vec3 &boxCenter, const glm::vec3 &boxHalf, 
   if (!triBoxAxisTestZ12(e2.y, e2.x, fey, fex, v1, v2, boxHalf))
     return false;
 
-  // Box-face-normal axis tests (standard AABB/AABB overlap on each axis).
   for (int axis = 0; axis < 3; ++axis) {
     float minV = std::min({v0[axis], v1[axis], v2[axis]});
     float maxV = std::max({v0[axis], v1[axis], v2[axis]});
@@ -128,7 +109,6 @@ inline bool triBoxOverlap(const glm::vec3 &boxCenter, const glm::vec3 &boxHalf, 
       return false;
   }
 
-  // Triangle-plane axis test.
   const glm::vec3 normal = glm::cross(e0, e1);
   return triBoxOverlapPlaneTest(normal, v0, boxHalf);
 }

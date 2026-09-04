@@ -9,19 +9,8 @@
 namespace italy {
 namespace {
 
-// glTF baseColorTexture is sRGB-encoded (baseColorFactor is linear — only
-// the texture needs decoding). The OptiX texture-sampling path gets this via
-// CUDA's hardware sRGB conversion (see optix_renderer.cpp); this CPU-side
-// bake has no such hardware, so it needs the standard sRGB EOTF explicitly.
-// Skipping it would systematically darken/mis-tint every voxel color baked
-// from a texture.
 float srgbToLinear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
 
-// No V flip: glTF's texture origin is the upper-left, TextureAsset stores rows
-// top-to-bottom (see mesh_asset.h), and the GPU path samples tex2D(u, v)
-// unflipped (pathtracer.cu's MATERIAL_TEXTURED_DIFFUSE branch). Flipping here
-// made the baked voxel colors a vertical mirror of what the same asset shows
-// when rendered as a mesh — the two representations have to agree.
 glm::vec3 sampleColorNearest(const TextureAsset &tex, glm::vec2 uv) {
   auto wrap = [](float x) { return x - std::floor(x); };
   const int px = std::clamp(static_cast<int>(wrap(uv.x) * tex.width), 0, tex.width - 1);
@@ -29,18 +18,12 @@ glm::vec3 sampleColorNearest(const TextureAsset &tex, glm::vec2 uv) {
   const size_t idx = (static_cast<size_t>(py) * tex.width + px) * 4;
   const glm::vec3 raw(tex.pixelsRGBA[idx] / 255.0f, tex.pixelsRGBA[idx + 1] / 255.0f,
                       tex.pixelsRGBA[idx + 2] / 255.0f);
-  // Only base-colour textures are sRGB-encoded; the flag travels with the
-  // texture now, so a linear map that somehow reaches here isn't double-
-  // decoded (see TextureAsset::srgb).
   if (!tex.srgb)
     return raw;
   return glm::vec3(srgbToLinear(raw.r), srgbToLinear(raw.g), srgbToLinear(raw.b));
 }
 
 glm::vec3 triangleColor(const MeshAsset &mesh, size_t triangle) {
-  // Per-triangle material lookup: one soup can now carry a whole scene's
-  // worth of materials, so the colour has to be resolved per triangle rather
-  // than once for the whole mesh.
   const MaterialAsset &mat = mesh.materialForTriangle(triangle);
   const size_t base = triangle * 3;
   if (mat.baseColorTexture >= 0 && mat.baseColorTexture < static_cast<int>(mesh.textures.size()) &&
@@ -73,7 +56,7 @@ VoxelGrid voxelizeMesh(const MeshAsset &mesh, int resolution) {
   grid.voxelSize = longestAxis / static_cast<float>(std::max(resolution, 1));
   grid.origin = mesh.boundsMin;
 
-  std::unordered_map<glm::ivec3, size_t, CellHash, CellEq> cellIndex; // cell -> index into grid.cells/colorSum
+  std::unordered_map<glm::ivec3, size_t, CellHash, CellEq> cellIndex;
   std::vector<glm::vec3> colorSum;
   std::vector<int> colorCount;
 
@@ -86,13 +69,6 @@ VoxelGrid voxelizeMesh(const MeshAsset &mesh, int resolution) {
 
     const glm::vec3 triMin = glm::min(glm::min(p0, p1), p2);
     const glm::vec3 triMax = glm::max(glm::max(p0, p1), p2);
-    // Clamped to [0, resolution-1]: a vertex sitting exactly on the mesh's
-    // far bounding-box edge (common for axis-aligned geometry, not rare for
-    // real meshes either) computes floor(extent/voxelSize) == resolution
-    // exactly — one past the last valid cell index — which without this
-    // clamp silently added a full phantom extra layer of cells on whichever
-    // axis hit the boundary. Caught by voxelize_test's hollow-cube case,
-    // where every vertex sits on a boundary on all three axes.
     const glm::ivec3 cellMin =
         glm::clamp(glm::ivec3(glm::floor((triMin - grid.origin) / grid.voxelSize)), glm::ivec3(0),
                    glm::ivec3(resolution - 1));

@@ -14,8 +14,6 @@ namespace italy {
 
 namespace {
 
-// SH-DC-to-RGB: constant term of a real spherical harmonic basis, the same
-// value the 3DGS reference implementation and every compatible exporter use.
 constexpr float kShC0 = 0.28209479177387814f;
 
 enum class PlyType { Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Float64 };
@@ -39,7 +37,6 @@ size_t plyTypeSize(PlyType t) {
 }
 
 bool parsePlyType(const std::string &tok, PlyType &out) {
-  // PLY spec allows both long names and C-style aliases; exporters use both.
   static const std::unordered_map<std::string, PlyType> kNames = {
       {"char", PlyType::Int8},     {"int8", PlyType::Int8},
       {"uchar", PlyType::UInt8},   {"uint8", PlyType::UInt8},
@@ -99,11 +96,9 @@ double readPlyValueAsDouble(const uint8_t *p, PlyType t) {
 struct PlyProperty {
   std::string name;
   PlyType type;
-  size_t byteOffset; // offset within one binary vertex record
+  size_t byteOffset;
 };
 
-// The subset of per-vertex fields this renderer actually consumes, and where
-// each one landed among the header's declared properties (-1 = absent).
 struct FieldIndex {
   int x = -1, y = -1, z = -1;
   int scale0 = -1, scale1 = -1, scale2 = -1;
@@ -145,7 +140,7 @@ float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 } // namespace
 
 bool loadGsplatPly(const std::string &path, GsplatAsset &outSplats, std::string &outError) {
-  outSplats = GsplatAsset{}; // reset any stale state from a previous load
+  outSplats = GsplatAsset{};
 
   std::ifstream file(path, std::ios::binary);
   if (!file) {
@@ -193,8 +188,6 @@ bool loadGsplatPly(const std::string &path, GsplatAsset &outSplats, std::string 
       iss >> elemName >> count;
       inVertexElement = (elemName == "vertex");
       if (inVertexElement) vertexCount = count;
-      // Non-vertex elements (e.g. "face") are not expected in a gsplat PLY
-      // and aren't handled — real 3DGS exports don't emit them.
     } else if (kw == "property") {
       if (!inVertexElement) continue;
       std::string typeTok;
@@ -215,7 +208,6 @@ bool loadGsplatPly(const std::string &path, GsplatAsset &outSplats, std::string 
     } else if (kw == "end_header") {
       break;
     }
-    // Unrecognized keywords are ignored, matching a lenient PLY reader.
   }
 
   if (!haveFormat) {
@@ -246,8 +238,6 @@ bool loadGsplatPly(const std::string &path, GsplatAsset &outSplats, std::string 
   auto pushVertex = [&](const std::vector<double> &v) {
     const glm::vec3 pos(static_cast<float>(v[fi.x]), static_cast<float>(v[fi.y]),
                          static_cast<float>(v[fi.z]));
-    // 3DGS stores log-scale and pre-sigmoid opacity; activate once here so
-    // everything downstream works with plain linear values.
     const glm::vec3 scale(std::exp(static_cast<float>(v[fi.scale0])),
                            std::exp(static_cast<float>(v[fi.scale1])),
                            std::exp(static_cast<float>(v[fi.scale2])));

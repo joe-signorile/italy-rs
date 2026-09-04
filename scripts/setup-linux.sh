@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Bootstraps build prerequisites for italy-rs on Debian/Ubuntu and runs the
-# first build. Mirrors humans.md's "Prerequisites" and "Build" sections —
-# keep the two in sync if either changes.
-#
-# What this does NOT do: download the OptiX SDK. NVIDIA gates that installer
-# behind a free Developer Program login, so it can't be scripted — this
-# script checks for it and prints the manual steps if it's missing, same as
-# humans.md.
 set -euo pipefail
 
 CUDA_PACKAGE="cuda-toolkit-13-2"
@@ -15,21 +7,16 @@ APT_BUILD_DEPS=(build-essential cmake ninja-build git pkg-config xorg-dev libgl1
 
 log() { echo "==> $*"; }
 die() { echo "error: $*" >&2; exit 1; }
-# CMake's find_package(CUDAToolkit) locates nvcc via the standard
-# /usr/local/cuda* prefixes on its own, independent of PATH — so check
-# those too rather than requiring nvcc on this shell's PATH specifically.
 find_nvcc() { command -v nvcc 2>/dev/null || compgen -G '/usr/local/cuda*/bin/nvcc' | head -1; }
 
 command -v apt-get >/dev/null 2>&1 ||
   die "this script only supports Debian/Ubuntu (apt-get not found) — see humans.md for manual steps on other distros."
 
-# --- NVIDIA driver -----------------------------------------------------
 command -v nvidia-smi >/dev/null 2>&1 ||
   die "nvidia-smi not found — install the NVIDIA driver first (this project is NVIDIA-only: CUDA + OptiX, no AMD/Vulkan)."
 nvidia-smi -L | grep -q . || die "nvidia-smi found no GPU."
 log "NVIDIA driver OK: $(nvidia-smi -L | head -1)"
 
-# --- Build tools + GLFW's Linux (X11) build deps ------------------------
 missing=()
 for pkg in "${APT_BUILD_DEPS[@]}"; do
   dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
@@ -40,7 +27,6 @@ if [ "${#missing[@]}" -gt 0 ]; then
   sudo apt-get install -y "${missing[@]}"
 fi
 
-# --- CUDA Toolkit --------------------------------------------------------
 nvcc_bin="$(find_nvcc)"
 if [ -z "$nvcc_bin" ]; then
   log "nvcc not found — installing ${CUDA_PACKAGE}"
@@ -57,7 +43,6 @@ fi
 [ -n "$nvcc_bin" ] || die "nvcc still not found after installing ${CUDA_PACKAGE} — check /usr/local/cuda*/bin exists."
 log "CUDA Toolkit OK: $("$nvcc_bin" --version | tail -1)"
 
-# --- OptiX SDK: cannot be scripted, only checked -------------------------
 if [ -z "${OPTIX_ROOT:-}" ] || [ ! -f "${OPTIX_ROOT}/include/optix.h" ] || [ ! -f "${OPTIX_ROOT}/SDK/sutil/vec_math.h" ]; then
   cat >&2 <<'EOF'
 error: OPTIX_ROOT is not set (or doesn't point at a full SDK install).
@@ -77,11 +62,7 @@ EOF
 fi
 log "OptiX SDK OK: ${OPTIX_ROOT}"
 
-# --- Build -----------------------------------------------------------
-# claudia: no automatic CUDA-host-compiler fallback — humans.md notes
-# g++-13 as a pinned fallback in case a newer default gcc breaks nvcc; if
-# the configure/build below fails on a host-compiler compat error, retry
-# with: cmake -B build -G Ninja -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13
+# claudia: no automatic CUDA-host-compiler fallback — if the build fails on a host-compiler compat error, retry with -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13
 log "configuring"
 cmake -B build -G Ninja
 log "building"

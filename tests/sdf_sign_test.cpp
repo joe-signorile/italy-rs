@@ -1,14 +1,4 @@
-// Sanity check for sdf_baker.cpp's sign/magnitude correctness against a
-// primitive with a known analytic SDF (a unit sphere), per the original
-// plan doc's verification ask. Unlike voxelize_test.cpp this exercises the
-// real OptiX bake pipeline (sdf_baker.cpp builds its own short-lived
-// OptixDeviceContext — see that file's header comment), so it needs an
-// actual GPU/OptiX SDK at run time, same as italy-rs itself.
-//
-// optix_function_table_definition.h defines a process-wide global and must
-// appear in exactly one translation unit in this binary (see the comment
-// at the top of sdf_baker.cpp) — this test binary doesn't link
-// optix_renderer.cpp, so it provides that definition itself.
+// Sanity check for sdf_baker.cpp's sign/magnitude correctness against a unit sphere's known analytic SDF; exercises the real OptiX bake pipeline so it needs a GPU/OptiX SDK at run time.
 #include <optix_function_table_definition.h>
 
 #include <cassert>
@@ -25,14 +15,11 @@ using italy::bakeSdf;
 
 namespace {
 
-// Closed triangle-soup UV sphere, radius r centered at the origin —
-// watertight (shared latitude/longitude grid, no gaps), which is what
-// bakeSdf's ray-parity sign vote requires to be reliable.
 MeshAsset makeUvSphere(float r, int lonSegs, int latSegs) {
   MeshAsset mesh;
   auto vertex = [&](int lat, int lon) {
-    const float theta = static_cast<float>(lat) / latSegs * static_cast<float>(M_PI);       // 0..pi
-    const float phi = static_cast<float>(lon) / lonSegs * 2.0f * static_cast<float>(M_PI); // 0..2pi
+    const float theta = static_cast<float>(lat) / latSegs * static_cast<float>(M_PI);
+    const float phi = static_cast<float>(lon) / lonSegs * 2.0f * static_cast<float>(M_PI);
     return glm::vec3(r * std::sin(theta) * std::cos(phi), r * std::cos(theta), r * std::sin(theta) * std::sin(phi));
   };
   for (int lat = 0; lat < latSegs; ++lat) {
@@ -41,8 +28,6 @@ MeshAsset makeUvSphere(float r, int lonSegs, int latSegs) {
       const glm::vec3 b = vertex(lat + 1, lon);
       const glm::vec3 c = vertex(lat + 1, lon + 1);
       const glm::vec3 d = vertex(lat, lon + 1);
-      // Two triangles per quad; degenerate at the poles (a==b or c==d) but
-      // a zero-area triangle doesn't break ray-parity counting.
       for (glm::vec3 v : {a, b, c, a, c, d}) {
         mesh.positions.push_back(v);
         mesh.normals.push_back(glm::normalize(v));
@@ -52,7 +37,7 @@ MeshAsset makeUvSphere(float r, int lonSegs, int latSegs) {
   }
   mesh.boundsMin = glm::vec3(-r);
   mesh.boundsMax = glm::vec3(r);
-  mesh.materials.push_back(italy::MaterialAsset{}); // see voxelize_test.cpp's makeUnitCubeShell for why this is required
+  mesh.materials.push_back(italy::MaterialAsset{});
   return mesh;
 }
 
@@ -61,14 +46,11 @@ MeshAsset makeUvSphere(float r, int lonSegs, int latSegs) {
 int main() {
   const float radius = 1.0f;
   const int resolution = 24;
-  const MeshAsset sphere = makeUvSphere(radius, /*lonSegs=*/32, /*latSegs=*/16);
+  const MeshAsset sphere = makeUvSphere(radius, 32, 16);
   const SdfGrid grid = bakeSdf(sphere, resolution);
 
   assert(!grid.distances.empty());
 
-  // sdf_baker.cpp's distance estimate is a minimum-hit-distance-over-random-
-  // directions approximation, not exact — allow slack proportional to the
-  // cell size rather than expecting bit-exact analytic agreement.
   const float tolerance = 1.5f * grid.voxelSize;
 
   size_t checked = 0, wrongSign = 0;
@@ -80,9 +62,6 @@ int main() {
         const float analytic = glm::length(center) - radius;
         const float baked = grid.distances[grid.index(x, y, z)];
 
-        // Sign check only makes sense away from the surface itself — right
-        // at the boundary, grid quantization can legitimately put the
-        // baked and analytic values on opposite sides of zero.
         if (std::fabs(analytic) > tolerance) {
           ++checked;
           if ((analytic < 0.0f) != (baked < 0.0f))

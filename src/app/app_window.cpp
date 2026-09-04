@@ -12,17 +12,6 @@ namespace italy {
 
 namespace {
 
-// Dear ImGui's GLFW backend resolves *which* ImGuiContext a callback should
-// touch via the process-global "current context", not via the GLFWwindow*
-// the callback receives — fine with one context, wrong the instant a second
-// one exists, since glfwPollEvents() is one global call that can dispatch
-// events for every open window before we regain control. The fix used
-// throughout this file: install_callbacks=false in the constructor below,
-// then these 7 trampolines (one per callback ImGui_ImplGlfw would otherwise
-// install itself) that pull `this` back out via the window user pointer,
-// make that window's ImGuiContext current, and forward to the real
-// ImGui_ImplGlfw_*Callback free function (public entry points exposed by
-// imgui_impl_glfw.h exactly for this case).
 AppWindow *ownerOf(GLFWwindow *window) { return static_cast<AppWindow *>(glfwGetWindowUserPointer(window)); }
 
 void cursorPosTrampoline(GLFWwindow *window, double x, double y) {
@@ -78,18 +67,10 @@ AppWindow::AppWindow(const char *title, int width, int height, GLFWwindow *share
   glfwMakeContextCurrent(window_);
   glfwSwapInterval(1);
 
-  // CreateContext() internally restores whatever ImGuiContext was current
-  // before the call, so it does NOT leave imguiContext_ current — the
-  // explicit SetCurrentContext below is required before touching anything
-  // ImGui-side (StyleColorsDark, GetIO(), the backend Init calls).
   imguiContext_ = ImGui::CreateContext();
   ImGui::SetCurrentContext(imguiContext_);
 
   ImGui::StyleColorsDark();
-  // claudia: window position/size are fixed defaults, not persisted
-  // across restarts — an imgui.ini per OS window has no meaningful
-  // intra-window layout left to save now that the OS window IS the panel.
-  // Revisit if users find re-arranging windows every launch annoying.
   ImGui::GetIO().IniFilename = nullptr;
 
   ImGui_ImplGlfw_InitForOpenGL(window_, /*install_callbacks=*/false);

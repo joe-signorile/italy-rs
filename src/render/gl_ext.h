@@ -1,12 +1,5 @@
-// Manually-resolved OpenGL buffer-object entry points (GL_ARB_vertex_buffer_
-// object, core since GL 1.5) needed for the CUDA-GL interop PBO. GLFW's
-// default include only gets us the legacy GL 1.1 ABI (glViewport, glClear,
-// glTex(Sub)Image2D — those we call directly, no loader needed); PBO
-// functions aren't part of that ABI on any platform.
-//
-// claudia: hand-resolving 4 function pointers instead of pulling in a full
-// loader (GLAD/GLEW) — upgrade to one if later phases need much more of
-// modern GL than this.
+// Manually-resolved OpenGL buffer-object entry points (GL_ARB_vertex_buffer_object) for the CUDA-GL interop PBO; GLFW's default include only exposes the legacy GL 1.1 ABI.
+
 #pragma once
 
 #include <GLFW/glfw3.h>

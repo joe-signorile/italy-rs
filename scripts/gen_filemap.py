@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
 """Generate docs/agent/filemap.toon from src/ and tests/.
 
-Regex-parsed, not clang/libclang-backed — no compiler dependency, so this
-runs standalone (no build dir needed) as well as wired into CMake.
-
-// claudia: static regex-parsed map, not clangd/LSP-backed — upgrade if
-// src/ grows past ~100 files or agents need real go-to-definition (this
-// repo has no LSP-bridge tool available to drive that today anyway).
-
-Also flags, as a side effect of already parsing includes, any file outside
-render/ and convert/sdf_baker.cpp that includes optix.h or cuda_runtime.h —
-CLAUDE.md's OptiX-seam rule.
-
-// claudia: seam check is first-order only (a file's own #include lines) —
-// doesn't follow includes transitively through local headers. Upgrade if
-// a violation ever needs to hide behind an intermediate header to slip
-// through.
-
-TOON output follows the tabular-array form in the official spec
-(https://github.com/toon-format/spec, `NAME[count]{fields}:` header, 2-space
-indented comma rows, quoting per SPEC.md \xa77.2/\xa77.1) rather than an
-ad hoc CSV-like guess.
+// claudia: regex-parsed, not clangd/LSP-backed — upgrade if src/ grows past ~100 files or agents need real go-to-definition.
+// claudia: seam check is first-order only (a file's own #include lines) — upgrade if a violation ever needs to hide behind an intermediate header.
 """
 import re
 import sys
@@ -44,8 +26,6 @@ CONTROL_RE = re.compile(r"[\x00-\x1f]")
 
 
 def skip_leading_boilerplate(text: str) -> str:
-    """Skip blank lines and a leading `#pragma once` so the doc comment
-    underneath (the common case in this codebase) is actually reached."""
     lines = text.splitlines()
     i = 0
     while i < len(lines) and (lines[i].strip() == "" or PRAGMA_ONCE_RE.match(lines[i])):
@@ -78,8 +58,6 @@ def extract_purpose(text: str) -> str:
                 break
             body_lines.append(lm.group(1))
 
-    # First paragraph only: skip leading blank decorated lines, stop at the
-    # first blank line once content has started.
     para = []
     started = False
     for raw in body_lines:
@@ -107,7 +85,6 @@ def extract_includes(text: str):
 
 
 def needs_quoting(field: str, delimiter: str = ",") -> bool:
-    """Per TOON SPEC.md \xa77.2."""
     if field == "":
         return True
     if field != field.strip(" \t"):
@@ -139,8 +116,6 @@ def toon_escape(field: str, delimiter: str = ",") -> str:
 
 
 def check_staleness():
-    """Hand-maintained docs (status.toon/commands.toon) can't be
-    regenerated — best we can do is warn when their source has moved on."""
     humans_md = REPO_ROOT / "humans.md"
     if not humans_md.exists():
         return

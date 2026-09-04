@@ -7,16 +7,6 @@
 
 namespace italy {
 
-// World-space AABB tightly bounding one splat's 3-sigma ellipsoid. Splats are
-// often strongly anisotropic (thin, flat disks), so this rotates the
-// per-axis 3-sigma half-extents by the splat's orientation rather than using
-// a sphere bound (which would be wasteful — one flat splat's bounding sphere
-// radius is set by its longest axis, ballooning the AABB on the other two).
-//
-// Standard rotated-box-to-AABB trick: world-space half-extent along axis i
-// is sum_j |R[i][j]| * localHalfExtent[j], where R is the rotation matrix.
-// Pure host-side math (no OptiX), so it's unit-testable without a GPU — see
-// tests/gsplat_ply_loader_test.cpp.
 inline std::pair<glm::vec3, glm::vec3> computeSplatAabb(const glm::vec3 &position,
                                                           const glm::vec3 &scale,
                                                           const glm::vec4 &rotationXYZW) {

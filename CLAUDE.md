@@ -36,13 +36,16 @@ Corollaries, so the ladder doesn't get misread:
 - **Artist controls are features, not cheats.** Exposure, look strength,
   aperture, focus, environment rotation, light size/colour: these serve (1)
   and need no physical justification beyond looking better.
-- **Mark every deliberate departure.** Any place physics was traded away on
-  purpose gets a comment:
-
-      // realism: <what was traded> — <why it looks better>
-
-  Greppable the same way the `claudia:` markers are (`grep -rn "realism:"
-  src/`). Unmarked non-physical behaviour is a bug, not a style choice.
+- **Mark every deliberate departure.** `src/` and `tests/` carry no
+  comments — not even `realism:`/`claudia:` markers (2026-09-02 convention
+  change; the code should read clearly enough not to need them, and the
+  record lives in one place instead of scattered across files). Any place
+  physics was traded away on purpose, or a minimalism-ladder rung was
+  deliberately skipped, gets one line in `humans.md`'s Status section
+  instead: `realism: <what was traded> — <why it looks better>` or
+  `claudia: <ceiling> — upgrade if <trigger>`. Greppable there
+  (`grep -n "^realism:\|^claudia:" humans.md`). Unrecorded non-physical
+  behaviour is a bug, not a style choice.
 - **When in doubt, render it both ways and look.** Verification in this
   repo is visual by design (`ITALY_DUMP_FRAME`, see `humans.md`). An
   argument from first principles loses to a side-by-side.
@@ -56,25 +59,31 @@ Read before touching `src/`:
 - There are exactly **two** sanctioned OptiX call sites:
   `src/render/` (the renderer) and `src/convert/sdf_baker.cpp` (a one-shot
   load-time bake that stands up its own short-lived context — see the
-  comment at the top of that file for why it isn't routed through the
-  renderer). Adding a third needs a reason in the same form. `io/` and
-  `app/` include neither `optix.h` nor `cuda_runtime.h`.
+  sdf_baker.cpp marker in humans.md's Status section for why it isn't
+  routed through the renderer). Adding a third needs a reason in the same
+  form. `io/` and `app/` include neither `optix.h` nor `cuda_runtime.h`.
 - A `src/rhi/` split with real per-backend interfaces is **deferred, not
   forgotten**: it happens the day a second backend (Metal) actually starts,
   and not before — there is nothing to abstract with one backend and one
-  call site. Marked in `optix_renderer.h`.
+  call site. Marked in humans.md's Status section (optix_renderer.h entry).
 - Build: `cmake -B build -G Ninja && cmake --build build`.
 
 ## Agent context docs (`docs/agent/`)
 
 Cold-start orientation without reading full prose:
 - `filemap.toon` — every `src/`/`tests/` file: path, one-line purpose (from
-  its header comment, where one exists), local `#include` edges.
-  Auto-regenerated on every build by the `agent_filemap` CMake target
-  (`scripts/gen_filemap.py`) — never hand-edit, never goes stale relative
-  to a built tree. Also flags any file outside `src/render/` and
-  `src/convert/sdf_baker.cpp` that includes `optix.h`/`cuda_runtime.h` (the
-  seam rule above) as a build-time error.
+  its header comment, where one exists — since the no-comments convention
+  above, that's usually blank; `humans.md` is the purpose source of truth
+  now), local `#include` edges. Regenerate anytime with
+  `python3 scripts/gen_filemap.py` from the repo root — pure Python over
+  `src/`/`tests/`, no CMake config or build needed, so it's cheap to rerun
+  mid-iteration for a fresh file map or a quick seam check without paying
+  for a full OptiX/CUDA build. The `agent_filemap` CMake target runs the
+  same script as an `ALL` build step so a built tree is never stale either
+  way — never hand-edit `filemap.toon` itself. Also flags any file outside
+  `src/render/` and `src/convert/sdf_baker.cpp` that includes
+  `optix.h`/`cuda_runtime.h` (the seam rule above): a nonzero exit
+  standalone, a build-time error under CMake.
 - `status.toon` / `commands.toon` — compact phase-status table and
   build/run/test/env-var command reference. Hand-maintained, not
   generated (source is `humans.md` prose, not code) — update these when

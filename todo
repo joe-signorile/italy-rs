@@ -1,0 +1,31 @@
+Config window changes:
+add super minimalist, simple descriptions for every property
+below is the new drawing order
+
+loader
+- resolution fields
+- model loader field
+- mode: mesh/sdf/gsplat
+- apply
+
+renderer
+- view: wireframe, solid, shaded, actual (current)
+- pause and play, add a stop button that flushes everything
+- tonemap: same as current
+- ground plane: expose a color selector, make it infinite
+- relevant render tuning fields depending on the mode we are in for mesh/sdf/gsplat
+
+exporter
+- get rid of the render to png buttons, samples and params
+- The first thing the export should be: just saving the current render to png or webp
+
+outliner
+- environment
+- lighting
+- camera
+
+
+
+
+
+set up hdr output, then dial the caustics in using cup.glb: we expect to see beautiful shapes within the caustics, not flatness

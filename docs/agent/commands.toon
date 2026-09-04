@@ -1,3 +1,6 @@
+filemap[1]{step,command}:
+  regenerate,"python3 scripts/gen_filemap.py — no build needed, safe to rerun mid-iteration; also runs as the agent_filemap CMake ALL target so a built tree is never stale either way"
+
 build[3]{step,command}:
   configure,"cmake -B build -G Ninja"
   build,"cmake --build build"
@@ -6,23 +9,25 @@ build[3]{step,command}:
 test[1]{step,command}:
   ctest,"ctest --test-dir build"
 
-run_flags[6]{flag,effect}:
-  "(no flags)","renders built-in test scene / assets/test.glb"
-  "path/to/asset.glb","render a GLB as textured triangles"
+run_flags[7]{flag,effect}:
+  "(no flags)","opens the Project window; pick a scene (Bring-up scene / Material probe / Glass cup) and click Bake to build it and hand off to Viewport+Settings"
+  "path/to/asset.glb","render a GLB — REJECTED unless it fits a box/sphere/cylinder prim (io/mesh_primitive_classify); organic content is meant for procedural SDF / gsplat now"
+  "--cup","layer a procedural CSG bowl (SDF) into whichever scene is built (also a UI checkbox) — the opaque ceramic bowl, distinct from the Glass cup registry scene"
   "path/to/asset.glb --voxel=64","voxelize mesh at 64 cells/longest-axis"
   "path/to/asset.glb --sdf=56","bake SDF at 56 cells/longest-axis (wins over --voxel if both given)"
   "--gsplat=path/to/scene.ply","render an imported 3D Gaussian Splat scene (distinct load source, not combined with GLB flags)"
   "path/to/asset.glb --env=overcast|midnight|noon|sky, or --hdri=path/to/custom.hdr","HDRI/procedural-sky lighting instead of the built-in quad light"
 
-env_hooks[8]{var,effect}:
-  ITALY_DUMP_FRAME,"=/path/to/out.png — write accumulated render to PNG after 128 subframes and exit (headless verification)"
+env_hooks[9]{var,effect}:
+  ITALY_DUMP_FRAME,"=/path/to/out.png — write accumulated render to PNG after 128 subframes and exit (headless verification); pre-arms the Project window's Bake so this works without a manual click"
+  ITALY_SCENE,"=<registry index, default 0> — which scene ITALY_DUMP_FRAME's pre-armed bake selects: 0 Bring-up, 1 Material probe, 2 Glass cup"
   ITALY_DUMP_AFTER_SUBFRAME,"=<n> — subframes to accumulate before ITALY_DUMP_FRAME writes"
   ITALY_FORCE_DENOISE,"=1 — force OptiX AI denoiser on"
   ITALY_TONEMAP,"=<agx|reinhard|aces|hable|clamp> — select tonemap operator"
   ITALY_FIREFLY_CLAMP,"=<value> — clamp bright outliers (0 disables)"
   ITALY_SKY_TURBIDITY,"seed procedural sky turbidity (see --env=sky)"
-  ITALY_SKY_ELEVATION,"seed procedural sky sun elevation"
-  ITALY_SKY_AZIMUTH,"seed procedural sky sun azimuth"
+  ITALY_SKY_ELEVATION,"seed procedural sky sun elevation (also aims the analytic sun disk)"
+  ITALY_SKY_AZIMUTH,"seed procedural sky sun azimuth (also aims the analytic sun disk)"
 
 hybrid_gpu_laptop[1]{note}:
   "Intel iGPU + NVIDIA dGPU (e.g. Iris Xe + RTX 4080 Laptop): GLX defaults to iGPU, breaks CUDA-GL interop. Prefix run with: __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia"
