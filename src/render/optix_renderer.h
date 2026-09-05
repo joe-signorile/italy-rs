@@ -26,6 +26,7 @@ struct RenderSettings {
   unsigned int samplesPerLaunch = 1;
   float exposure = 1.0f;
   bool denoise = false;
+  bool denoiseTemporal = true;
   TonemapOperator tonemap = TonemapOperator::AgX;
   float fireflyClamp = 10.0f;
 
@@ -34,6 +35,7 @@ struct RenderSettings {
   unsigned int maxConnectionsPerVertex = 8;
 
   bool reservoirNEE = false;
+  bool reservoirTemporal = true;
   unsigned int extraTestLightCount = 0;
 
   float aperture = 0.0f;
@@ -73,6 +75,7 @@ public:
   void render(const OrbitCamera &camera, const RenderSettings &settings = {});
 
   void resetAccumulation();
+  void notifyCameraMoved();
 
   unsigned int glTextureId() const { return glTexture_; }
   int width() const { return width_; }
@@ -91,6 +94,7 @@ private:
   int height_;
   unsigned int glTexture_ = 0;
   unsigned int subframeIndex_ = 0;
+  bool cameraMovedPending_ = false;
   glm::vec3 sceneBoundsCenter_{0.0f};
   float sceneBoundsRadius_ = 3.0f;
 };

@@ -130,9 +130,14 @@ samples-per-launch, the OptiX AI denoiser, and the tonemap operator (AgX
 default; Reinhard/ACES/Hable/Clamp are debugging aids for comparison).
 
 Scripted testing hooks for the toggles that are otherwise UI-only:
-`ITALY_FORCE_DENOISE=1`, `ITALY_TONEMAP=<agx|reinhard|aces|hable|clamp>`, and
-`ITALY_FIREFLY_CLAMP=<value>` (0 disables). `ITALY_DUMP_AFTER_SUBFRAME=<n>`
+`ITALY_FORCE_DENOISE=1`, `ITALY_DENOISE_TEMPORAL=<0|1>` (temporal AOV vs.
+plain HDR denoiser model, default 1), `ITALY_TONEMAP=<agx|reinhard|aces|hable|clamp>`,
+and `ITALY_FIREFLY_CLAMP=<value>` (0 disables). `ITALY_DUMP_AFTER_SUBFRAME=<n>`
 sets how many subframes accumulate before `ITALY_DUMP_FRAME` writes.
+`ITALY_SCRIPT_ORBIT_AFTER=<n>` nudges the camera once via `camera.orbit()`
+after subframe `n` is reached — headless equivalent of dragging the viewport
+mid-accumulation, for verifying reprojection/temporal-denoiser behavior
+across a camera move without a live window.
 `ITALY_SKY_TURBIDITY`/`ITALY_SKY_ELEVATION`/`ITALY_SKY_AZIMUTH` seed the
 procedural sky's params (see `--env=sky` above) the same way.
 
@@ -1454,3 +1459,98 @@ claudia: Phase 4 (DLSS Super-Resolution) — the one plausible fit
   Upgrade trigger: navigation empirically shown to be sluggish, and even
   then try a zero-dependency bilinear low-res preview first before
   reaching for DLSS-SR specifically.
+realism: Phase 5A (camera motion vectors) — reprojected-accumulation
+  disocclusion is decided by first-hit albedo/normal similarity
+  (dot(currentNormal, reprojectedNormal) > 0.9 and an albedo L2 distance
+  < 0.2), not by a real depth-and-normal G-buffer like production TAA
+  uses; there is no position/depth buffer yet to compare against.
+  Adequate given the scene only ever moves the camera in this phase; the
+  fast-follow upgrade is a real per-pixel depth buffer if ghosting shows
+  up once other Phase 5 motion sources (non-camera animation) land.
+claudia: src/render/kernels/pathtracer.cu, src/render/optix_renderer.{h,cpp}
+  — took the rotation-aware miss-case motion vector (projecting ray
+  direction through the previous frame's camera basis) rather than the
+  spec's allowed float2(0,0) fallback, since U/V/W are confirmed mutually
+  orthogonal (right/up/forward from glm::cross, independently scaled by
+  FOV/aspect) in optix_renderer.cpp's render(), which makes the orthogonal
+  per-axis projection exact rather than an approximation needing a 3x3
+  solve. No upgrade needed unless that orthogonality assumption changes
+  (e.g. a sheared/off-axis camera projection is added).
+claudia: src/render/optix_renderer.cpp — used `OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV`
+  rather than the deprecated `OPTIX_DENOISER_MODEL_KIND_TEMPORAL` the OptiX
+  9.1 header explicitly says to stop using (it's an alias that maps
+  internally to `TEMPORAL_AOV` anyway); non-temporal mode still uses `HDR`
+  unchanged, so `denoiseTemporal=false` reproduces exactly Phase 1's prior
+  behavior byte-for-byte. `OptixDenoiserBuilt`/`buildDenoiser()` now takes a
+  `temporal` flag and is re-invoked lazily from `render()` when
+  `RenderSettings::denoiseTemporal` no longer matches the live denoiser
+  (freeing and recreating the OptiX denoiser object plus its ping-ponged
+  `denoisedBuffer[2]`/`denoiserInternalGuideBuffer[2]`); a UI toggle
+  ("Temporal" checkbox next to "Denoiser") and `ITALY_DENOISE_TEMPORAL`
+  make it A/B-able against the old HDR path, matching the `reservoirNEE`
+  toggle precedent from Phase 3.
+claudia: src/render/kernels/pathtracer.cu, src/render/optix_renderer.{h,cpp}
+  — no explicit "first frame" flag for the temporal denoiser;
+  `OptixDenoiserParams::temporalModeUsePreviousLayers` is gated on
+  `subframeIndex_ != 0`, reusing the same "is this a fresh accumulation"
+  signal `resetAccumulation()` already resets for the path-tracer's own
+  reprojection history, rather than adding a second one. Verified visually
+  (`ITALY_DUMP_AFTER_SUBFRAME=1`): no ghosting/garbage on the first
+  denoised frame after a reset, with `previousOutputInternalGuideLayer`
+  zeroed at denoiser (re)build time — matches the OptiX SDK's own
+  `optixDenoiser` sample (`OptiXDenoiser.h`), which does the same
+  zero-and-let-the-model-self-correct thing rather than special-casing
+  frame 0's invoke.
+realism: src/render/kernels/pathtracer.cu — the NanoVDB medium branch's
+  sentinel motion vector (`float2(1e6, 1e6)`, meaning "no valid camera
+  reprojection for this volume-scatter pixel") is written verbatim into
+  `Params::motionVectorBuffer` for the existing reprojection consumer, but
+  clamped to `float2(0, 0)` in the new `Params::denoiserFlowBuffer` that
+  only the temporal denoiser reads — OptiX's flow image is a pixel-space
+  offset it samples directly, and 1e6 would push that sample far outside
+  the image rather than being recognized as a sentinel the way the
+  reprojection code's explicit `fabsf(mv) < 1e5f` check treats it. "No
+  motion" is a safe fallback for fog pixels since real per-voxel volume
+  motion vectors were already out of scope for Phase 5A.
+realism: src/render/kernels/pathtracer.cu, src/render/optix_renderer.{h,cpp}
+  — Phase 5C reopens Phase 3's original "no temporal reservoir reuse"
+  call (grep this file for the earlier `realism:`/`claudia:` RIS entries).
+  That decision was made before Phase 5A's motion-vector/disocclusion/
+  per-pixel-history infrastructure existed, and it no longer applies in
+  the same form: `Params::reservoirBuffer` is now ping-ponged exactly like
+  `accumBuffer[2]` (`Impl::reservoirBuffer[2]`, same `nextWriteIdx`/
+  `readIdx` plumbing through `render()`), and `buildAndStoreReservoir`
+  folds one more candidate into its per-pixel RIS combine: the previous
+  subframe's reservoir at the motion-vector-reprojected pixel (or the same
+  pixel, unreprojected, when the camera didn't move), gated by the same
+  disocclusion heuristic Phase 5A used for accumulation reprojection — now
+  extracted into a shared `isDisoccluded()` helper (normal-dot > 0.9 and
+  albedo L2 distance < 0.2) used by both `__raygen__rg`'s accumulation
+  reprojection and `buildAndStoreReservoir`'s temporal reservoir fetch,
+  rather than duplicating the check. Reservoir fetch itself is
+  nearest-neighbor, not bilinear: a `Reservoir`'s `sample`/`M`/`weightSum`/
+  `W` fields aren't independently interpolable the way radiance is, so
+  bilinear-blending two reservoirs would produce a meaningless hybrid
+  sample. The incoming temporal reservoir's `M` is capped at
+  `kReservoirTemporalMaxM = 30` (5x `kReservoirCandidates` = 6) before
+  combining — standard ReSTIR practice to bound how much "effective past
+  history" one reservoir can carry forward, which bounds the bias a stale
+  temporal sample can introduce. Verified: `ctest` 7/7 green;
+  `ITALY_DUMP_AFTER_SUBFRAME=128` on the single-quad-light bring-up scene
+  and the `ITALY_TEST_EXTRA_LIGHTS=3` many-light scene both converge to
+  the same image with `reservoirTemporal` on vs. off (mean-pixel abs diff
+  ~0.005-0.009/255 across all three channels — consistent with RNG noise,
+  not bias); a scripted `ITALY_SCRIPT_ORBIT_AFTER`/`ITALY_DUMP_AFTER_SUBFRAME`
+  camera move plus a `ITALY_LIGHT_SUBPATHS=0` low-subframe isolation test
+  confirmed the temporal path is live (~28% of pixels change vs. temporal
+  off at low sample counts) with no ghosting at disoccluded silhouette
+  edges; the intended "converges faster after a camera move" benefit was
+  not visually distinguishable from the noise floor in these test scenes,
+  because indirect-GI/VCM speckle dominates the image far more than
+  direct-light-selection noise at low sample counts — the same limitation
+  Phase 3's spatial-only reuse already had, not a regression. Gated behind
+  `RenderSettings::reservoirTemporal` (default true when `reservoirNEE` is
+  on — matching the `denoiseTemporal` precedent, since it's a
+  quality-neutral-or-better change with no cost when the camera is
+  static), `ITALY_RESERVOIR_TEMPORAL` env var, and a "Temporal" checkbox
+  next to "Reservoir NEE" in Settings.

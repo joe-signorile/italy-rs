@@ -564,6 +564,8 @@ int main(int argc, char **argv) {
   }
   if (std::getenv("ITALY_FORCE_DENOISE"))
     state.render.denoise = true;
+  if (const char *dt = std::getenv("ITALY_DENOISE_TEMPORAL"))
+    state.render.denoiseTemporal = std::atoi(dt) != 0;
   if (const char *fc = std::getenv("ITALY_FIREFLY_CLAMP"))
     state.render.fireflyClamp = static_cast<float>(std::atof(fc));
   if (const char *ls = std::getenv("ITALY_LIGHT_SUBPATHS"))
@@ -572,6 +574,8 @@ int main(int argc, char **argv) {
     state.render.maxConnectionsPerVertex = static_cast<unsigned int>(std::max(0, std::atoi(mc)));
   if (const char *rn = std::getenv("ITALY_RESERVOIR_NEE"))
     state.render.reservoirNEE = std::atoi(rn) != 0;
+  if (const char *rt = std::getenv("ITALY_RESERVOIR_TEMPORAL"))
+    state.render.reservoirTemporal = std::atoi(rt) != 0;
   if (const char *el = std::getenv("ITALY_TEST_EXTRA_LIGHTS"))
     state.render.extraTestLightCount = static_cast<unsigned int>(std::max(0, std::atoi(el)));
   if (std::getenv("ITALY_NO_GROUND"))
@@ -711,9 +715,17 @@ int main(int argc, char **argv) {
     if (ImGui::IsItemHovered())
       camera.zoom(ImGui::GetIO().MouseWheel);
 
+    if (const char *orbitAfter = std::getenv("ITALY_SCRIPT_ORBIT_AFTER")) {
+      static bool scriptedOrbitDone = false;
+      if (!scriptedOrbitDone && renderer->subframeIndex() >= static_cast<unsigned int>(std::atoi(orbitAfter))) {
+        camera.orbit(15.0f, 0.0f);
+        scriptedOrbitDone = true;
+      }
+    }
+
     if (state.isSampling) {
       if (cameraChanged(camera, prevCamera)) {
-        renderer->resetAccumulation();
+        renderer->notifyCameraMoved();
         prevCamera = camera;
       }
       renderer->render(camera, state.render);
@@ -867,6 +879,11 @@ int main(int argc, char **argv) {
     if (ImGui::InputInt("Samples/launch", &spl))
       state.render.samplesPerLaunch = static_cast<unsigned int>(std::max(spl, 1));
     ImGui::Checkbox("Denoiser", &state.render.denoise);
+    if (state.render.denoise) {
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Temporal", &state.render.denoiseTemporal))
+        renderer->resetAccumulation();
+    }
 
     if (ImGui::InputFloat("Firefly clamp (0 = off)", &state.render.fireflyClamp)) {
       state.render.fireflyClamp = std::max(state.render.fireflyClamp, 0.0f);
@@ -884,6 +901,11 @@ int main(int argc, char **argv) {
 
     if (ImGui::Checkbox("Reservoir NEE (spatial RIS)", &state.render.reservoirNEE))
       renderer->resetAccumulation();
+    if (state.render.reservoirNEE) {
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Temporal", &state.render.reservoirTemporal))
+        renderer->resetAccumulation();
+    }
     int extraLights = static_cast<int>(state.render.extraTestLightCount);
     if (ImGui::InputInt("Extra test lights (RIS verification)", &extraLights)) {
       state.render.extraTestLightCount = static_cast<unsigned int>(std::clamp(extraLights, 0, 3));

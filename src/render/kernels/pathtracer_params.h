@@ -114,6 +114,13 @@ struct Params {
   float sceneBoundsRadius;
 
   float3 eye, U, V, W;
+  float3 prevEye, prevU, prevV, prevW;
+  float2 *motionVectorBuffer;
+  float2 *denoiserFlowBuffer;
+  float4 *prevAccumBuffer;
+  float4 *prevAccumAlbedoBuffer;
+  float4 *prevAccumNormalBuffer;
+  unsigned int cameraMoved;
 
   float aperture;
   float focusDistance;
@@ -126,8 +133,10 @@ struct Params {
   OptixTraversableHandle handle;
 
   unsigned int reservoirNEE;
+  unsigned int reservoirTemporal;
   unsigned int reservoirBuildPass;
   Reservoir *reservoirBuffer;
+  Reservoir *prevReservoirBuffer;
 
   cudaTextureObject_t envTex;
   float *envMarginalCdf;

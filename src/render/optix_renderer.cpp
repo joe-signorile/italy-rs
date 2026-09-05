@@ -105,7 +105,11 @@ struct OptixRenderer::Impl {
   size_t denoiserStateSize = 0;
   CUdeviceptr denoiserScratchBuffer = 0;
   size_t denoiserScratchSize = 0;
-  CUdeviceptr denoisedBuffer = 0;
+  CUdeviceptr denoisedBuffer[2] = {0, 0};
+  CUdeviceptr denoiserInternalGuideBuffer[2] = {0, 0};
+  size_t denoiserInternalGuideLayerPixelSizeInBytes = 0;
+  bool denoiserTemporalActive = false;
+  bool denoiserBuilt = false;
 
   OptixPipeline pipeline = nullptr;
 
@@ -116,10 +120,18 @@ struct OptixRenderer::Impl {
   OptixShaderBindingTable sbt{};
 
   CUstream stream = nullptr;
-  CUdeviceptr accumBuffer = 0;
-  CUdeviceptr accumAlbedoBuffer = 0;
-  CUdeviceptr accumNormalBuffer = 0;
-  CUdeviceptr reservoirBuffer = 0;
+  CUdeviceptr accumBuffer[2] = {0, 0};
+  CUdeviceptr accumAlbedoBuffer[2] = {0, 0};
+  CUdeviceptr accumNormalBuffer[2] = {0, 0};
+  CUdeviceptr motionVectorBuffer = 0;
+  CUdeviceptr denoiserFlowBuffer = 0;
+  int nextWriteIdx = 0;
+  bool hasPrevCamera = false;
+  float3 prevEyeUsed{};
+  float3 prevUUsed{};
+  float3 prevVUsed{};
+  float3 prevWUsed{};
+  CUdeviceptr reservoirBuffer[2] = {0, 0};
   CUdeviceptr paramsBuffer = 0;
 
   unsigned int pbo = 0;
@@ -269,24 +281,25 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(causticAabbSbt.raygenRecord));
     if (causticAabbSbt.missRecordBase)
       cudaFree(reinterpret_cast<void *>(causticAabbSbt.missRecordBase));
-    if (denoisedBuffer)
-      cudaFree(reinterpret_cast<void *>(denoisedBuffer));
-    if (denoiserStateBuffer)
-      cudaFree(reinterpret_cast<void *>(denoiserStateBuffer));
-    if (denoiserScratchBuffer)
-      cudaFree(reinterpret_cast<void *>(denoiserScratchBuffer));
-    if (denoiser)
-      optixDenoiserDestroy(denoiser);
+    freeDenoiser();
     if (paramsBuffer)
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
-    if (accumBuffer)
-      cudaFree(reinterpret_cast<void *>(accumBuffer));
-    if (accumAlbedoBuffer)
-      cudaFree(reinterpret_cast<void *>(accumAlbedoBuffer));
-    if (accumNormalBuffer)
-      cudaFree(reinterpret_cast<void *>(accumNormalBuffer));
-    if (reservoirBuffer)
-      cudaFree(reinterpret_cast<void *>(reservoirBuffer));
+    for (int i = 0; i < 2; ++i) {
+      if (accumBuffer[i])
+        cudaFree(reinterpret_cast<void *>(accumBuffer[i]));
+      if (accumAlbedoBuffer[i])
+        cudaFree(reinterpret_cast<void *>(accumAlbedoBuffer[i]));
+      if (accumNormalBuffer[i])
+        cudaFree(reinterpret_cast<void *>(accumNormalBuffer[i]));
+    }
+    if (motionVectorBuffer)
+      cudaFree(reinterpret_cast<void *>(motionVectorBuffer));
+    if (denoiserFlowBuffer)
+      cudaFree(reinterpret_cast<void *>(denoiserFlowBuffer));
+    for (int i = 0; i < 2; ++i) {
+      if (reservoirBuffer[i])
+        cudaFree(reinterpret_cast<void *>(reservoirBuffer[i]));
+    }
     if (sbt.raygenRecord)
       cudaFree(reinterpret_cast<void *>(sbt.raygenRecord));
     if (sbt.missRecordBase)
@@ -1461,25 +1474,66 @@ struct OptixRenderer::Impl {
     reservoirBuildSbt.hitgroupRecordCount = sbt.hitgroupRecordCount;
   }
 
-  void buildDenoiser(int width, int height) {
+  void freeDenoiser() {
+    for (int i = 0; i < 2; ++i) {
+      if (denoisedBuffer[i])
+        cudaFree(reinterpret_cast<void *>(denoisedBuffer[i]));
+      denoisedBuffer[i] = 0;
+      if (denoiserInternalGuideBuffer[i])
+        cudaFree(reinterpret_cast<void *>(denoiserInternalGuideBuffer[i]));
+      denoiserInternalGuideBuffer[i] = 0;
+    }
+    if (denoiserStateBuffer)
+      cudaFree(reinterpret_cast<void *>(denoiserStateBuffer));
+    denoiserStateBuffer = 0;
+    if (denoiserScratchBuffer)
+      cudaFree(reinterpret_cast<void *>(denoiserScratchBuffer));
+    denoiserScratchBuffer = 0;
+    if (denoiser)
+      optixDenoiserDestroy(denoiser);
+    denoiser = nullptr;
+    denoiserBuilt = false;
+  }
+
+  void buildDenoiser(int width, int height, bool temporal) {
+    if (denoiserBuilt)
+      freeDenoiser();
+
     OptixDenoiserOptions options{};
     options.guideAlbedo = 1;
     options.guideNormal = 1;
-    OPTIX_CHECK(optixDenoiserCreate(context, OPTIX_DENOISER_MODEL_KIND_HDR, &options, &denoiser));
+    OPTIX_CHECK(optixDenoiserCreate(
+        context, temporal ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV : OPTIX_DENOISER_MODEL_KIND_HDR, &options,
+        &denoiser));
+    denoiserTemporalActive = temporal;
 
     OptixDenoiserSizes sizes{};
     OPTIX_CHECK(optixDenoiserComputeMemoryResources(denoiser, static_cast<unsigned int>(width),
                                                      static_cast<unsigned int>(height), &sizes));
     denoiserStateSize = sizes.stateSizeInBytes;
     denoiserScratchSize = sizes.withoutOverlapScratchSizeInBytes;
+    denoiserInternalGuideLayerPixelSizeInBytes = sizes.internalGuideLayerPixelSizeInBytes;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoiserStateBuffer), denoiserStateSize));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoiserScratchBuffer), denoiserScratchSize));
     OPTIX_CHECK(optixDenoiserSetup(denoiser, stream, static_cast<unsigned int>(width),
                                     static_cast<unsigned int>(height), denoiserStateBuffer, denoiserStateSize,
                                     denoiserScratchBuffer, denoiserScratchSize));
 
-    CUDA_CHECK(
-        cudaMalloc(reinterpret_cast<void **>(&denoisedBuffer), static_cast<size_t>(width) * height * sizeof(float4)));
+    for (int i = 0; i < 2; ++i)
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoisedBuffer[i]),
+                             static_cast<size_t>(width) * height * sizeof(float4)));
+
+    if (temporal && sizes.internalGuideLayerPixelSizeInBytes > 0) {
+      const size_t internalBytes =
+          static_cast<size_t>(width) * height * sizes.internalGuideLayerPixelSizeInBytes;
+      for (int i = 0; i < 2; ++i) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoiserInternalGuideBuffer[i]), internalBytes));
+        CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void *>(denoiserInternalGuideBuffer[i]), 0, internalBytes,
+                                    stream));
+      }
+    }
+
+    denoiserBuilt = true;
   }
 
   void buildCausticAabbSbt() {
@@ -1526,14 +1580,22 @@ struct OptixRenderer::Impl {
     gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cudaPbo, pbo, cudaGraphicsRegisterFlagsWriteDiscard));
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumBuffer),
-                           static_cast<size_t>(width) * height * sizeof(float4)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumAlbedoBuffer),
-                           static_cast<size_t>(width) * height * sizeof(float4)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumNormalBuffer),
-                           static_cast<size_t>(width) * height * sizeof(float4)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&reservoirBuffer),
-                           static_cast<size_t>(width) * height * sizeof(Reservoir)));
+    for (int i = 0; i < 2; ++i) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumBuffer[i]),
+                             static_cast<size_t>(width) * height * sizeof(float4)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumAlbedoBuffer[i]),
+                             static_cast<size_t>(width) * height * sizeof(float4)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumNormalBuffer[i]),
+                             static_cast<size_t>(width) * height * sizeof(float4)));
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&motionVectorBuffer),
+                           static_cast<size_t>(width) * height * sizeof(float2)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&denoiserFlowBuffer),
+                           static_cast<size_t>(width) * height * sizeof(float2)));
+    for (int i = 0; i < 2; ++i) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&reservoirBuffer[i]),
+                             static_cast<size_t>(width) * height * sizeof(Reservoir)));
+    }
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&paramsBuffer), sizeof(Params)));
   }
 };
@@ -1550,7 +1612,7 @@ OptixRenderer::OptixRenderer(int width, int height, const SceneSource &source)
   impl_->buildTonemapSbt();
   impl_->buildCausticAabbSbt();
   impl_->initGLInterop(width, height);
-  impl_->buildDenoiser(width, height);
+  impl_->buildDenoiser(width, height, true);
 
   sceneBoundsCenter_ = impl_->boundsCenter;
   sceneBoundsRadius_ = impl_->boundsRadius;
@@ -1569,14 +1631,20 @@ OptixRenderer::~OptixRenderer() {
   delete impl_;
 }
 
-void OptixRenderer::resetAccumulation() { subframeIndex_ = 0; }
+void OptixRenderer::resetAccumulation() {
+  subframeIndex_ = 0;
+  cameraMovedPending_ = false;
+}
+
+void OptixRenderer::notifyCameraMoved() { cameraMovedPending_ = true; }
 
 bool OptixRenderer::readAccumulationRgb(std::vector<float> &rgb) const {
-  if (!impl_->accumBuffer || subframeIndex_ == 0)
+  const CUdeviceptr lastWritten = impl_->accumBuffer[1 - impl_->nextWriteIdx];
+  if (!lastWritten || subframeIndex_ == 0)
     return false;
   const size_t count = static_cast<size_t>(width_) * static_cast<size_t>(height_);
   std::vector<float4> host(count);
-  CUDA_CHECK(cudaMemcpy(host.data(), reinterpret_cast<const void *>(impl_->accumBuffer), count * sizeof(float4),
+  CUDA_CHECK(cudaMemcpy(host.data(), reinterpret_cast<const void *>(lastWritten), count * sizeof(float4),
                         cudaMemcpyDeviceToHost));
   rgb.resize(count * 3);
   for (size_t i = 0; i < count; ++i) {
@@ -1597,11 +1665,20 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   const float aspect = static_cast<float>(width_) / static_cast<float>(height_);
   const float tanHalfFov = std::tan(camera.fovYRadians * 0.5f);
 
+  const int writeIdx = impl_->nextWriteIdx;
+  const int readIdx = 1 - writeIdx;
+
   Params params{};
   params.subframeIndex = subframeIndex_;
-  params.accumBuffer = reinterpret_cast<float4 *>(impl_->accumBuffer);
-  params.accumAlbedoBuffer = reinterpret_cast<float4 *>(impl_->accumAlbedoBuffer);
-  params.accumNormalBuffer = reinterpret_cast<float4 *>(impl_->accumNormalBuffer);
+  params.accumBuffer = reinterpret_cast<float4 *>(impl_->accumBuffer[writeIdx]);
+  params.accumAlbedoBuffer = reinterpret_cast<float4 *>(impl_->accumAlbedoBuffer[writeIdx]);
+  params.accumNormalBuffer = reinterpret_cast<float4 *>(impl_->accumNormalBuffer[writeIdx]);
+  params.prevAccumBuffer = reinterpret_cast<float4 *>(impl_->accumBuffer[readIdx]);
+  params.prevAccumAlbedoBuffer = reinterpret_cast<float4 *>(impl_->accumAlbedoBuffer[readIdx]);
+  params.prevAccumNormalBuffer = reinterpret_cast<float4 *>(impl_->accumNormalBuffer[readIdx]);
+  params.motionVectorBuffer = reinterpret_cast<float2 *>(impl_->motionVectorBuffer);
+  params.denoiserFlowBuffer = reinterpret_cast<float2 *>(impl_->denoiserFlowBuffer);
+  params.cameraMoved = cameraMovedPending_ ? 1u : 0u;
   params.width = static_cast<unsigned int>(width_);
   params.height = static_cast<unsigned int>(height_);
   params.samplesPerLaunch = settings.samplesPerLaunch;
@@ -1638,6 +1715,17 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   params.U = toFloat3(right * tanHalfFov * aspect);
   params.V = toFloat3(up * tanHalfFov);
   params.W = toFloat3(forward);
+  if (!impl_->hasPrevCamera) {
+    impl_->prevEyeUsed = params.eye;
+    impl_->prevUUsed = params.U;
+    impl_->prevVUsed = params.V;
+    impl_->prevWUsed = params.W;
+    impl_->hasPrevCamera = true;
+  }
+  params.prevEye = impl_->prevEyeUsed;
+  params.prevU = impl_->prevUUsed;
+  params.prevV = impl_->prevVUsed;
+  params.prevW = impl_->prevWUsed;
   params.light = impl_->light;
   params.extraLightCount = 0;
   if (settings.extraTestLightCount > 0 && !impl_->hasEnvironment) {
@@ -1656,7 +1744,9 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   }
   params.handle = impl_->iasHandle;
   params.reservoirNEE = settings.reservoirNEE ? 1u : 0u;
-  params.reservoirBuffer = reinterpret_cast<Reservoir *>(impl_->reservoirBuffer);
+  params.reservoirTemporal = settings.reservoirTemporal ? 1u : 0u;
+  params.reservoirBuffer = reinterpret_cast<Reservoir *>(impl_->reservoirBuffer[writeIdx]);
+  params.prevReservoirBuffer = reinterpret_cast<Reservoir *>(impl_->reservoirBuffer[readIdx]);
   if (impl_->hasEnvironment) {
     params.envTex = impl_->envTexObj;
     params.envMarginalCdf = reinterpret_cast<float *>(impl_->envMarginalCdfBuffer);
@@ -1700,7 +1790,9 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&devicePtr, &mappedSize, impl_->cudaPbo));
   params.frameBuffer = reinterpret_cast<uchar4 *>(devicePtr);
   params.denoiserEnabled = settings.denoise ? 1u : 0u;
-  params.denoisedBuffer = reinterpret_cast<float4 *>(impl_->denoisedBuffer);
+  if (settings.denoise && impl_->denoiserTemporalActive != settings.denoiseTemporal)
+    impl_->buildDenoiser(width_, height_, settings.denoiseTemporal);
+  params.denoisedBuffer = reinterpret_cast<float4 *>(impl_->denoisedBuffer[writeIdx]);
 
   CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
                              cudaMemcpyHostToDevice, impl_->stream));
@@ -1708,7 +1800,10 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
                            height_, 1));
 
   if (settings.denoise) {
+    const bool temporal = impl_->denoiserTemporalActive;
+
     OptixDenoiserParams denoiserParams{};
+    denoiserParams.temporalModeUsePreviousLayers = (temporal && subframeIndex_ != 0) ? 1u : 0u;
 
     OptixImage2D img{};
     img.width = static_cast<unsigned int>(width_);
@@ -1718,22 +1813,53 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
     img.format = OPTIX_PIXEL_FORMAT_FLOAT4;
 
     OptixImage2D inputImg = img;
-    inputImg.data = impl_->accumBuffer;
+    inputImg.data = impl_->accumBuffer[writeIdx];
     OptixImage2D outputImg = img;
-    outputImg.data = impl_->denoisedBuffer;
+    outputImg.data = impl_->denoisedBuffer[writeIdx];
 
     OptixDenoiserLayer layer{};
     layer.input = inputImg;
     layer.output = outputImg;
+    layer.type = OPTIX_DENOISER_AOV_TYPE_BEAUTY;
+    if (temporal) {
+      OptixImage2D prevOutputImg = img;
+      prevOutputImg.data = impl_->denoisedBuffer[readIdx];
+      layer.previousOutput = prevOutputImg;
+    }
 
     OptixImage2D albedoImg = img;
-    albedoImg.data = impl_->accumAlbedoBuffer;
+    albedoImg.data = impl_->accumAlbedoBuffer[writeIdx];
     OptixImage2D normalImg = img;
-    normalImg.data = impl_->accumNormalBuffer;
+    normalImg.data = impl_->accumNormalBuffer[writeIdx];
 
     OptixDenoiserGuideLayer guideLayer{};
     guideLayer.albedo = albedoImg;
     guideLayer.normal = normalImg;
+
+    if (temporal) {
+      OptixImage2D flowImg{};
+      flowImg.data = impl_->denoiserFlowBuffer;
+      flowImg.width = static_cast<unsigned int>(width_);
+      flowImg.height = static_cast<unsigned int>(height_);
+      flowImg.rowStrideInBytes = static_cast<unsigned int>(width_) * sizeof(float2);
+      flowImg.pixelStrideInBytes = sizeof(float2);
+      flowImg.format = OPTIX_PIXEL_FORMAT_FLOAT2;
+      guideLayer.flow = flowImg;
+
+      OptixImage2D prevInternalImg{};
+      prevInternalImg.data = impl_->denoiserInternalGuideBuffer[readIdx];
+      prevInternalImg.width = static_cast<unsigned int>(width_);
+      prevInternalImg.height = static_cast<unsigned int>(height_);
+      prevInternalImg.pixelStrideInBytes =
+          static_cast<unsigned int>(impl_->denoiserInternalGuideLayerPixelSizeInBytes);
+      prevInternalImg.rowStrideInBytes = prevInternalImg.pixelStrideInBytes * prevInternalImg.width;
+      prevInternalImg.format = OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER;
+      guideLayer.previousOutputInternalGuideLayer = prevInternalImg;
+
+      OptixImage2D outInternalImg = prevInternalImg;
+      outInternalImg.data = impl_->denoiserInternalGuideBuffer[writeIdx];
+      guideLayer.outputInternalGuideLayer = outInternalImg;
+    }
 
     OPTIX_CHECK(optixDenoiserInvoke(impl_->denoiser, impl_->stream, &denoiserParams, impl_->denoiserStateBuffer,
                                      impl_->denoiserStateSize, &guideLayer, &layer, 1, 0, 0,
@@ -1752,6 +1878,13 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width_, height_, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
   glBindTexture(GL_TEXTURE_2D, 0);
   gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+  impl_->prevEyeUsed = params.eye;
+  impl_->prevUUsed = params.U;
+  impl_->prevVUsed = params.V;
+  impl_->prevWUsed = params.W;
+  impl_->nextWriteIdx = readIdx;
+  cameraMovedPending_ = false;
 
   ++subframeIndex_;
 }

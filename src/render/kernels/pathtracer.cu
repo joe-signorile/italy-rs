@@ -293,6 +293,56 @@ static __forceinline__ __device__ void trace(OptixTraversableHandle handle, floa
   prd.normal = make_float3(__uint_as_float(p[22]), __uint_as_float(p[23]), __uint_as_float(p[24]));
 }
 
+static __forceinline__ __device__ float2 projectToPrevFrame(float3 vecFromPrevEye) {
+  const float wComp = dot(vecFromPrevEye, params.prevW);
+  const float wSq = dot(params.prevW, params.prevW);
+  if (wComp <= 1e-6f || wSq <= 1e-12f)
+    return make_float2(1e6f, 1e6f);
+  const float scale = wSq / wComp;
+  const float3 v = vecFromPrevEye * scale;
+  const float3 vMinusW = v - params.prevW;
+  const float uSq = fmaxf(dot(params.prevU, params.prevU), 1e-12f);
+  const float vSq = fmaxf(dot(params.prevV, params.prevV), 1e-12f);
+  const float dx = dot(vMinusW, params.prevU) / uSq;
+  const float dy = dot(vMinusW, params.prevV) / vSq;
+  const float px = (dx + 1.0f) * 0.5f * static_cast<float>(params.width) - 0.5f;
+  const float py = (dy + 1.0f) * 0.5f * static_cast<float>(params.height) - 0.5f;
+  return make_float2(px, py);
+}
+
+static __forceinline__ __device__ void writeMotionVector(const uint3 &idx, float3 vecFromPrevEye) {
+  const float2 prevPixel = projectToPrevFrame(vecFromPrevEye);
+  const unsigned int pixel = idx.y * params.width + idx.x;
+  if (prevPixel.x > 1e5f || prevPixel.y > 1e5f) {
+    params.motionVectorBuffer[pixel] = make_float2(1e6f, 1e6f);
+    params.denoiserFlowBuffer[pixel] = make_float2(0.0f, 0.0f);
+  } else {
+    const float2 mv = make_float2(static_cast<float>(idx.x) - prevPixel.x, static_cast<float>(idx.y) - prevPixel.y);
+    params.motionVectorBuffer[pixel] = mv;
+    params.denoiserFlowBuffer[pixel] = mv;
+  }
+}
+
+static __forceinline__ __device__ float4 sampleBuffer2D(const float4 *buf, unsigned int w, unsigned int h,
+                                                          float2 p) {
+  const int x0 = max(0, min(static_cast<int>(w) - 2, static_cast<int>(floorf(p.x))));
+  const int y0 = max(0, min(static_cast<int>(h) - 2, static_cast<int>(floorf(p.y))));
+  const float fx = fminf(fmaxf(p.x - x0, 0.0f), 1.0f);
+  const float fy = fminf(fmaxf(p.y - y0, 0.0f), 1.0f);
+  const float4 c00 = buf[y0 * w + x0];
+  const float4 c10 = buf[y0 * w + x0 + 1];
+  const float4 c01 = buf[(y0 + 1) * w + x0];
+  const float4 c11 = buf[(y0 + 1) * w + x0 + 1];
+  return bilerp(c00, c10, c01, c11, fx, fy);
+}
+
+static __forceinline__ __device__ bool isDisoccluded(float3 currentAlbedo, float3 currentNormal,
+                                                        float3 reprojAlbedo, float3 reprojNormal) {
+  const float normalDot = dot(normalize(currentNormal), normalize(reprojNormal));
+  const float albedoDiff = length(currentAlbedo - reprojAlbedo);
+  return !(normalDot > 0.9f && albedoDiff < 0.2f);
+}
+
 static __forceinline__ __device__ float surfaceEpsilon(const float3 &p) {
   return 1e-3f + 1e-6f * fmaxf(fmaxf(fabsf(p.x), fabsf(p.y)), fabsf(p.z));
 }
@@ -401,12 +451,37 @@ extern "C" __global__ void __raygen__rg() {
 
   const unsigned int pixel = idx.y * w + idx.x;
   float3 accum = result / static_cast<float>(spl);
+
+  float oldHistory = 0.0f;
+  float3 prevColorForBlend = accum;
   if (subframe > 0) {
-    const float a = 1.0f / static_cast<float>(subframe + 1);
-    const float3 prevColor = make_float3(params.accumBuffer[pixel]);
-    accum = lerp(prevColor, accum, a);
+    if (params.cameraMoved) {
+      const float2 mv = params.motionVectorBuffer[pixel];
+      if (fabsf(mv.x) < 1e5f && fabsf(mv.y) < 1e5f) {
+        const float2 prevPixel =
+            make_float2(static_cast<float>(idx.x), static_cast<float>(idx.y)) - mv;
+        if (prevPixel.x >= 0.0f && prevPixel.x <= static_cast<float>(w - 1) && prevPixel.y >= 0.0f &&
+            prevPixel.y <= static_cast<float>(h - 1)) {
+          const float4 reprojColor = sampleBuffer2D(params.prevAccumBuffer, w, h, prevPixel);
+          const float3 reprojAlbedo = make_float3(sampleBuffer2D(params.prevAccumAlbedoBuffer, w, h, prevPixel));
+          const float3 reprojNormal = make_float3(sampleBuffer2D(params.prevAccumNormalBuffer, w, h, prevPixel));
+          if (!isDisoccluded(firstHitAlbedo, firstHitNormal, reprojAlbedo, reprojNormal)) {
+            oldHistory = reprojColor.w;
+            prevColorForBlend = make_float3(reprojColor);
+          }
+        }
+      }
+    } else {
+      const float4 prevSelf = params.prevAccumBuffer[pixel];
+      oldHistory = prevSelf.w;
+      prevColorForBlend = make_float3(prevSelf);
+    }
   }
-  params.accumBuffer[pixel] = make_float4(accum, 1.0f);
+  oldHistory = fminf(oldHistory, 127.0f);
+  const float a = 1.0f / (oldHistory + 1.0f);
+  accum = lerp(prevColorForBlend, accum, a);
+
+  params.accumBuffer[pixel] = make_float4(accum, oldHistory + 1.0f);
   params.accumAlbedoBuffer[pixel] = make_float4(firstHitAlbedo, 1.0f);
   params.accumNormalBuffer[pixel] = make_float4(firstHitNormal, 0.0f);
   if (!params.denoiserEnabled)
@@ -501,6 +576,7 @@ extern "C" __global__ void __miss__radiance() {
     optixSetPayload_22(__float_as_uint(-dir.x));
     optixSetPayload_23(__float_as_uint(-dir.y));
     optixSetPayload_24(__float_as_uint(-dir.z));
+    writeMotionVector(optixGetLaunchIndex(), dir);
   }
 }
 
@@ -1118,6 +1194,7 @@ static __forceinline__ __device__ float3 mediumTransmittance(float3 rayO, float3
 static constexpr int kReservoirCandidates = 6;
 static constexpr int kReservoirSpatialNeighbors = 4;
 static constexpr int kReservoirSpatialRadius = 4;
+static constexpr float kReservoirTemporalMaxM = 30.0f;
 
 static __forceinline__ __device__ void pickQuadLightUniform(unsigned int &seed, float3 &pos, float3 &normal,
                                                               float3 &emission, float &pdfArea) {
@@ -1244,7 +1321,7 @@ static __forceinline__ __device__ bool lightSampleTargetAndMixedPdf(const LightS
   return true;
 }
 
-static __forceinline__ __device__ void buildAndStoreReservoir(float3 P, float3 N, float3 V,
+static __forceinline__ __device__ void buildAndStoreReservoir(float3 P, float3 N, float3 V, float3 albedo,
                                                                 const ShadingMaterial &shading, unsigned int &seed) {
   Reservoir r;
   initReservoir(r);
@@ -1256,6 +1333,38 @@ static __forceinline__ __device__ void buildAndStoreReservoir(float3 P, float3 N
     const float w = mixedPdf > 1e-8f ? targetPdf / mixedPdf : 0.0f;
     updateReservoir(r, ls, w, sutil::rnd(seed));
   }
+
+  if (params.reservoirTemporal) {
+    const uint3 idxT = optixGetLaunchIndex();
+    unsigned int prevIdx = idxT.y * params.width + idxT.x;
+    bool valid = true;
+    if (params.cameraMoved) {
+      valid = false;
+      const float2 prevPixel = projectToPrevFrame(P - params.prevEye);
+      if (prevPixel.x >= 0.0f && prevPixel.x <= static_cast<float>(params.width - 1) && prevPixel.y >= 0.0f &&
+          prevPixel.y <= static_cast<float>(params.height - 1)) {
+        const float3 reprojAlbedo =
+            make_float3(sampleBuffer2D(params.prevAccumAlbedoBuffer, params.width, params.height, prevPixel));
+        const float3 reprojNormal =
+            make_float3(sampleBuffer2D(params.prevAccumNormalBuffer, params.width, params.height, prevPixel));
+        if (!isDisoccluded(albedo, N, reprojAlbedo, reprojNormal)) {
+          const int px = min(max(static_cast<int>(roundf(prevPixel.x)), 0), static_cast<int>(params.width) - 1);
+          const int py = min(max(static_cast<int>(roundf(prevPixel.y)), 0), static_cast<int>(params.height) - 1);
+          prevIdx = static_cast<unsigned int>(py) * params.width + static_cast<unsigned int>(px);
+          valid = true;
+        }
+      }
+    }
+    if (valid) {
+      Reservoir prevR = params.prevReservoirBuffer[prevIdx];
+      prevR.M = fminf(prevR.M, kReservoirTemporalMaxM);
+      if (prevR.M > 0.0f) {
+        const float prevTargetAtSelf = lightSampleTargetPdf(prevR.sample, P, N, V, shading);
+        combineReservoirs(r, prevR, prevTargetAtSelf, sutil::rnd(seed));
+      }
+    }
+  }
+
   const float finalTarget = lightSampleTargetPdf(r.sample, P, N, V, shading);
   r.W = (r.weightSum > 0.0f && finalTarget > 0.0f) ? r.weightSum / (r.M * finalTarget) : 0.0f;
   const uint3 idx = optixGetLaunchIndex();
@@ -1394,6 +1503,9 @@ extern "C" __global__ void __closesthit__radiance() {
       optixSetPayload_22(__float_as_uint(-rayDir.x));
       optixSetPayload_23(__float_as_uint(-rayDir.y));
       optixSetPayload_24(__float_as_uint(-rayDir.z));
+      const uint3 idx = optixGetLaunchIndex();
+      params.motionVectorBuffer[idx.y * params.width + idx.x] = make_float2(1e6f, 1e6f);
+      params.denoiserFlowBuffer[idx.y * params.width + idx.x] = make_float2(0.0f, 0.0f);
     }
     return;
   }
@@ -1554,7 +1666,7 @@ extern "C" __global__ void __closesthit__radiance() {
 
     if (params.reservoirBuildPass) {
       if (params.reservoirNEE)
-        buildAndStoreReservoir(P, N, V, shading, seed);
+        buildAndStoreReservoir(P, N, V, albedo, shading, seed);
       done = 1;
     } else {
     const bool useReservoir = params.reservoirNEE && depth == 0;
@@ -1800,6 +1912,7 @@ extern "C" __global__ void __closesthit__radiance() {
     optixSetPayload_22(__float_as_uint(N.x));
     optixSetPayload_23(__float_as_uint(N.y));
     optixSetPayload_24(__float_as_uint(N.z));
+    writeMotionVector(optixGetLaunchIndex(), P - params.prevEye);
   }
 }
 
