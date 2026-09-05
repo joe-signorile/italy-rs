@@ -136,6 +136,23 @@ sets how many subframes accumulate before `ITALY_DUMP_FRAME` writes.
 `ITALY_SKY_TURBIDITY`/`ITALY_SKY_ELEVATION`/`ITALY_SKY_AZIMUTH` seed the
 procedural sky's params (see `--env=sky` above) the same way.
 
+To composite a procedural NanoVDB fog volume onto whatever scene the other
+flags select (a real absorbing/scattering participating medium, not a
+billboard — Woodcock delta-tracking with multi-scatter and Henyey-Greenstein
+phase, see `src/io/nvdb_loader.h` and the `MATERIAL_NVDB` branch in
+`pathtracer.cu`):
+
+```
+./build/italy-rs --fog --env=sky
+```
+
+Radius, voxel size, extinction (`sigma_t`), single-scatter albedo, phase
+asymmetry (`g`), and a density multiplier are live ImGui sliders under
+Settings once the window is open (each edit re-bakes the grid and
+reconstructs the renderer — this is scene geometry, not a `RenderSettings`
+field). Scripted A/B verification: `ITALY_NVDB_SIGMA_T=<value>` (0 ~=
+no volume), `ITALY_NVDB_DENSITY_SCALE=<value>`, `ITALY_NVDB_G=<-0.95..0.95>`.
+
 ### Tests
 
 ```
@@ -1275,3 +1292,165 @@ claudia: src/convert/sdf_baker.cpp — builds/tears down its own
 realism: src/convert/sdf_procedural.cpp — no per-material authoring tool
   for procedural SDF content yet, so a plausible warm off-white ceramic is
   hand-picked; an artist control (doctrine rung 1).
+claudia: src/render/kernels/pathtracer.cu — __intersection__causticSplat
+  duplicates __intersection__gsplat's local-frame ellipsoid quadratic
+  (factored into a shared reportEllipsoidIntersection helper) rather than
+  parameterizing one kernel over both; the two anyhit accept rules differ
+  enough (stochastic alpha-composite for opacity vs. deterministic
+  always-ignore weighted accumulation for caustic density estimation)
+  that a shared entry point would need a runtime mode branch on the hot
+  path; revisit only if a third ellipsoid-intersection use case appears.
+claudia: src/render/kernels/pathtracer.cu — accumAlbedoBuffer/
+  accumNormalBuffer (OptiX AI Denoiser guide layers) hold the first
+  sample's first-hit values per pixel per subframe, written verbatim every
+  subframe with no lerp/average against the previous subframe, unlike
+  accumBuffer; don't read them as a progressively-converging buffer. The
+  miss-case normal (-rayDirection) is a synthesized sentinel for
+  background pixels, not a physical surface normal.
+claudia: src/render/kernels/pathtracer.cu — NanoVDB volumetric medium
+  (Phase 2) uses a single global-max-density majorant (grid stats'
+  `tree().root().maximum()` times sigma_t times the artist density-scale
+  slider) for both the primary Woodcock/delta-tracking random walk and the
+  shadow-ray ratio-tracking transmittance estimator. This is unbiased —
+  every rejected null-collision is exactly compensated by the free-flight
+  pdf — but slower than it needs to be: a uniform-density fog sphere has
+  no empty space to skip, so the majorant is tight everywhere, but a
+  sparser/wispier grid would waste most candidate collisions on nearly-air
+  regions this global bound can't distinguish from dense ones. NanoVDB
+  ships per-leaf/per-tile min/max stats specifically to tighten the
+  majorant locally (and its HDDA traversal to skip empty leaves entirely);
+  wiring that in is a natural, deliberately-deferred fast-follow once a
+  non-trivial (not analytically-uniform) density field is authored — no
+  correctness change, purely a null-collision-rate/performance win.
+realism: src/render/kernels/pathtracer.cu — the medium's extinction
+  `sigma_t` is tracked as a single scalar (the mean of the three
+  channels), not per-channel/spectral; using different sigma_t per RGB
+  channel would need a hero-wavelength or spectral-MIS scheme to stay
+  unbiased, which is out of scope for the first volumetric primitive.
+  Color in the fog comes entirely from `scatterAlbedo` (applied via an
+  unbiased albedo/albedoAvg ratio at each real scattering event, the same
+  trick used for the continuation throughput) — a grey-extinction,
+  colored-single-scatter-albedo medium is a common, physically legitimate
+  simplification (real smoke/steam skews this way already), not a fudge
+  of the free-flight estimator itself.
+realism: src/render/kernels/pathtracer.cu — light reaching a diffuse/
+  glass/etc. surface through the volume is ratio-traced
+  (`mediumTransmittance`) in the three existing NEE branches (sun/env/quad
+  light), but the bidirectional light-subpath/vertex-merging pass has no
+  hit-group for NanoVDB's custom-primitive AABB and is disabled outright
+  whenever an Nvdb object is in the scene (same pre-existing guard as
+  Voxel/Gsplat) — caustics-through-fog isn't part of this phase.
+claudia: src/render/optix_renderer.h — `SceneSource::volume` is a single
+  `const NvdbVolume *`, not a vector like `extraSdf`, even though the
+  plan's stated pattern was the plural-list one; end-to-end delta
+  tracking/NEE transmittance only reads one active medium
+  (`Params::volume`), so a vector would have implied multi-volume support
+  that isn't actually wired up. `GeometryKind::Nvdb`/`buildNvdbObject` can
+  add more than one medium *object* to the GAS list today, but only the
+  most recently built one's parameters end up in `Params`; upgrade to a
+  real multi-volume `Params` array (and a compositing rule for overlapping
+  media) if a scene ever needs more than one fog volume at once.
+claudia: src/io/nvdb_loader.cpp — the plan's Phase 2 spec asked for the
+  `cudaMalloc`/`cudaMemcpy` device upload to live in this file, but
+  CLAUDE.md's OptiX seam rule is explicit that `src/io/` and `src/app/`
+  never include `optix.h`/`cuda_runtime.h` — only `src/render/` and
+  `src/convert/sdf_baker.cpp` are sanctioned CUDA/OptiX call sites. Kept
+  the seam: this loader builds the NanoVDB grid entirely on the host
+  (`nanovdb::tools::createFogVolumeSphere`) and returns the raw serialized
+  bytes in a `std::vector<uint8_t>`; `OptixRenderer::Impl::buildNvdbObject`
+  (src/render/optix_renderer.cpp) does the actual device upload, the same
+  division of labor `VoxelGrid`/`SdfGrid`/`GsplatAsset` already use.
+realism: src/render/kernels/pathtracer.cu, src/render/optix_renderer.{h,cpp}
+  — Phase 3 adds RTXDI's *spatial-only* resampled importance sampling
+  (RIS) idea to surface NEE, reimplemented directly from the published
+  weighted-reservoir-sampling math (Talbot/Bitterli), not the RTXDI SDK.
+  This is explicitly not RTXDI-the-SDK: RTXDI assumes a fixed-frame-budget
+  G-buffer renderer that reuses reservoirs *across rendered frames* via
+  motion-vector reprojection, and italy has none of that (no G-buffer, no
+  motion vectors, a static-camera progressive accumulator, not a
+  real-time many-bounce-many-light renderer). Carrying a reservoir across
+  subframes into the progressively-averaged `accumBuffer` would
+  double-count samples the same way naive photon-radius reuse would, so
+  there is zero temporal reservoir carry-over — `__raygen__reservoirBuild`
+  reruns from scratch every subframe. What's kept is the *spatial* half:
+  a per-subframe build pass draws `kReservoirCandidates` (6) candidate
+  light samples per pixel (same sun/env/quad strategies as plain NEE),
+  weights them via RIS, then the main pass mixes in `kReservoirSpatialNeighbors`
+  (4) neighbor pixels' reservoirs from the *same* subframe launch before
+  consuming the winning sample through the existing NEE/`traceOcclusion`/
+  `mediumTransmittance`/BSDF machinery unchanged — only which light
+  sample gets shadow-tested changes. Gated behind `RenderSettings::reservoirNEE`
+  (default false, `ITALY_RESERVOIR_NEE` env var), matching the
+  `lightSubpaths` on/off precedent.
+claudia: src/render/kernels/pathtracer.cu — RIS/reservoir reuse is scoped
+  to the primary-hit surface NEE only (`depth == 0` in the diffuse-family
+  branch of `__closesthit__radiance`); it deliberately does not extend to
+  the NanoVDB volume's own NEE branch, even though Phase 2's multi-light-
+  in-fog scenario is the stated motivation for Phase 3. Reason: the
+  volume branch's scatter position is itself resampled by Woodcock/delta
+  tracking on every trace, so the reservoir-build pass's scatter point and
+  the main pass's independently-sampled scatter point would generally be
+  different points in the medium — reusing a reservoir built at one
+  stochastic scatter location to shade a different one breaks the
+  domain-consistency the RIS math depends on (the same failure mode this
+  phase's `evalLightSampleAtPoint`/`combineReservoirs` machinery exists to
+  avoid for *surface* points). Making that sound would mean caching or
+  otherwise sharing a single deterministic scatter position per pixel per
+  subframe between the build and shading passes — a bigger structural
+  change than this phase's scope. The volume's own quad-light NEE was
+  still generalized to `pickQuadLightUniform()` so the many-light test
+  scene lights it correctly; it just isn't RIS-resampled. Upgrade trigger:
+  a scene where volume-NEE light-selection noise is visibly the dominant
+  artifact (not yet observed — Phase 2's single-quad-light fog scene
+  doesn't stress this).
+claudia: src/render/optix_renderer.{h,cpp} — the "several simultaneous
+  emitters" scene needed to demonstrate RIS's benefit (`RenderSettings::
+  extraTestLightCount`, `ITALY_TEST_EXTRA_LIGHTS`) is implemented as
+  purely virtual, non-intersectable quad lights (`Params::extraLights`,
+  up to `kMaxExtraLights` = 3): NEE-only positions/normals/emission with
+  no backing geometry or SBT hit-group entries. This sidesteps needing a
+  general multi-light-geometry authoring feature (accel structure
+  rebuilds, per-light HitGroupData, BSDF-ray-hits-a-light MIS bookkeeping
+  for each) that the plan explicitly said not to build. It's not a
+  compromise on physical correctness: a light with no geometry that can
+  never be hit by a BSDF-sampled ray needs no MIS weight against a
+  BSDF-sampling technique (there is no such technique for it), so its
+  contribution is exactly `Le * BSDF * cos * V / pdf`, the same math sun/
+  environment lighting already use in this renderer for the same reason.
+  Upgrade to real emissive geometry only if a scene needs these lights to
+  be directly visible/hittable, not just NEE sources.
+realism: Phase 4 (RTXGI) — scoped out fully, no code. DDGI light-probe
+  volumes amortize indirect lighting across many rendered frames of a
+  moving real-time scene; italy already computes converged global
+  illumination directly and unbiased over ~128 progressive subframes.
+  Adopting probes would mean trading correctness italy already has for a
+  performance win a progressive/offline renderer doesn't need — probe
+  interpolation and light leaking are exactly the kind of transport bias
+  the doctrine says not to introduce to save time nobody's asking to save.
+  Phase 2's many-light-in-fog case, solved via Phase 3's unbiased spatial
+  RIS instead of a biased probe cache, is itself supporting evidence: the
+  actual variance problem didn't need this.
+realism: Phase 4 (NRD) — scoped out fully, no code. NRD (ReBLUR/ReLAX/
+  SIGMA) is built for 1-spp-or-fewer real-time ray tracing, denoising via
+  heavy temporal accumulation over motion vectors and disocclusion
+  handling. italy's actual scenario is static-camera progressive
+  denoising with no per-frame motion history to hand it in the first
+  place; the OptiX AI Denoiser already integrated pre-Phase-1, now with
+  Phase 1's albedo/normal guide layers, is architecturally the correct
+  tool for that scenario already.
+realism: Phase 4 (DLSS Frame Generation) — scoped out fully, no exception.
+  Interpolates frames for perceived-motion smoothing in a bounded-frame-
+  time real-time context; italy has no frame-rate target at all.
+claudia: Phase 4 (DLSS Super-Resolution) — the one plausible fit
+  (upscaling the live camera-navigation preview before convergence,
+  decoupled from the full-res converged accumulation buffer), evaluated
+  and deliberately deferred rather than implemented. No evidence in the
+  codebase or from Phases 1-3's work that native-resolution navigation
+  preview is actually slow on target hardware (RTX 4080 Laptop per
+  README); pulling in a third vendor SDK (its own model weights, runtime
+  dependency footprint) to solve an unverified performance problem is the
+  speculative-building this project's own plan doctrine warns against —
+  same standard already applied to RTXDI before Phase 3, now applied here.
+  Upgrade trigger: navigation empirically shown to be sluggish, and even
+  then try a zero-dependency bilinear low-res preview first before
+  reaching for DLSS-SR specifically.

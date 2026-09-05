@@ -9,6 +9,7 @@
 #include "core/orbit_camera.h"
 #include "io/gsplat_asset.h"
 #include "io/mesh_asset.h"
+#include "io/nvdb_loader.h"
 #include "render/environment.h"
 
 namespace italy {
@@ -32,6 +33,9 @@ struct RenderSettings {
 
   unsigned int maxConnectionsPerVertex = 8;
 
+  bool reservoirNEE = false;
+  unsigned int extraTestLightCount = 0;
+
   float aperture = 0.0f;
   float focusDistance = 0.0f;
 
@@ -50,6 +54,7 @@ struct SceneSource {
   const SdfGrid *sdf = nullptr;
   const GsplatAsset *splats = nullptr;
   std::vector<const SdfGrid *> extraSdf;
+  const NvdbVolume *volume = nullptr;
   const EnvironmentMap *environment = nullptr;
   bool groundPlane = true;
   float groundOffset = 0.0f;

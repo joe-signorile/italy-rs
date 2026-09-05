@@ -54,7 +54,7 @@ void contextLogCallback(unsigned int level, const char *tag, const char *message
   std::fprintf(stderr, "[optix][%u][%s] %s\n", level, tag, message);
 }
 
-enum class GeometryKind { Triangle, Sphere, SolidSphere, Voxel, Sdf, Gsplat };
+enum class GeometryKind { Triangle, Sphere, SolidSphere, Voxel, Sdf, Gsplat, Nvdb };
 
 struct SceneObject {
   OptixTraversableHandle gas = 0;
@@ -80,6 +80,7 @@ struct OptixRenderer::Impl {
   OptixProgramGroup hitVoxelPG = nullptr;
   OptixProgramGroup hitSdfPG = nullptr;
   OptixProgramGroup hitGsplatPG = nullptr;
+  OptixProgramGroup hitNvdbPG = nullptr;
 
   OptixProgramGroup lightSubpathRaygenPG = nullptr;
   OptixProgramGroup lightSubpathMissPG = nullptr;
@@ -93,6 +94,12 @@ struct OptixRenderer::Impl {
 
   OptixProgramGroup tonemapRaygenPG = nullptr;
   OptixShaderBindingTable tonemapSbt{};
+
+  OptixProgramGroup reservoirBuildRaygenPG = nullptr;
+  OptixShaderBindingTable reservoirBuildSbt{};
+
+  OptixProgramGroup causticAabbRaygenPG = nullptr;
+  OptixShaderBindingTable causticAabbSbt{};
   OptixDenoiser denoiser = nullptr;
   CUdeviceptr denoiserStateBuffer = 0;
   size_t denoiserStateSize = 0;
@@ -110,6 +117,9 @@ struct OptixRenderer::Impl {
 
   CUstream stream = nullptr;
   CUdeviceptr accumBuffer = 0;
+  CUdeviceptr accumAlbedoBuffer = 0;
+  CUdeviceptr accumNormalBuffer = 0;
+  CUdeviceptr reservoirBuffer = 0;
   CUdeviceptr paramsBuffer = 0;
 
   unsigned int pbo = 0;
@@ -143,6 +153,16 @@ struct OptixRenderer::Impl {
   CUdeviceptr splatOpacityBuffer = 0;
   CUdeviceptr splatColorBuffer = 0;
 
+  CUdeviceptr nvdbGridBuffer = 0;
+  bool hasVolume = false;
+  float3 nvdbBoundsMin{};
+  float3 nvdbBoundsMax{};
+  float3 nvdbSigmaT{};
+  float3 nvdbScatterAlbedo{};
+  float nvdbG = 0.0f;
+  float nvdbDensityScale = 1.0f;
+  float nvdbMajorant = 0.0f;
+
   bool hasEnvironment = false;
   bool wantGroundPlane = true;
   float groundOffset = 0.0f;
@@ -159,6 +179,7 @@ struct OptixRenderer::Impl {
   OptixShaderBindingTable lightSubpathSbt{};
   CUdeviceptr lightVertexBuffer = 0;
   CUdeviceptr lightVertexCounterBuffer = 0;
+  CUdeviceptr causticAabbBuffer = 0;
   unsigned int lightSubpathPassIndex = 0;
   unsigned int totalLightPathsEmitted = 0;
 
@@ -166,7 +187,6 @@ struct OptixRenderer::Impl {
 
   CUdeviceptr mergeGasOutputBuffer = 0;
   CUdeviceptr mergeGasTempBuffer = 0;
-  CUdeviceptr mergeGasRadiusBuffer = 0;
   size_t mergeGasOutputCapacityBytes = 0;
   size_t mergeGasTempCapacityBytes = 0;
   OptixTraversableHandle mergeGasHandle = 0;
@@ -213,6 +233,8 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(splatOpacityBuffer));
     if (splatColorBuffer)
       cudaFree(reinterpret_cast<void *>(splatColorBuffer));
+    if (nvdbGridBuffer)
+      cudaFree(reinterpret_cast<void *>(nvdbGridBuffer));
     if (envTexObj)
       cudaDestroyTextureObject(envTexObj);
     if (envArray)
@@ -225,12 +247,12 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(lightVertexBuffer));
     if (lightVertexCounterBuffer)
       cudaFree(reinterpret_cast<void *>(lightVertexCounterBuffer));
+    if (causticAabbBuffer)
+      cudaFree(reinterpret_cast<void *>(causticAabbBuffer));
     if (mergeGasOutputBuffer)
       cudaFree(reinterpret_cast<void *>(mergeGasOutputBuffer));
     if (mergeGasTempBuffer)
       cudaFree(reinterpret_cast<void *>(mergeGasTempBuffer));
-    if (mergeGasRadiusBuffer)
-      cudaFree(reinterpret_cast<void *>(mergeGasRadiusBuffer));
     if (lightSubpathSbt.raygenRecord)
       cudaFree(reinterpret_cast<void *>(lightSubpathSbt.raygenRecord));
     if (lightSubpathSbt.missRecordBase)
@@ -241,6 +263,12 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(tonemapSbt.raygenRecord));
     if (tonemapSbt.missRecordBase)
       cudaFree(reinterpret_cast<void *>(tonemapSbt.missRecordBase));
+    if (reservoirBuildSbt.raygenRecord)
+      cudaFree(reinterpret_cast<void *>(reservoirBuildSbt.raygenRecord));
+    if (causticAabbSbt.raygenRecord)
+      cudaFree(reinterpret_cast<void *>(causticAabbSbt.raygenRecord));
+    if (causticAabbSbt.missRecordBase)
+      cudaFree(reinterpret_cast<void *>(causticAabbSbt.missRecordBase));
     if (denoisedBuffer)
       cudaFree(reinterpret_cast<void *>(denoisedBuffer));
     if (denoiserStateBuffer)
@@ -253,6 +281,12 @@ struct OptixRenderer::Impl {
       cudaFree(reinterpret_cast<void *>(paramsBuffer));
     if (accumBuffer)
       cudaFree(reinterpret_cast<void *>(accumBuffer));
+    if (accumAlbedoBuffer)
+      cudaFree(reinterpret_cast<void *>(accumAlbedoBuffer));
+    if (accumNormalBuffer)
+      cudaFree(reinterpret_cast<void *>(accumNormalBuffer));
+    if (reservoirBuffer)
+      cudaFree(reinterpret_cast<void *>(reservoirBuffer));
     if (sbt.raygenRecord)
       cudaFree(reinterpret_cast<void *>(sbt.raygenRecord));
     if (sbt.missRecordBase)
@@ -270,6 +304,8 @@ struct OptixRenderer::Impl {
       GLBufferFns::get().glDeleteBuffers(1, &pbo);
     if (pipeline)
       optixPipelineDestroy(pipeline);
+    if (causticAabbRaygenPG)
+      optixProgramGroupDestroy(causticAabbRaygenPG);
     if (tonemapRaygenPG)
       optixProgramGroupDestroy(tonemapRaygenPG);
     if (mergeMissPG)
@@ -288,6 +324,8 @@ struct OptixRenderer::Impl {
       optixProgramGroupDestroy(lightSubpathMissPG);
     if (lightSubpathRaygenPG)
       optixProgramGroupDestroy(lightSubpathRaygenPG);
+    if (hitNvdbPG)
+      optixProgramGroupDestroy(hitNvdbPG);
     if (hitGsplatPG)
       optixProgramGroupDestroy(hitGsplatPG);
     if (hitSdfPG)
@@ -328,7 +366,7 @@ struct OptixRenderer::Impl {
     pipelineCompileOptions.usesMotionBlur = false;
     pipelineCompileOptions.traversableGraphFlags =
         OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING | OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    pipelineCompileOptions.numPayloadValues = 19;
+    pipelineCompileOptions.numPayloadValues = 25;
     pipelineCompileOptions.numAttributeValues = 2;
     pipelineCompileOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";
@@ -419,6 +457,14 @@ struct OptixRenderer::Impl {
     hitGsplatDesc.hitgroup.entryFunctionNameIS = "__intersection__gsplat";
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitGsplatDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitGsplatPG));
 
+    OptixProgramGroupDesc hitNvdbDesc{};
+    hitNvdbDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitNvdbDesc.hitgroup.moduleCH = module;
+    hitNvdbDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+    hitNvdbDesc.hitgroup.moduleIS = module;
+    hitNvdbDesc.hitgroup.entryFunctionNameIS = "__intersection__nvdb";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitNvdbDesc, 1, &pgOptions, LOG, &LOG_SIZE, &hitNvdbPG));
+
     OptixProgramGroupDesc lightSubpathRaygenDesc{};
     lightSubpathRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
     lightSubpathRaygenDesc.raygen.module = module;
@@ -470,7 +516,8 @@ struct OptixRenderer::Impl {
     mergeHitDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
     mergeHitDesc.hitgroup.moduleAH = module;
     mergeHitDesc.hitgroup.entryFunctionNameAH = "__anyhit__merge";
-    mergeHitDesc.hitgroup.moduleIS = sphereModule;
+    mergeHitDesc.hitgroup.moduleIS = module;
+    mergeHitDesc.hitgroup.entryFunctionNameIS = "__intersection__causticSplat";
     OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &mergeHitDesc, 1, &pgOptions, LOG, &LOG_SIZE, &mergeHitPG));
 
     OptixProgramGroupDesc mergeMissDesc{};
@@ -485,6 +532,20 @@ struct OptixRenderer::Impl {
     tonemapRaygenDesc.raygen.entryFunctionName = "__raygen__tonemap";
     OPTIX_CHECK_LOG(
         optixProgramGroupCreate(context, &tonemapRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE, &tonemapRaygenPG));
+
+    OptixProgramGroupDesc causticAabbRaygenDesc{};
+    causticAabbRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    causticAabbRaygenDesc.raygen.module = module;
+    causticAabbRaygenDesc.raygen.entryFunctionName = "__raygen__causticAabb";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &causticAabbRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &causticAabbRaygenPG));
+
+    OptixProgramGroupDesc reservoirBuildRaygenDesc{};
+    reservoirBuildRaygenDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    reservoirBuildRaygenDesc.raygen.module = module;
+    reservoirBuildRaygenDesc.raygen.entryFunctionName = "__raygen__reservoirBuild";
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &reservoirBuildRaygenDesc, 1, &pgOptions, LOG, &LOG_SIZE,
+                                             &reservoirBuildRaygenPG));
   }
 
   void buildPipeline() {
@@ -497,6 +558,7 @@ struct OptixRenderer::Impl {
                                    hitVoxelPG,
                                    hitSdfPG,
                                    hitGsplatPG,
+                                   hitNvdbPG,
                                    lightSubpathRaygenPG,
                                    lightSubpathMissPG,
                                    lightSubpathHitTrianglePG,
@@ -505,7 +567,9 @@ struct OptixRenderer::Impl {
                                    lightSubpathHitSdfPG,
                                    mergeHitPG,
                                    mergeMissPG,
-                                   tonemapRaygenPG};
+                                   tonemapRaygenPG,
+                                   causticAabbRaygenPG,
+                                   reservoirBuildRaygenPG};
     OptixPipelineLinkOptions linkOptions{};
     const uint32_t maxTraceDepth = 2;
     linkOptions.maxTraceDepth = maxTraceDepth;
@@ -911,6 +975,54 @@ struct OptixRenderer::Impl {
     return obj;
   }
 
+  SceneObject buildNvdbObject(const NvdbVolume &volume) {
+    SceneObject obj;
+    obj.kind = GeometryKind::Nvdb;
+    obj.material.materialType = MATERIAL_NVDB;
+
+    const size_t blobBytes = volume.gridBlob.size();
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&nvdbGridBuffer), blobBytes));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(nvdbGridBuffer), volume.gridBlob.data(), blobBytes,
+                           cudaMemcpyHostToDevice));
+
+    const float sigmaScalar = (volume.sigmaT.x + volume.sigmaT.y + volume.sigmaT.z) / 3.0f;
+    hasVolume = true;
+    nvdbBoundsMin = toFloat3(volume.boundsMin);
+    nvdbBoundsMax = toFloat3(volume.boundsMax);
+    nvdbSigmaT = toFloat3(volume.sigmaT);
+    nvdbScatterAlbedo = toFloat3(volume.scatterAlbedo);
+    nvdbG = volume.g;
+    nvdbDensityScale = volume.densityScale;
+    nvdbMajorant = sigmaScalar * volume.maxDensity * volume.densityScale;
+
+    obj.material.nvdbGrid = reinterpret_cast<void *>(nvdbGridBuffer);
+    obj.material.nvdbBoundsMin = nvdbBoundsMin;
+    obj.material.nvdbBoundsMax = nvdbBoundsMax;
+    obj.material.nvdbSigmaT = nvdbSigmaT;
+    obj.material.nvdbScatterAlbedo = nvdbScatterAlbedo;
+    obj.material.nvdbG = nvdbG;
+    obj.material.nvdbDensityScale = nvdbDensityScale;
+    obj.material.nvdbMajorant = nvdbMajorant;
+
+    OptixAabb aabb{nvdbBoundsMin.x, nvdbBoundsMin.y, nvdbBoundsMin.z,
+                   nvdbBoundsMax.x, nvdbBoundsMax.y, nvdbBoundsMax.z};
+    CUdeviceptr aabbBuffer;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&aabbBuffer), sizeof(OptixAabb)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(aabbBuffer), &aabb, sizeof(OptixAabb), cudaMemcpyHostToDevice));
+
+    OptixBuildInput input{};
+    input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    input.customPrimitiveArray.aabbBuffers = &aabbBuffer;
+    input.customPrimitiveArray.numPrimitives = 1;
+    static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
+    input.customPrimitiveArray.flags = flags;
+    input.customPrimitiveArray.numSbtRecords = 1;
+
+    obj.gas = buildAccel(input, obj.gasBuffer);
+    cudaFree(reinterpret_cast<void *>(aabbBuffer));
+    return obj;
+  }
+
   void buildSplatScene(const GsplatAsset &splats) {
     objects.push_back(buildSplatObject(splats));
     boundsCenter = splats.boundsCenter();
@@ -1108,11 +1220,18 @@ struct OptixRenderer::Impl {
       addBoundsKeyLight(boundsCenter, boundsRadius);
     }
 
+    if (source.volume) {
+      objects.push_back(buildNvdbObject(*source.volume));
+      const glm::vec3 volMin(nvdbBoundsMin.x, nvdbBoundsMin.y, nvdbBoundsMin.z);
+      const glm::vec3 volMax(nvdbBoundsMax.x, nvdbBoundsMax.y, nvdbBoundsMax.z);
+      boundsRadius = std::max({boundsRadius, glm::length(volMax - boundsCenter), glm::length(volMin - boundsCenter)});
+    }
+
     if (enableLightSubpaths) {
       for (const SceneObject &o : objects) {
-        if (o.kind == GeometryKind::Voxel || o.kind == GeometryKind::Gsplat) {
+        if (o.kind == GeometryKind::Voxel || o.kind == GeometryKind::Gsplat || o.kind == GeometryKind::Nvdb) {
           std::fprintf(stderr,
-                       "italy: light subpaths disabled — scene has a voxel/gsplat object and "
+                       "italy: light subpaths disabled — scene has a voxel/gsplat/nvdb object and "
                        "traceLightSubpathPass() has no hit-group for custom primitives (see buildScene()).\n");
           enableLightSubpaths = false;
           break;
@@ -1127,6 +1246,8 @@ struct OptixRenderer::Impl {
       CUDA_CHECK(
           cudaMalloc(reinterpret_cast<void **>(&lightVertexBuffer), sizeof(LightVertex) * kLightVertexCapacity));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&lightVertexCounterBuffer), sizeof(unsigned int)));
+      CUDA_CHECK(
+          cudaMalloc(reinterpret_cast<void **>(&causticAabbBuffer), sizeof(OptixAabb) * kLightVertexCapacity));
     }
   }
 
@@ -1200,23 +1321,15 @@ struct OptixRenderer::Impl {
       return;
     }
 
-    if (!mergeGasRadiusBuffer)
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&mergeGasRadiusBuffer), sizeof(float)));
-    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(mergeGasRadiusBuffer), &mergeRadius, sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
-
-    const CUdeviceptr vertexBuffer = lightVertexBuffer + offsetof(LightVertex, position);
+    OPTIX_CHECK(optixLaunch(pipeline, stream, paramsBuffer, sizeof(Params), &causticAabbSbt, vertexCount, 1, 1));
 
     OptixBuildInput input{};
-    input.type = OPTIX_BUILD_INPUT_TYPE_SPHERES;
-    input.sphereArray.vertexBuffers = &vertexBuffer;
-    input.sphereArray.vertexStrideInBytes = sizeof(LightVertex);
-    input.sphereArray.numVertices = vertexCount;
-    input.sphereArray.radiusBuffers = &mergeGasRadiusBuffer;
-    input.sphereArray.singleRadius = 1;
+    input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    input.customPrimitiveArray.aabbBuffers = &causticAabbBuffer;
+    input.customPrimitiveArray.numPrimitives = vertexCount;
     static const uint32_t flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
-    input.sphereArray.flags = flags;
-    input.sphereArray.numSbtRecords = 1;
+    input.customPrimitiveArray.flags = flags;
+    input.customPrimitiveArray.numSbtRecords = 1;
 
     OptixAccelBuildOptions accelOptions{};
     accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_BUILD;
@@ -1307,6 +1420,9 @@ struct OptixRenderer::Impl {
       case GeometryKind::Gsplat:
         pg = hitGsplatPG;
         break;
+      case GeometryKind::Nvdb:
+        pg = hitNvdbPG;
+        break;
       default:
         pg = hitTrianglePG;
         break;
@@ -1329,8 +1445,26 @@ struct OptixRenderer::Impl {
     sbt.hitgroupRecordCount = static_cast<unsigned int>(hitRecords.size());
   }
 
+  void buildReservoirBuildSbt() {
+    RayGenRecord rgRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(reservoirBuildRaygenPG, &rgRecord));
+    CUdeviceptr d_rg;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
+
+    reservoirBuildSbt.raygenRecord = d_rg;
+    reservoirBuildSbt.missRecordBase = sbt.missRecordBase;
+    reservoirBuildSbt.missRecordStrideInBytes = sbt.missRecordStrideInBytes;
+    reservoirBuildSbt.missRecordCount = sbt.missRecordCount;
+    reservoirBuildSbt.hitgroupRecordBase = sbt.hitgroupRecordBase;
+    reservoirBuildSbt.hitgroupRecordStrideInBytes = sbt.hitgroupRecordStrideInBytes;
+    reservoirBuildSbt.hitgroupRecordCount = sbt.hitgroupRecordCount;
+  }
+
   void buildDenoiser(int width, int height) {
     OptixDenoiserOptions options{};
+    options.guideAlbedo = 1;
+    options.guideNormal = 1;
     OPTIX_CHECK(optixDenoiserCreate(context, OPTIX_DENOISER_MODEL_KIND_HDR, &options, &denoiser));
 
     OptixDenoiserSizes sizes{};
@@ -1346,6 +1480,24 @@ struct OptixRenderer::Impl {
 
     CUDA_CHECK(
         cudaMalloc(reinterpret_cast<void **>(&denoisedBuffer), static_cast<size_t>(width) * height * sizeof(float4)));
+  }
+
+  void buildCausticAabbSbt() {
+    RayGenRecord rgRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(causticAabbRaygenPG, &rgRecord));
+    CUdeviceptr d_rg;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_rg), sizeof(rgRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_rg), &rgRecord, sizeof(rgRecord), cudaMemcpyHostToDevice));
+    causticAabbSbt.raygenRecord = d_rg;
+
+    MissRecord missRecord{};
+    OPTIX_CHECK(optixSbtRecordPackHeader(missOcclusionPG, &missRecord));
+    CUdeviceptr d_miss;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_miss), sizeof(missRecord)));
+    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void *>(d_miss), &missRecord, sizeof(missRecord), cudaMemcpyHostToDevice));
+    causticAabbSbt.missRecordBase = d_miss;
+    causticAabbSbt.missRecordStrideInBytes = sizeof(MissRecord);
+    causticAabbSbt.missRecordCount = 1;
   }
 
   void buildTonemapSbt() {
@@ -1376,6 +1528,12 @@ struct OptixRenderer::Impl {
 
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumBuffer),
                            static_cast<size_t>(width) * height * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumAlbedoBuffer),
+                           static_cast<size_t>(width) * height * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&accumNormalBuffer),
+                           static_cast<size_t>(width) * height * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&reservoirBuffer),
+                           static_cast<size_t>(width) * height * sizeof(Reservoir)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&paramsBuffer), sizeof(Params)));
   }
 };
@@ -1388,7 +1546,9 @@ OptixRenderer::OptixRenderer(int width, int height, const SceneSource &source)
   impl_->buildPipeline();
   impl_->buildScene(source);
   impl_->buildSbt();
+  impl_->buildReservoirBuildSbt();
   impl_->buildTonemapSbt();
+  impl_->buildCausticAabbSbt();
   impl_->initGLInterop(width, height);
   impl_->buildDenoiser(width, height);
 
@@ -1440,6 +1600,8 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   Params params{};
   params.subframeIndex = subframeIndex_;
   params.accumBuffer = reinterpret_cast<float4 *>(impl_->accumBuffer);
+  params.accumAlbedoBuffer = reinterpret_cast<float4 *>(impl_->accumAlbedoBuffer);
+  params.accumNormalBuffer = reinterpret_cast<float4 *>(impl_->accumNormalBuffer);
   params.width = static_cast<unsigned int>(width_);
   params.height = static_cast<unsigned int>(height_);
   params.samplesPerLaunch = settings.samplesPerLaunch;
@@ -1459,6 +1621,17 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
                                             sunDir.x * sunSin + sunDir.z * sunCos));
   params.sun.cosAngularRadius = std::cos(glm::radians(settings.sunAngularRadiusDeg));
   params.sun.radiance = toFloat3(settings.sunRadiance);
+  params.volume.enabled = impl_->hasVolume ? 1u : 0u;
+  if (impl_->hasVolume) {
+    params.volume.grid = reinterpret_cast<void *>(impl_->nvdbGridBuffer);
+    params.volume.boundsMin = impl_->nvdbBoundsMin;
+    params.volume.boundsMax = impl_->nvdbBoundsMax;
+    params.volume.sigmaT = impl_->nvdbSigmaT;
+    params.volume.scatterAlbedo = impl_->nvdbScatterAlbedo;
+    params.volume.g = impl_->nvdbG;
+    params.volume.densityScale = impl_->nvdbDensityScale;
+    params.volume.majorant = impl_->nvdbMajorant;
+  }
   params.sceneBoundsCenter = toFloat3(impl_->boundsCenter);
   params.sceneBoundsRadius = impl_->boundsRadius;
   params.eye = toFloat3(eye);
@@ -1466,7 +1639,24 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
   params.V = toFloat3(up * tanHalfFov);
   params.W = toFloat3(forward);
   params.light = impl_->light;
+  params.extraLightCount = 0;
+  if (settings.extraTestLightCount > 0 && !impl_->hasEnvironment) {
+    const unsigned int n = std::min(settings.extraTestLightCount, kMaxExtraLights);
+    params.extraLightCount = n;
+    const float3 tangent = normalize(impl_->light.v1);
+    const float3 bitangent = normalize(impl_->light.v2);
+    const float radius = impl_->boundsRadius * 0.6f;
+    for (unsigned int i = 0; i < n; ++i) {
+      QuadLight q = impl_->light;
+      const float angle = 6.2831853f * static_cast<float>(i + 1) / static_cast<float>(n + 1);
+      const float3 offset = tangent * (radius * std::cos(angle)) + bitangent * (radius * std::sin(angle));
+      q.corner = impl_->light.corner + offset;
+      params.extraLights[i] = q;
+    }
+  }
   params.handle = impl_->iasHandle;
+  params.reservoirNEE = settings.reservoirNEE ? 1u : 0u;
+  params.reservoirBuffer = reinterpret_cast<Reservoir *>(impl_->reservoirBuffer);
   if (impl_->hasEnvironment) {
     params.envTex = impl_->envTexObj;
     params.envMarginalCdf = reinterpret_cast<float *>(impl_->envMarginalCdfBuffer);
@@ -1480,16 +1670,28 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
     params.lightVertexCapacity = Impl::kLightVertexCapacity;
     params.lightSubpathBatchSize = Impl::kLightSubpathBatchSize;
     params.totalLightPathsEmitted = impl_->totalLightPathsEmitted;
+    params.causticAabbs = reinterpret_cast<OptixAabb *>(impl_->causticAabbBuffer);
     CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
                                cudaMemcpyHostToDevice, impl_->stream));
     const unsigned int deposited = impl_->traceLightSubpathPass();
     params.lightVertexCount = deposited;
     params.totalLightPathsEmitted = impl_->totalLightPathsEmitted;
     params.mergeRadius = impl_->mergeRadius;
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
+                               cudaMemcpyHostToDevice, impl_->stream));
     impl_->buildMergeGas(deposited);
     params.vertexMergeHandle = impl_->mergeGasHandle;
     params.mergeHitSbtOffset = impl_->mergeHitSbtOffset;
     params.maxConnectionsPerVertex = settings.maxConnectionsPerVertex;
+  }
+
+  if (settings.reservoirNEE) {
+    params.reservoirBuildPass = 1u;
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void *>(impl_->paramsBuffer), &params, sizeof(Params),
+                               cudaMemcpyHostToDevice, impl_->stream));
+    OPTIX_CHECK(optixLaunch(impl_->pipeline, impl_->stream, impl_->paramsBuffer, sizeof(Params),
+                             &impl_->reservoirBuildSbt, width_, height_, 1));
+    params.reservoirBuildPass = 0u;
   }
 
   CUDA_CHECK(cudaGraphicsMapResources(1, &impl_->cudaPbo, impl_->stream));
@@ -1523,7 +1725,15 @@ void OptixRenderer::render(const OrbitCamera &camera, const RenderSettings &sett
     OptixDenoiserLayer layer{};
     layer.input = inputImg;
     layer.output = outputImg;
+
+    OptixImage2D albedoImg = img;
+    albedoImg.data = impl_->accumAlbedoBuffer;
+    OptixImage2D normalImg = img;
+    normalImg.data = impl_->accumNormalBuffer;
+
     OptixDenoiserGuideLayer guideLayer{};
+    guideLayer.albedo = albedoImg;
+    guideLayer.normal = normalImg;
 
     OPTIX_CHECK(optixDenoiserInvoke(impl_->denoiser, impl_->stream, &denoiserParams, impl_->denoiserStateBuffer,
                                      impl_->denoiserStateSize, &guideLayer, &layer, 1, 0, 0,

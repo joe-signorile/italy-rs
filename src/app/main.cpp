@@ -25,6 +25,7 @@
 #include "io/gsplat_ply_loader.h"
 #include "io/mesh_primitive_classify.h"
 #include "io/mesh_validate.h"
+#include "io/nvdb_loader.h"
 #include "render/environment.h"
 #include "render/optix_renderer.h"
 #include "render/procedural_sky.h"
@@ -121,6 +122,15 @@ struct AppState {
   char gsplatPathBuf[512] = "";
   italy::EnvironmentMap environment;
   bool haveEnvironment = false;
+
+  bool wantFogVolume = false;
+  italy::NvdbVolume fogVolume;
+  float fogRadius = 1.1f;
+  float fogVoxelSize = 0.05f;
+  float fogSigmaT = 2.0f;
+  glm::vec3 fogScatterAlbedo{0.95f, 0.95f, 0.95f};
+  float fogAsymmetry = 0.0f;
+  float fogDensityScale = 1.0f;
 
   char glbPathBuf[512] = "";
   Representation representation = Representation::Mesh;
@@ -256,6 +266,12 @@ void bakeStepRepresentation(AppState &state, ProjectBakeState &bake) {
     state.statusLine += " -> baked " + std::to_string(state.materialProbeGrids.size()) + " material probe grids at " +
                          std::to_string(AppState::kMaterialProbeResolution) + "^3";
   }
+  if (state.wantFogVolume) {
+    state.fogVolume = italy::buildProceduralFogSphereVolume(
+        glm::vec3(0.0f), state.fogRadius, state.fogVoxelSize, glm::vec3(state.fogSigmaT), state.fogScatterAlbedo,
+        state.fogAsymmetry, state.fogDensityScale);
+    state.statusLine += " + fog volume (NanoVDB, " + std::to_string(state.fogVolume.gridBlob.size()) + " bytes)";
+  }
   logBakeLine(bake, "Bake representation: " + state.statusLine);
 }
 
@@ -317,6 +333,8 @@ void bakeStepConstructRenderer(AppState &state, std::unique_ptr<italy::OptixRend
     source.sdf = &state.glassCupGrid;
   if (state.haveEnvironment)
     source.environment = &state.environment;
+  if (state.wantFogVolume)
+    source.volume = &state.fogVolume;
   source.groundPlane = state.groundPlane;
   if (state.wantCup) {
     state.cupGrid = italy::makeCupSdf(AppState::kCupResolution, -1.0f, glm::vec2(-1.6f, 1.6f));
@@ -348,6 +366,17 @@ void rebuildEnvironmentLive(AppState &state, std::unique_ptr<italy::OptixRendere
                              italy::OrbitCamera &camera) {
   ProjectBakeState localBake;
   bakeStepEnvironment(state, localBake);
+  bakeStepConstructRenderer(state, renderer, camera, localBake, /*reframeCamera=*/false);
+}
+
+void rebuildFogVolumeLive(AppState &state, std::unique_ptr<italy::OptixRenderer> &renderer,
+                            italy::OrbitCamera &camera) {
+  if (state.wantFogVolume) {
+    state.fogVolume = italy::buildProceduralFogSphereVolume(glm::vec3(0.0f), state.fogRadius, state.fogVoxelSize,
+                                                              glm::vec3(state.fogSigmaT), state.fogScatterAlbedo,
+                                                              state.fogAsymmetry, state.fogDensityScale);
+  }
+  ProjectBakeState localBake;
   bakeStepConstructRenderer(state, renderer, camera, localBake, /*reframeCamera=*/false);
 }
 
@@ -506,8 +535,17 @@ int main(int argc, char **argv) {
     } else if (key == "--gsplat") {
       state.representation = Representation::Gsplat;
       std::snprintf(state.gsplatPathBuf, sizeof(state.gsplatPathBuf), "%s", value.c_str());
+    } else if (key == "--fog") {
+      state.wantFogVolume = true;
     }
   }
+
+  if (const char *v = std::getenv("ITALY_NVDB_SIGMA_T"))
+    state.fogSigmaT = std::max(0.0f, static_cast<float>(std::atof(v)));
+  if (const char *v = std::getenv("ITALY_NVDB_DENSITY_SCALE"))
+    state.fogDensityScale = std::max(0.0f, static_cast<float>(std::atof(v)));
+  if (const char *v = std::getenv("ITALY_NVDB_G"))
+    state.fogAsymmetry = std::clamp(static_cast<float>(std::atof(v)), -0.95f, 0.95f);
 
   if (!glfwInit()) {
     std::fprintf(stderr, "glfwInit failed\n");
@@ -532,6 +570,10 @@ int main(int argc, char **argv) {
     state.render.lightSubpaths = std::atoi(ls) != 0;
   if (const char *mc = std::getenv("ITALY_MAX_CONNECTIONS"))
     state.render.maxConnectionsPerVertex = static_cast<unsigned int>(std::max(0, std::atoi(mc)));
+  if (const char *rn = std::getenv("ITALY_RESERVOIR_NEE"))
+    state.render.reservoirNEE = std::atoi(rn) != 0;
+  if (const char *el = std::getenv("ITALY_TEST_EXTRA_LIGHTS"))
+    state.render.extraTestLightCount = static_cast<unsigned int>(std::max(0, std::atoi(el)));
   if (std::getenv("ITALY_NO_GROUND"))
     state.groundPlane = false;
   if (const char *ap = std::getenv("ITALY_APERTURE"))
@@ -804,6 +846,21 @@ int main(int argc, char **argv) {
     ImGui::Checkbox("Ground plane", &state.groundPlane);
 
     ImGui::Separator();
+    if (ImGui::Checkbox("Fog volume (NanoVDB)", &state.wantFogVolume))
+      rebuildFogVolumeLive(state, renderer, camera);
+    if (state.wantFogVolume) {
+      bool fogChanged = false;
+      fogChanged |= ImGui::SliderFloat("Fog radius", &state.fogRadius, 0.1f, 5.0f);
+      fogChanged |= ImGui::SliderFloat("Fog voxel size", &state.fogVoxelSize, 0.01f, 0.2f);
+      fogChanged |= ImGui::SliderFloat("Fog sigma_t (extinction)", &state.fogSigmaT, 0.0f, 20.0f);
+      fogChanged |= ImGui::ColorEdit3("Fog scatter albedo", &state.fogScatterAlbedo.x);
+      fogChanged |= ImGui::SliderFloat("Fog phase g", &state.fogAsymmetry, -0.95f, 0.95f);
+      fogChanged |= ImGui::SliderFloat("Fog density scale", &state.fogDensityScale, 0.0f, 5.0f);
+      if (fogChanged)
+        rebuildFogVolumeLive(state, renderer, camera);
+    }
+
+    ImGui::Separator();
     if (ImGui::InputFloat("Exposure", &state.render.exposure))
       state.render.exposure = std::max(state.render.exposure, 0.0f);
     int spl = static_cast<int>(state.render.samplesPerLaunch);
@@ -822,6 +879,14 @@ int main(int argc, char **argv) {
     int maxConn = static_cast<int>(state.render.maxConnectionsPerVertex);
     if (ImGui::InputInt("Max BDPT connections/vertex (0 = uncapped)", &maxConn)) {
       state.render.maxConnectionsPerVertex = static_cast<unsigned int>(std::max(maxConn, 0));
+      renderer->resetAccumulation();
+    }
+
+    if (ImGui::Checkbox("Reservoir NEE (spatial RIS)", &state.render.reservoirNEE))
+      renderer->resetAccumulation();
+    int extraLights = static_cast<int>(state.render.extraTestLightCount);
+    if (ImGui::InputInt("Extra test lights (RIS verification)", &extraLights)) {
+      state.render.extraTestLightCount = static_cast<unsigned int>(std::clamp(extraLights, 0, 3));
       renderer->resetAccumulation();
     }
 

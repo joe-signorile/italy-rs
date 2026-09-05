@@ -54,6 +54,17 @@ set(TINYGLTF_INSTALL OFF CACHE BOOL "" FORCE)
 set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(tinygltf)
 
+FetchContent_Declare(nanovdb_src
+  GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openvdb.git
+  GIT_TAG v12.1.1
+  GIT_SHALLOW TRUE)
+FetchContent_GetProperties(nanovdb_src)
+if(NOT nanovdb_src_POPULATED)
+  FetchContent_Populate(nanovdb_src)
+endif()
+add_library(nanovdb INTERFACE)
+target_include_directories(nanovdb INTERFACE ${nanovdb_src_SOURCE_DIR}/nanovdb)
+
 add_library(imgui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -91,6 +102,7 @@ function(italy_compile_optixir cu_file out_var)
             -I "${OPTIX_INCLUDE_DIR}"
             -I "${OPTIX_ROOT}/SDK"
             -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            -I "${nanovdb_src_SOURCE_DIR}/nanovdb"
             -o ${output}
             ${cu_file}
     DEPENDS ${cu_file} "${CMAKE_CURRENT_SOURCE_DIR}/src/render/kernels/pathtracer_params.h"
@@ -122,6 +134,7 @@ add_executable(italy-rs
   src/io/mesh_validate.cpp
   src/io/mesh_primitive_classify.cpp
   src/io/gsplat_ply_loader.cpp
+  src/io/nvdb_loader.cpp
   src/convert/voxelize.cpp
   src/convert/sdf_baker.cpp
   src/convert/sdf_procedural.cpp
@@ -130,7 +143,7 @@ add_executable(italy-rs
 )
 add_dependencies(italy-rs italy_optixir_pathtracer italy_optixir_sdf_bake)
 target_include_directories(italy-rs PRIVATE src ${CMAKE_BINARY_DIR}/generated ${OPTIX_INCLUDE_DIR} ${OPTIX_ROOT}/SDK)
-target_link_libraries(italy-rs PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf)
+target_link_libraries(italy-rs PRIVATE glfw imgui glm::glm OpenGL::GL CUDA::cudart stb tinygltf nanovdb)
 
 enable_testing()
 add_executable(voxelize_test tests/voxelize_test.cpp src/convert/voxelize.cpp)

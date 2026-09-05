@@ -2,6 +2,8 @@
 
 #include <optix.h>
 
+#include <nanovdb/NanoVDB.h>
+
 #include "device_onb.h"
 #include "pathtracer_params.h"
 
@@ -254,21 +256,29 @@ struct RadiancePRD {
   float3 origin;
   float3 direction;
   int done;
+  float3 albedo;
+  float3 normal;
 };
 
 static __forceinline__ __device__ void trace(OptixTraversableHandle handle, float3 origin, float3 direction,
                                               float tmin, float tmax, RadiancePRD &prd) {
-  unsigned int p[19] = {};
+  unsigned int p[25] = {};
   p[0] = __float_as_uint(prd.attenuation.x);
   p[1] = __float_as_uint(prd.attenuation.y);
   p[2] = __float_as_uint(prd.attenuation.z);
   p[3] = prd.seed;
   p[4] = static_cast<unsigned int>(prd.depth);
   p[5] = __float_as_uint(prd.prevBsdfPdf);
+  p[19] = __float_as_uint(prd.albedo.x);
+  p[20] = __float_as_uint(prd.albedo.y);
+  p[21] = __float_as_uint(prd.albedo.z);
+  p[22] = __float_as_uint(prd.normal.x);
+  p[23] = __float_as_uint(prd.normal.y);
+  p[24] = __float_as_uint(prd.normal.z);
 
   optixTrace(handle, origin, direction, tmin, tmax, 0.0f, OptixVisibilityMask(1), OPTIX_RAY_FLAG_NONE, 0, 1, 0, p[0],
              p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16],
-             p[17], p[18]);
+             p[17], p[18], p[19], p[20], p[21], p[22], p[23], p[24]);
 
   prd.attenuation = make_float3(__uint_as_float(p[0]), __uint_as_float(p[1]), __uint_as_float(p[2]));
   prd.seed = p[3];
@@ -279,6 +289,8 @@ static __forceinline__ __device__ void trace(OptixTraversableHandle handle, floa
   prd.origin = make_float3(__uint_as_float(p[12]), __uint_as_float(p[13]), __uint_as_float(p[14]));
   prd.direction = make_float3(__uint_as_float(p[15]), __uint_as_float(p[16]), __uint_as_float(p[17]));
   prd.done = static_cast<int>(p[18]);
+  prd.albedo = make_float3(__uint_as_float(p[19]), __uint_as_float(p[20]), __uint_as_float(p[21]));
+  prd.normal = make_float3(__uint_as_float(p[22]), __uint_as_float(p[23]), __uint_as_float(p[24]));
 }
 
 static __forceinline__ __device__ float surfaceEpsilon(const float3 &p) {
@@ -323,6 +335,8 @@ extern "C" __global__ void __raygen__rg() {
   unsigned int seed = sutil::tea<4>(idx.y * w + idx.x, subframe);
 
   float3 result = make_float3(0.0f);
+  float3 firstHitAlbedo = make_float3(0.0f);
+  float3 firstHitNormal = make_float3(0.0f);
   unsigned int spl = params.samplesPerLaunch;
   for (unsigned int s = 0; s < spl; ++s) {
     const float2 jitter =
@@ -354,6 +368,11 @@ extern "C" __global__ void __raygen__rg() {
 
     for (;;) {
       trace(params.handle, origin, direction, 1e-3f, 1e16f, prd);
+
+      if (s == 0 && prd.depth == 0) {
+        firstHitAlbedo = prd.albedo;
+        firstHitNormal = prd.normal;
+      }
 
       sample += prd.emitted;
       sample += prd.radiance;
@@ -388,8 +407,47 @@ extern "C" __global__ void __raygen__rg() {
     accum = lerp(prevColor, accum, a);
   }
   params.accumBuffer[pixel] = make_float4(accum, 1.0f);
+  params.accumAlbedoBuffer[pixel] = make_float4(firstHitAlbedo, 1.0f);
+  params.accumNormalBuffer[pixel] = make_float4(firstHitNormal, 0.0f);
   if (!params.denoiserEnabled)
     params.frameBuffer[pixel] = applyTonemapAndQuantize(accum * params.exposure, params.tonemapOperator);
+}
+
+extern "C" __global__ void __raygen__reservoirBuild() {
+  const uint3 idx = optixGetLaunchIndex();
+  const unsigned int w = params.width;
+  const unsigned int h = params.height;
+  const unsigned int pixel = idx.y * w + idx.x;
+  params.reservoirBuffer[pixel] = Reservoir{};
+
+  if (!params.reservoirNEE)
+    return;
+
+  unsigned int seed = sutil::tea<4>(pixel, params.subframeIndex ^ 0x9e3779b9u);
+  const float2 jitter = make_float2(tentFilterWarp(sutil::rnd(seed)), tentFilterWarp(sutil::rnd(seed)));
+  const float2 d = 2.0f *
+                       make_float2((static_cast<float>(idx.x) + 0.5f + jitter.x) / static_cast<float>(w),
+                                   (static_cast<float>(idx.y) + 0.5f + jitter.y) / static_cast<float>(h)) -
+                   1.0f;
+  float3 origin = params.eye;
+  float3 direction = normalize(d.x * params.U + d.y * params.V + params.W);
+
+  if (params.aperture > 0.0f) {
+    const float cosAxis = dot(direction, params.W);
+    if (cosAxis > 1e-6f) {
+      const float3 focalPoint = origin + direction * (params.focusDistance / cosAxis);
+      const float2 lens = concentricSampleDisk(sutil::rnd(seed), sutil::rnd(seed)) * params.aperture;
+      origin = origin + normalize(params.U) * lens.x + normalize(params.V) * lens.y;
+      direction = normalize(focalPoint - origin);
+    }
+  }
+
+  RadiancePRD prd;
+  prd.attenuation = make_float3(1.0f);
+  prd.seed = seed;
+  prd.depth = 0;
+  prd.prevBsdfPdf = -1.0f;
+  trace(params.handle, origin, direction, 1e-3f, 1e16f, prd);
 }
 
 extern "C" __global__ void __raygen__tonemap() {
@@ -435,6 +493,15 @@ extern "C" __global__ void __miss__radiance() {
   optixSetPayload_10(__float_as_uint(0.0f));
   optixSetPayload_11(__float_as_uint(0.0f));
   optixSetPayload_18(1u);
+
+  if (depth == 0) {
+    optixSetPayload_19(__float_as_uint(params.backgroundColor.x));
+    optixSetPayload_20(__float_as_uint(params.backgroundColor.y));
+    optixSetPayload_21(__float_as_uint(params.backgroundColor.z));
+    optixSetPayload_22(__float_as_uint(-dir.x));
+    optixSetPayload_23(__float_as_uint(-dir.y));
+    optixSetPayload_24(__float_as_uint(-dir.z));
+  }
 }
 
 extern "C" __global__ void __miss__occlusion() { optixSetPayload_0(0u); }
@@ -490,6 +557,25 @@ extern "C" __global__ void __intersection__voxel() {
 
   const unsigned int face = static_cast<unsigned int>(enterAxis) * 2 + (enterUpper ? 1u : 0u);
   optixReportIntersection(t0, 0, face);
+}
+
+extern "C" __global__ void __intersection__nvdb() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const float3 rayO = optixGetObjectRayOrigin();
+  const float3 rayD = optixGetObjectRayDirection();
+  const float o[3] = {rayO.x, rayO.y, rayO.z};
+  const float d[3] = {rayD.x, rayD.y, rayD.z};
+  const float lo[3] = {rt->nvdbBoundsMin.x, rt->nvdbBoundsMin.y, rt->nvdbBoundsMin.z};
+  const float hi[3] = {rt->nvdbBoundsMax.x, rt->nvdbBoundsMax.y, rt->nvdbBoundsMax.z};
+
+  float t0 = optixGetRayTmin();
+  float t1 = optixGetRayTmax();
+  int enterAxis;
+  bool enterUpper;
+  if (!slabTest(o, d, lo, hi, t0, t1, enterAxis, enterUpper))
+    return;
+
+  optixReportIntersection(fmaxf(t0, optixGetRayTmin()), 0, __float_as_uint(t1));
 }
 
 #define SPHERE_HIT_FROM_OUTSIDE 0u
@@ -697,21 +783,10 @@ static __forceinline__ __device__ float3 splatLocalSigma(float4 rotation, float3
   return quatRotate(quatConjugate(rotation), worldOffset) / scale;
 }
 
-extern "C" __global__ void __intersection__gsplat() {
-  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
-  const unsigned int i = optixGetPrimitiveIndex();
-  const float3 center = rt->splatPositions[i];
-  const float3 scale = rt->splatScales[i];
-  const float4 rotation = rt->splatRotations[i];
-
-  const float3 rayO = optixGetObjectRayOrigin() - center;
-  const float3 rayD = optixGetObjectRayDirection();
-  const float3 so = splatLocalSigma(rotation, scale, rayO);
-  const float3 sd = quatRotate(quatConjugate(rotation), rayD) / scale;
-
+static __forceinline__ __device__ void reportEllipsoidIntersection(float3 so, float3 sd, float sigmaExtent2) {
   const float a = dot(sd, sd);
   const float b = dot(so, sd);
-  const float c = dot(so, so) - GSPLAT_SIGMA_EXTENT * GSPLAT_SIGMA_EXTENT;
+  const float c = dot(so, so) - sigmaExtent2;
   const float disc = b * b - a * c;
   if (disc < 0.0f)
     return;
@@ -726,6 +801,21 @@ extern "C" __global__ void __intersection__gsplat() {
     optixReportIntersection(tNear, 0);
   else if (tFar > tmin && tFar < tmax)
     optixReportIntersection(tFar, 0);
+}
+
+extern "C" __global__ void __intersection__gsplat() {
+  const HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
+  const unsigned int i = optixGetPrimitiveIndex();
+  const float3 center = rt->splatPositions[i];
+  const float3 scale = rt->splatScales[i];
+  const float4 rotation = rt->splatRotations[i];
+
+  const float3 rayO = optixGetObjectRayOrigin() - center;
+  const float3 rayD = optixGetObjectRayDirection();
+  const float3 so = splatLocalSigma(rotation, scale, rayO);
+  const float3 sd = quatRotate(quatConjugate(rotation), rayD) / scale;
+
+  reportEllipsoidIntersection(so, sd, GSPLAT_SIGMA_EXTENT * GSPLAT_SIGMA_EXTENT);
 }
 
 extern "C" __global__ void __anyhit__gsplat() {
@@ -745,6 +835,43 @@ extern "C" __global__ void __anyhit__gsplat() {
   optixSetPayload_3(seed);
   if (!accept)
     optixIgnoreIntersection();
+}
+
+static __forceinline__ __device__ void causticSplatFrame(float3 tangent, float3 normal, float stretchRatio,
+                                                           float mergeRadius, float3 &bitangent, float3 &axisScale) {
+  bitangent = cross(normal, tangent);
+  const float stretchSqrt = sqrtf(fmaxf(stretchRatio, 1.0f));
+  const float3 extent = make_float3(mergeRadius * stretchSqrt, mergeRadius / stretchSqrt, mergeRadius);
+  axisScale = extent / GSPLAT_SIGMA_EXTENT;
+}
+
+static __forceinline__ __device__ void causticTangentAndStretch(float3 rayDir, float3 N, float3 &tangent,
+                                                                  float &stretchRatio) {
+  const float cosTheta = fabsf(dot(rayDir, N));
+  const float3 tangentRaw = rayDir - N * dot(rayDir, N);
+  const float tangentLenSq = dot(tangentRaw, tangentRaw);
+  if (tangentLenSq > 1e-12f) {
+    tangent = tangentRaw * rsqrtf(tangentLenSq);
+  } else {
+    const Onb onb(N);
+    tangent = onb.m_tangent;
+  }
+  stretchRatio = clamp(1.0f / fmaxf(cosTheta, 1e-4f), 1.0f, 3.0f);
+}
+
+extern "C" __global__ void __intersection__causticSplat() {
+  const unsigned int i = optixGetPrimitiveIndex();
+  const LightVertex &lv = params.lightVertices[i];
+
+  float3 bitangent, axisScale;
+  causticSplatFrame(lv.tangent, lv.normal, lv.stretchRatio, params.mergeRadius, bitangent, axisScale);
+
+  const float3 rayO = optixGetWorldRayOrigin() - lv.position;
+  const float3 rayD = optixGetWorldRayDirection();
+  const float3 so = make_float3(dot(rayO, lv.tangent), dot(rayO, bitangent), dot(rayO, lv.normal)) / axisScale;
+  const float3 sd = make_float3(dot(rayD, lv.tangent), dot(rayD, bitangent), dot(rayD, lv.normal)) / axisScale;
+
+  reportEllipsoidIntersection(so, sd, GSPLAT_SIGMA_EXTENT * GSPLAT_SIGMA_EXTENT);
 }
 
 static __forceinline__ __device__ float3 splatEllipsoidNormal(float4 rotation, float3 scale, float3 sigma) {
@@ -916,10 +1043,361 @@ static __forceinline__ __device__ float3 geometricNormalFor(const HitGroupData *
   return computeGeometricNormal(rayDir);
 }
 
+static __forceinline__ __device__ float sampleNvdbDensity(const void *gridPtr, float3 worldPos) {
+  const nanovdb::FloatGrid *grid = reinterpret_cast<const nanovdb::FloatGrid *>(gridPtr);
+  const nanovdb::Vec3f ijkf = grid->worldToIndexF(nanovdb::Vec3f(worldPos.x, worldPos.y, worldPos.z));
+  const nanovdb::Coord ijk = nanovdb::Coord::Floor(ijkf);
+  auto acc = grid->tree().getAccessor();
+  return acc.getValue(ijk);
+}
+
+static __forceinline__ __device__ bool rayVolumeInterval(const NvdbMedium &vol, float3 rayO, float3 rayD, float tmin,
+                                                            float tmax, float &tEnter, float &tExit) {
+  const float o[3] = {rayO.x, rayO.y, rayO.z};
+  const float d[3] = {rayD.x, rayD.y, rayD.z};
+  const float lo[3] = {vol.boundsMin.x, vol.boundsMin.y, vol.boundsMin.z};
+  const float hi[3] = {vol.boundsMax.x, vol.boundsMax.y, vol.boundsMax.z};
+  tEnter = tmin;
+  tExit = tmax;
+  int enterAxis;
+  bool enterUpper;
+  return slabTest(o, d, lo, hi, tEnter, tExit, enterAxis, enterUpper);
+}
+
+static __forceinline__ __device__ float evalHenyeyGreenstein(float cosTheta, float g) {
+  const float g2 = g * g;
+  const float denom = fmaxf(1.0f + g2 - 2.0f * g * cosTheta, 1e-6f);
+  return (1.0f - g2) / (4.0f * M_PIf * denom * sqrtf(denom));
+}
+
+static __forceinline__ __device__ float3 sampleHenyeyGreenstein(float3 forward, float g, unsigned int &seed,
+                                                                   float &pdfOut) {
+  const float u1 = sutil::rnd(seed);
+  const float u2 = sutil::rnd(seed);
+  float cosTheta;
+  if (fabsf(g) < 1e-3f) {
+    cosTheta = 1.0f - 2.0f * u1;
+  } else {
+    const float sqrTerm = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
+    cosTheta = -(1.0f + g * g - sqrTerm * sqrTerm) / (2.0f * g);
+  }
+  const float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
+  const float phi = 2.0f * M_PIf * u2;
+  const float3 local = make_float3(sinTheta * cosf(phi), sinTheta * sinf(phi), cosTheta);
+  const Onb onb(forward);
+  pdfOut = evalHenyeyGreenstein(cosTheta, g);
+  return onb.toWorld(local);
+}
+
+static __forceinline__ __device__ float3 mediumTransmittance(float3 rayO, float3 rayD, float tmin, float tmax,
+                                                                unsigned int &seed) {
+  if (!params.volume.enabled)
+    return make_float3(1.0f);
+  float tEnter, tExit;
+  if (!rayVolumeInterval(params.volume, rayO, rayD, tmin, tmax, tEnter, tExit))
+    return make_float3(1.0f);
+  const float sigmaBar = params.volume.majorant;
+  if (!(sigmaBar > 0.0f))
+    return make_float3(1.0f);
+  const float sigmaScalar =
+      (params.volume.sigmaT.x + params.volume.sigmaT.y + params.volume.sigmaT.z) / 3.0f;
+  float t = tEnter;
+  float transmittance = 1.0f;
+  for (int i = 0; i < 256; ++i) {
+    t -= logf(1.0f - sutil::rnd(seed)) / sigmaBar;
+    if (t >= tExit)
+      break;
+    const float3 pos = rayO + t * rayD;
+    const float density = sampleNvdbDensity(params.volume.grid, pos) * params.volume.densityScale;
+    const float sigmaLocal = sigmaScalar * density;
+    transmittance *= 1.0f - sigmaLocal / sigmaBar;
+  }
+  return make_float3(transmittance);
+}
+
+static constexpr int kReservoirCandidates = 6;
+static constexpr int kReservoirSpatialNeighbors = 4;
+static constexpr int kReservoirSpatialRadius = 4;
+
+static __forceinline__ __device__ void pickQuadLightUniform(unsigned int &seed, float3 &pos, float3 &normal,
+                                                              float3 &emission, float &pdfArea) {
+  const unsigned int n = 1u + params.extraLightCount;
+  unsigned int pick = static_cast<unsigned int>(sutil::rnd(seed) * static_cast<float>(n));
+  if (pick >= n)
+    pick = n - 1u;
+  const QuadLight &light = pick == 0u ? params.light : params.extraLights[pick - 1u];
+  const float z1 = sutil::rnd(seed), z2 = sutil::rnd(seed);
+  pos = light.corner + light.v1 * z1 + light.v2 * z2;
+  normal = light.normal;
+  emission = light.emission;
+  const float area = length(cross(light.v1, light.v2));
+  pdfArea = 1.0f / (fmaxf(area, 1e-8f) * static_cast<float>(n));
+}
+
+static __forceinline__ __device__ void initReservoir(Reservoir &r) {
+  r.sample = LightSample{};
+  r.weightSum = 0.0f;
+  r.M = 0.0f;
+  r.W = 0.0f;
+}
+
+static __forceinline__ __device__ bool updateReservoir(Reservoir &r, const LightSample &s, float weight, float rnd) {
+  r.weightSum += weight;
+  r.M += 1.0f;
+  if (weight > 0.0f && rnd < weight / r.weightSum) {
+    r.sample = s;
+    return true;
+  }
+  return false;
+}
+
+static __forceinline__ __device__ void combineReservoirs(Reservoir &r, const Reservoir &other, float targetPdfAtR,
+                                                           float rnd) {
+  if (other.M <= 0.0f)
+    return;
+  const float weight = targetPdfAtR * other.W * other.M;
+  r.weightSum += weight;
+  r.M += other.M;
+  if (weight > 0.0f && rnd < weight / fmaxf(r.weightSum, 1e-12f))
+    r.sample = other.sample;
+}
+
+static __forceinline__ __device__ void drawLightCandidate(unsigned int &seed, LightSample &ls) {
+  const float pSun = params.sun.enabled ? 0.5f : 0.0f;
+  if (params.sun.enabled && sutil::rnd(seed) < pSun) {
+    float sunPdf;
+    const float3 dir = sampleSunCone(seed, sunPdf);
+    ls.lightType = LIGHT_SAMPLE_SUN;
+    ls.dirOrPos = dir;
+    ls.normal = make_float3(0.0f);
+    ls.radiance = params.sun.radiance;
+    ls.pdf = sunPdf * pSun;
+  } else {
+    const float otherPdfScale = params.sun.enabled ? (1.0f - pSun) : 1.0f;
+    if (params.envTex) {
+      float envPdf;
+      const float3 dir = sampleEnvironment(sutil::rnd(seed), sutil::rnd(seed), envPdf);
+      ls.lightType = LIGHT_SAMPLE_ENV;
+      ls.dirOrPos = dir;
+      ls.normal = make_float3(0.0f);
+      ls.radiance = lookupEnvironmentRadiance(dir);
+      ls.pdf = envPdf * otherPdfScale;
+    } else {
+      float3 pos, normal, emission;
+      float pdfArea;
+      pickQuadLightUniform(seed, pos, normal, emission, pdfArea);
+      ls.lightType = LIGHT_SAMPLE_QUAD;
+      ls.dirOrPos = pos;
+      ls.normal = normal;
+      ls.radiance = emission;
+      ls.pdf = pdfArea * otherPdfScale;
+    }
+  }
+}
+
+static __forceinline__ __device__ bool evalLightSampleAtPoint(const LightSample &ls, float3 P, float3 N, float3 V,
+                                                                const ShadingMaterial &shading, float3 &dirOut,
+                                                                float3 &fCosOut, float &pdfBsdfOut,
+                                                                float &mixedPdfOut, float3 &radianceOut,
+                                                                float &distOut) {
+  if (ls.lightType == LIGHT_SAMPLE_QUAD) {
+    const float3 toLight = ls.dirOrPos - P;
+    const float dist = length(toLight);
+    if (dist < 1e-6f)
+      return false;
+    dirOut = toLight / dist;
+    const float lnDl = -dot(ls.normal, dirOut);
+    if (lnDl <= 0.0f)
+      return false;
+    mixedPdfOut = ls.pdf * (dist * dist) / fmaxf(lnDl, 1e-6f);
+    radianceOut = ls.radiance;
+    distOut = dist;
+  } else {
+    dirOut = ls.dirOrPos;
+    mixedPdfOut = ls.pdf;
+    radianceOut = ls.radiance;
+    distOut = 1e16f;
+  }
+  evalBsdf(shading, N, V, dirOut, fCosOut, pdfBsdfOut);
+  return (fCosOut.x + fCosOut.y + fCosOut.z) > 0.0f && mixedPdfOut > 1e-8f;
+}
+
+static __forceinline__ __device__ float lightSampleTargetPdf(const LightSample &ls, float3 P, float3 N, float3 V,
+                                                               const ShadingMaterial &shading) {
+  float3 dir, fCos, rad;
+  float pdfBsdf, mixedPdf, dist;
+  if (!evalLightSampleAtPoint(ls, P, N, V, shading, dir, fCos, pdfBsdf, mixedPdf, rad, dist))
+    return 0.0f;
+  return luminance3(fCos * rad);
+}
+
+static __forceinline__ __device__ bool lightSampleTargetAndMixedPdf(const LightSample &ls, float3 P, float3 N,
+                                                                      float3 V, const ShadingMaterial &shading,
+                                                                      float &targetPdfOut, float &mixedPdfOut) {
+  float3 dir, fCos, rad;
+  float pdfBsdf, dist;
+  if (!evalLightSampleAtPoint(ls, P, N, V, shading, dir, fCos, pdfBsdf, mixedPdfOut, rad, dist)) {
+    targetPdfOut = 0.0f;
+    return false;
+  }
+  targetPdfOut = luminance3(fCos * rad);
+  return true;
+}
+
+static __forceinline__ __device__ void buildAndStoreReservoir(float3 P, float3 N, float3 V,
+                                                                const ShadingMaterial &shading, unsigned int &seed) {
+  Reservoir r;
+  initReservoir(r);
+  for (int i = 0; i < kReservoirCandidates; ++i) {
+    LightSample ls;
+    drawLightCandidate(seed, ls);
+    float targetPdf, mixedPdf;
+    lightSampleTargetAndMixedPdf(ls, P, N, V, shading, targetPdf, mixedPdf);
+    const float w = mixedPdf > 1e-8f ? targetPdf / mixedPdf : 0.0f;
+    updateReservoir(r, ls, w, sutil::rnd(seed));
+  }
+  const float finalTarget = lightSampleTargetPdf(r.sample, P, N, V, shading);
+  r.W = (r.weightSum > 0.0f && finalTarget > 0.0f) ? r.weightSum / (r.M * finalTarget) : 0.0f;
+  const uint3 idx = optixGetLaunchIndex();
+  params.reservoirBuffer[idx.y * params.width + idx.x] = r;
+}
+
 extern "C" __global__ void __closesthit__radiance() {
   HitGroupData *rt = reinterpret_cast<HitGroupData *>(optixGetSbtDataPointer());
-
   const float3 rayDir = optixGetWorldRayDirection();
+
+  if (rt->materialType == MATERIAL_NVDB) {
+    const float3 rayO = optixGetWorldRayOrigin();
+    const float tEnter = optixGetRayTmax();
+    const float tExit = __uint_as_float(optixGetAttribute_0());
+
+    unsigned int seed = optixGetPayload_3();
+    const int depth = static_cast<int>(optixGetPayload_4());
+    float3 attenuation = make_float3(__uint_as_float(optixGetPayload_0()), __uint_as_float(optixGetPayload_1()),
+                                      __uint_as_float(optixGetPayload_2()));
+    const float3 throughput = attenuation;
+
+    const float sigmaScalar = (rt->nvdbSigmaT.x + rt->nvdbSigmaT.y + rt->nvdbSigmaT.z) / 3.0f;
+    const float sigmaBar = rt->nvdbMajorant;
+
+    float3 emitted = make_float3(0.0f);
+    float3 radiance = make_float3(0.0f);
+    float3 nextOrigin = rayO + tExit * rayDir;
+    float3 nextDirection = rayDir;
+    float nextPdf = -1.0f;
+    int done = 0;
+
+    if (sigmaBar > 0.0f) {
+      float t = tEnter;
+      bool scattered = false;
+      float3 scatterPos = make_float3(0.0f);
+      for (int i = 0; i < 512; ++i) {
+        t -= logf(1.0f - sutil::rnd(seed)) / sigmaBar;
+        if (t >= tExit)
+          break;
+        const float3 pos = rayO + t * rayDir;
+        const float density = sampleNvdbDensity(rt->nvdbGrid, pos) * rt->nvdbDensityScale;
+        const float sigmaLocal = sigmaScalar * density;
+        if (sutil::rnd(seed) < sigmaLocal / sigmaBar) {
+          scatterPos = pos;
+          scattered = true;
+          break;
+        }
+      }
+
+      if (scattered) {
+        const float3 albedo = rt->nvdbScatterAlbedo;
+        const float albedoAvg = fmaxf((albedo.x + albedo.y + albedo.z) / 3.0f, 1e-4f);
+        if (sutil::rnd(seed) < albedoAvg) {
+          const float3 albedoRatio = albedo / albedoAvg;
+          attenuation = attenuation * albedoRatio;
+
+          const float pSun = params.sun.enabled ? 0.5f : 0.0f;
+          if (params.sun.enabled && sutil::rnd(seed) < pSun) {
+            float sunPdf;
+            const float3 dir = sampleSunCone(seed, sunPdf);
+            const float phaseVal = evalHenyeyGreenstein(dot(dir, rayDir), rt->nvdbG);
+            if (phaseVal > 0.0f && !traceOcclusion(params.handle, scatterPos, dir, 1e-3f, 1e16f)) {
+              const float3 mediumT = mediumTransmittance(scatterPos, dir, 1e-3f, 1e16f, seed);
+              const float mixedPdf = sunPdf * pSun;
+              const float weight = powerHeuristic(mixedPdf, phaseVal);
+              radiance = params.sun.radiance * phaseVal * mediumT * albedoRatio * (weight / fmaxf(mixedPdf, 1e-6f));
+            }
+          } else if (params.envTex) {
+            float envPdf;
+            const float3 dir = sampleEnvironment(sutil::rnd(seed), sutil::rnd(seed), envPdf);
+            const float otherPdfScale = params.sun.enabled ? (1.0f - pSun) : 1.0f;
+            const float phaseVal = evalHenyeyGreenstein(dot(dir, rayDir), rt->nvdbG);
+            if (envPdf > 0.0f && phaseVal > 0.0f && !traceOcclusion(params.handle, scatterPos, dir, 1e-3f, 1e16f)) {
+              const float3 mediumT = mediumTransmittance(scatterPos, dir, 1e-3f, 1e16f, seed);
+              const float3 envRadiance = lookupEnvironmentRadiance(dir);
+              const float mixedPdf = envPdf * otherPdfScale;
+              const float weight = powerHeuristic(mixedPdf, phaseVal);
+              radiance = envRadiance * phaseVal * mediumT * albedoRatio * (weight / mixedPdf);
+            }
+          } else {
+            float3 lightPos, lightNormal, lightEmission;
+            float pdfArea;
+            pickQuadLightUniform(seed, lightPos, lightNormal, lightEmission, pdfArea);
+            const float3 toLight = lightPos - scatterPos;
+            const float dist = length(toLight);
+            const float3 dir = toLight / dist;
+            const float lnDl = -dot(lightNormal, dir);
+            const float phaseVal = evalHenyeyGreenstein(dot(dir, rayDir), rt->nvdbG);
+            if (lnDl > 0.0f && phaseVal > 0.0f) {
+              const float eps = 1e-3f;
+              if (!traceOcclusion(params.handle, scatterPos, dir, eps, dist - 2.0f * eps)) {
+                const float3 mediumT = mediumTransmittance(scatterPos, dir, eps, dist - 2.0f * eps, seed);
+                const float pdfLight = (dist * dist) / fmaxf(lnDl, 1e-6f) * pdfArea;
+                const float weight = powerHeuristic(pdfLight, phaseVal);
+                radiance = lightEmission * phaseVal * mediumT * albedoRatio * (weight / fmaxf(pdfLight, 1e-6f));
+              }
+            }
+          }
+
+          float phasePdf;
+          nextDirection = sampleHenyeyGreenstein(rayDir, rt->nvdbG, seed, phasePdf);
+          nextOrigin = scatterPos;
+          nextPdf = phasePdf;
+        } else {
+          done = 1;
+        }
+      }
+    }
+
+    emitted = emitted * throughput;
+    radiance = radiance * throughput;
+
+    optixSetPayload_0(__float_as_uint(attenuation.x));
+    optixSetPayload_1(__float_as_uint(attenuation.y));
+    optixSetPayload_2(__float_as_uint(attenuation.z));
+    optixSetPayload_3(seed);
+    optixSetPayload_4(static_cast<unsigned int>(depth));
+    optixSetPayload_5(__float_as_uint(nextPdf));
+    optixSetPayload_6(__float_as_uint(emitted.x));
+    optixSetPayload_7(__float_as_uint(emitted.y));
+    optixSetPayload_8(__float_as_uint(emitted.z));
+    optixSetPayload_9(__float_as_uint(radiance.x));
+    optixSetPayload_10(__float_as_uint(radiance.y));
+    optixSetPayload_11(__float_as_uint(radiance.z));
+    optixSetPayload_12(__float_as_uint(nextOrigin.x));
+    optixSetPayload_13(__float_as_uint(nextOrigin.y));
+    optixSetPayload_14(__float_as_uint(nextOrigin.z));
+    optixSetPayload_15(__float_as_uint(nextDirection.x));
+    optixSetPayload_16(__float_as_uint(nextDirection.y));
+    optixSetPayload_17(__float_as_uint(nextDirection.z));
+    optixSetPayload_18(static_cast<unsigned int>(done));
+    if (depth == 0) {
+      optixSetPayload_19(__float_as_uint(rt->nvdbScatterAlbedo.x));
+      optixSetPayload_20(__float_as_uint(rt->nvdbScatterAlbedo.y));
+      optixSetPayload_21(__float_as_uint(rt->nvdbScatterAlbedo.z));
+      optixSetPayload_22(__float_as_uint(-rayDir.x));
+      optixSetPayload_23(__float_as_uint(-rayDir.y));
+      optixSetPayload_24(__float_as_uint(-rayDir.z));
+    }
+    return;
+  }
+
   float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
 
   float3 N;
@@ -1073,6 +1551,55 @@ extern "C" __global__ void __closesthit__radiance() {
               rt->materialType == MATERIAL_GSPLAT) &&
              !(transmission > 0.0f && sutil::rnd(seed) < transmission)) {
     const float3 V = -rayDir;
+
+    if (params.reservoirBuildPass) {
+      if (params.reservoirNEE)
+        buildAndStoreReservoir(P, N, V, shading, seed);
+      done = 1;
+    } else {
+    const bool useReservoir = params.reservoirNEE && depth == 0;
+    if (useReservoir) {
+      const uint3 idx2 = optixGetLaunchIndex();
+      const unsigned int pixel2 = idx2.y * params.width + idx2.x;
+      Reservoir combined;
+      initReservoir(combined);
+      const Reservoir &own = params.reservoirBuffer[pixel2];
+      if (own.M > 0.0f) {
+        const float targetOwnAtSelf = lightSampleTargetPdf(own.sample, P, N, V, shading);
+        combineReservoirs(combined, own, targetOwnAtSelf, sutil::rnd(seed));
+      }
+      for (int k = 0; k < kReservoirSpatialNeighbors; ++k) {
+        const int ox = static_cast<int>(sutil::rnd(seed) * static_cast<float>(2 * kReservoirSpatialRadius + 1)) -
+                       kReservoirSpatialRadius;
+        const int oy = static_cast<int>(sutil::rnd(seed) * static_cast<float>(2 * kReservoirSpatialRadius + 1)) -
+                       kReservoirSpatialRadius;
+        const int nx = min(max(static_cast<int>(idx2.x) + ox, 0), static_cast<int>(params.width) - 1);
+        const int ny = min(max(static_cast<int>(idx2.y) + oy, 0), static_cast<int>(params.height) - 1);
+        const Reservoir &nb = params.reservoirBuffer[ny * params.width + nx];
+        if (nb.M <= 0.0f)
+          continue;
+        const float targetAtSelf = lightSampleTargetPdf(nb.sample, P, N, V, shading);
+        combineReservoirs(combined, nb, targetAtSelf, sutil::rnd(seed));
+      }
+      const float finalTarget = lightSampleTargetPdf(combined.sample, P, N, V, shading);
+      combined.W =
+          (combined.weightSum > 0.0f && finalTarget > 0.0f) ? combined.weightSum / (combined.M * finalTarget) : 0.0f;
+
+      if (combined.W > 0.0f) {
+        float3 dir, fCos, rad;
+        float pdfBsdf, mixedPdf, dist;
+        if (evalLightSampleAtPoint(combined.sample, P, N, V, shading, dir, fCos, pdfBsdf, mixedPdf, rad, dist)) {
+          const float eps = surfaceEpsilon(P);
+          const float tmax = dist < 1e15f ? dist - 2.0f * eps : 1e16f;
+          const bool occluded = traceOcclusion(params.handle, P, dir, eps, tmax);
+          if (!occluded) {
+            const float3 mediumT = mediumTransmittance(P, dir, eps, tmax, seed);
+            const float weight = powerHeuristic(mixedPdf, pdfBsdf);
+            radiance = rad * fCos * mediumT * weight * combined.W;
+          }
+        }
+      }
+    } else {
     const float pSun = params.sun.enabled ? 0.5f : 0.0f;
     if (params.sun.enabled && sutil::rnd(seed) < pSun) {
       float sunPdf;
@@ -1083,9 +1610,10 @@ extern "C" __global__ void __closesthit__radiance() {
       if (fCos.x + fCos.y + fCos.z > 0.0f) {
         const bool occluded = traceOcclusion(params.handle, P, dir, surfaceEpsilon(P), 1e16f);
         if (!occluded) {
+          const float3 mediumT = mediumTransmittance(P, dir, surfaceEpsilon(P), 1e16f, seed);
           const float mixedPdf = sunPdf * pSun;
           const float weight = powerHeuristic(mixedPdf, pdfBsdf);
-          radiance = params.sun.radiance * fCos * (weight / fmaxf(mixedPdf, 1e-6f));
+          radiance = params.sun.radiance * fCos * mediumT * (weight / fmaxf(mixedPdf, 1e-6f));
         }
       }
     } else {
@@ -1100,22 +1628,22 @@ extern "C" __global__ void __closesthit__radiance() {
           if (fCos.x + fCos.y + fCos.z > 0.0f) {
             const bool occluded = traceOcclusion(params.handle, P, dir, surfaceEpsilon(P), 1e16f);
             if (!occluded) {
+              const float3 mediumT = mediumTransmittance(P, dir, surfaceEpsilon(P), 1e16f, seed);
               const float3 envRadiance = lookupEnvironmentRadiance(dir);
               const float mixedPdf = envPdf * otherPdfScale;
               const float weight = powerHeuristic(mixedPdf, pdfBsdf);
-              radiance = envRadiance * fCos * (weight / mixedPdf);
+              radiance = envRadiance * fCos * mediumT * (weight / mixedPdf);
             }
           }
         }
       } else {
-        const QuadLight &light = params.light;
-        const float z1 = sutil::rnd(seed);
-        const float z2 = sutil::rnd(seed);
-        const float3 lightPos = light.corner + light.v1 * z1 + light.v2 * z2;
+        float3 lightPos, lightNormal, lightEmission;
+        float pdfArea;
+        pickQuadLightUniform(seed, lightPos, lightNormal, lightEmission, pdfArea);
         const float3 toLight = lightPos - P;
         const float dist = length(toLight);
         const float3 L = toLight / dist;
-        const float lnDl = -dot(light.normal, L);
+        const float lnDl = -dot(lightNormal, L);
         if (lnDl > 0.0f) {
           float3 fCos;
           float pdfBsdf;
@@ -1124,14 +1652,15 @@ extern "C" __global__ void __closesthit__radiance() {
             const float eps = surfaceEpsilon(P);
             const bool occluded = traceOcclusion(params.handle, P, L, eps, dist - 2.0f * eps);
             if (!occluded) {
-              const float area = length(cross(light.v1, light.v2));
-              const float pdfLight = (dist * dist) / (lnDl * area) * otherPdfScale;
+              const float3 mediumT = mediumTransmittance(P, L, eps, dist - 2.0f * eps, seed);
+              const float pdfLight = (dist * dist) / fmaxf(lnDl, 1e-6f) * pdfArea * otherPdfScale;
               const float weight = powerHeuristic(pdfLight, pdfBsdf);
-              radiance = light.emission * fCos * (weight / fmaxf(pdfLight, 1e-6f));
+              radiance = lightEmission * fCos * mediumT * (weight / fmaxf(pdfLight, 1e-6f));
             }
           }
         }
       }
+    }
     }
 
     if (params.lightVertexCount > 0 &&
@@ -1216,6 +1745,7 @@ extern "C" __global__ void __closesthit__radiance() {
     } else {
       done = 1;
     }
+    }
   } else if (rt->materialType == MATERIAL_MIRROR) {
     nextDirection = reflect(rayDir, N);
     attenuation = attenuation * rt->albedo;
@@ -1262,6 +1792,15 @@ extern "C" __global__ void __closesthit__radiance() {
   optixSetPayload_16(__float_as_uint(nextDirection.y));
   optixSetPayload_17(__float_as_uint(nextDirection.z));
   optixSetPayload_18(static_cast<unsigned int>(done));
+
+  if (depth == 0) {
+    optixSetPayload_19(__float_as_uint(albedo.x));
+    optixSetPayload_20(__float_as_uint(albedo.y));
+    optixSetPayload_21(__float_as_uint(albedo.z));
+    optixSetPayload_22(__float_as_uint(N.x));
+    optixSetPayload_23(__float_as_uint(N.y));
+    optixSetPayload_24(__float_as_uint(N.z));
+  }
 }
 
 extern "C" __global__ void __anyhit__merge() {
@@ -1277,10 +1816,17 @@ extern "C" __global__ void __anyhit__merge() {
 
   const float3 P = optixGetWorldRayOrigin() + N * (1.01f * params.mergeRadius);
   const float3 offset = lv.position - P;
-  if (dot(offset, offset) > params.mergeRadius * params.mergeRadius) {
+
+  float3 bitangent, axisScale;
+  causticSplatFrame(lv.tangent, lv.normal, lv.stretchRatio, params.mergeRadius, bitangent, axisScale);
+  const float3 sigma =
+      make_float3(dot(offset, lv.tangent), dot(offset, bitangent), dot(offset, lv.normal)) / axisScale;
+  const float d2 = dot(sigma, sigma);
+  if (d2 > GSPLAT_SIGMA_EXTENT * GSPLAT_SIGMA_EXTENT) {
     optixIgnoreIntersection();
     return;
   }
+  const float weight = expf(-0.5f * d2);
 
   ShadingMaterial m;
   m.diffuse = make_float3(__uint_as_float(optixGetPayload_6()), __uint_as_float(optixGetPayload_7()),
@@ -1299,12 +1845,32 @@ extern "C" __global__ void __anyhit__merge() {
   if (fCosEye.x + fCosEye.y + fCosEye.z > 0.0f) {
     const float3 sum = make_float3(__uint_as_float(optixGetPayload_14()), __uint_as_float(optixGetPayload_15()),
                                     __uint_as_float(optixGetPayload_16())) +
-                        fCosEye * lv.throughput;
+                        fCosEye * lv.throughput * weight;
     optixSetPayload_14(__float_as_uint(sum.x));
     optixSetPayload_15(__float_as_uint(sum.y));
     optixSetPayload_16(__float_as_uint(sum.z));
   }
   optixIgnoreIntersection();
+}
+
+extern "C" __global__ void __raygen__causticAabb() {
+  const unsigned int i = optixGetLaunchIndex().x;
+  if (i >= params.lightVertexCount)
+    return;
+  const LightVertex &lv = params.lightVertices[i];
+
+  float3 bitangent, axisScale;
+  causticSplatFrame(lv.tangent, lv.normal, lv.stretchRatio, params.mergeRadius, bitangent, axisScale);
+  const float3 extent = axisScale * GSPLAT_SIGMA_EXTENT;
+
+  const float3 absTangent = make_float3(fabsf(lv.tangent.x), fabsf(lv.tangent.y), fabsf(lv.tangent.z));
+  const float3 absBitangent = make_float3(fabsf(bitangent.x), fabsf(bitangent.y), fabsf(bitangent.z));
+  const float3 absNormal = make_float3(fabsf(lv.normal.x), fabsf(lv.normal.y), fabsf(lv.normal.z));
+  const float3 worldHalf = absTangent * extent.x + absBitangent * extent.y + absNormal * extent.z;
+
+  params.causticAabbs[i] = OptixAabb{lv.position.x - worldHalf.x, lv.position.y - worldHalf.y,
+                                      lv.position.z - worldHalf.z, lv.position.x + worldHalf.x,
+                                      lv.position.y + worldHalf.y, lv.position.z + worldHalf.z};
 }
 
 extern "C" __global__ void __closesthit__lightSubpath() {
@@ -1313,6 +1879,10 @@ extern "C" __global__ void __closesthit__lightSubpath() {
   const float3 P = optixGetWorldRayOrigin() + optixGetRayTmax() * rayDir;
   const float3 Ng = geometricNormalFor(rt, P, rayDir);
   const float3 N = faceforward(Ng, -rayDir, Ng);
+
+  float3 causticTangent;
+  float causticStretchRatio;
+  causticTangentAndStretch(rayDir, N, causticTangent, causticStretchRatio);
 
   unsigned int seed = optixGetPayload_0();
   float3 throughput = make_float3(__uint_as_float(optixGetPayload_1()), __uint_as_float(optixGetPayload_2()),
@@ -1380,6 +1950,8 @@ extern "C" __global__ void __closesthit__lightSubpath() {
         params.lightVertices[idx].baseColorFactor = mat.baseColorFactor;
         params.lightVertices[idx].metallic = mat.metallic;
         params.lightVertices[idx].roughness = mat.roughness;
+        params.lightVertices[idx].tangent = causticTangent;
+        params.lightVertices[idx].stretchRatio = causticStretchRatio;
       }
       const ShadingMaterial lightMat = materialFromMetallicRoughness(mat.baseColorFactor, mat.metallic, mat.roughness);
       float3 bounceDir, bounceWeight;
@@ -1402,6 +1974,8 @@ extern "C" __global__ void __closesthit__lightSubpath() {
       params.lightVertices[idx].baseColorFactor = rt->albedo;
       params.lightVertices[idx].metallic = 0.0f;
       params.lightVertices[idx].roughness = 1.0f;
+      params.lightVertices[idx].tangent = causticTangent;
+      params.lightVertices[idx].stretchRatio = causticStretchRatio;
     }
     const ShadingMaterial lightMat = materialFromMetallicRoughness(rt->albedo, 0.0f, 1.0f);
     float3 bounceDir, bounceWeight;

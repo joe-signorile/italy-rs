@@ -16,6 +16,7 @@ enum MaterialType : unsigned int {
   MATERIAL_VOXEL = 5,
   MATERIAL_SDF = 6,
   MATERIAL_GSPLAT = 7,
+  MATERIAL_NVDB = 8,
 };
 
 struct QuadLight {
@@ -23,6 +24,29 @@ struct QuadLight {
   float3 v1, v2;
   float3 normal;
   float3 emission;
+};
+
+inline constexpr unsigned int kMaxExtraLights = 3;
+
+enum LightSampleType : unsigned int {
+  LIGHT_SAMPLE_SUN = 0,
+  LIGHT_SAMPLE_ENV = 1,
+  LIGHT_SAMPLE_QUAD = 2,
+};
+
+struct LightSample {
+  unsigned int lightType;
+  float3 dirOrPos;
+  float3 normal;
+  float3 radiance;
+  float pdf;
+};
+
+struct Reservoir {
+  LightSample sample;
+  float weightSum;
+  float M;
+  float W;
 };
 
 enum SdfMaterialKindGpu : unsigned int {
@@ -36,6 +60,17 @@ struct SdfGpuMaterial {
   float metallic, roughness;
   float ior;
   float3 extinction;
+};
+
+struct NvdbMedium {
+  void *grid;
+  float3 boundsMin, boundsMax;
+  float3 sigmaT;
+  float3 scatterAlbedo;
+  float g;
+  float densityScale;
+  float majorant;
+  unsigned int enabled;
 };
 
 struct SunLight {
@@ -53,11 +88,15 @@ struct LightVertex {
   float3 baseColorFactor;
   float metallic;
   float roughness;
+  float3 tangent;
+  float stretchRatio;
 };
 
 struct Params {
   unsigned int subframeIndex;
   float4 *accumBuffer;
+  float4 *accumAlbedoBuffer;
+  float4 *accumNormalBuffer;
   uchar4 *frameBuffer;
   unsigned int width;
   unsigned int height;
@@ -82,7 +121,13 @@ struct Params {
   float envRotation;
 
   QuadLight light;
+  QuadLight extraLights[kMaxExtraLights];
+  unsigned int extraLightCount;
   OptixTraversableHandle handle;
+
+  unsigned int reservoirNEE;
+  unsigned int reservoirBuildPass;
+  Reservoir *reservoirBuffer;
 
   cudaTextureObject_t envTex;
   float *envMarginalCdf;
@@ -99,6 +144,7 @@ struct Params {
 
   OptixTraversableHandle vertexMergeHandle;
   unsigned int mergeHitSbtOffset;
+  OptixAabb *causticAabbs;
 
   float mergeRadius;
 
@@ -106,6 +152,7 @@ struct Params {
 
   float3 backgroundColor;
   SunLight sun;
+  NvdbMedium volume;
 };
 
 struct GpuMaterial {
@@ -163,4 +210,13 @@ struct HitGroupData {
   float4 *splatRotations = nullptr;
   float *splatOpacity = nullptr;
   float3 *splatColors = nullptr;
+
+  void *nvdbGrid = nullptr;
+  float3 nvdbBoundsMin{};
+  float3 nvdbBoundsMax{};
+  float3 nvdbSigmaT{};
+  float3 nvdbScatterAlbedo{};
+  float nvdbG = 0.0f;
+  float nvdbDensityScale = 1.0f;
+  float nvdbMajorant = 0.0f;
 };

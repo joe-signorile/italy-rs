@@ -1,7 +1,7 @@
-files[49]{path,purpose,includes}:
+files[51]{path,purpose,includes}:
   src/app/app_window.cpp,"",app/app_window.h
   src/app/app_window.h,"",""
-  src/app/main.cpp,"",app/app_window.h|convert/sdf_baker.h|convert/sdf_procedural.h|convert/voxelize.h|core/orbit_camera.h|io/gltf_loader.h|io/gsplat_ply_loader.h|io/mesh_primitive_classify.h|io/mesh_validate.h|render/environment.h|render/optix_renderer.h|render/procedural_sky.h
+  src/app/main.cpp,"",app/app_window.h|convert/sdf_baker.h|convert/sdf_procedural.h|convert/voxelize.h|core/orbit_camera.h|io/gltf_loader.h|io/gsplat_ply_loader.h|io/mesh_primitive_classify.h|io/mesh_validate.h|io/nvdb_loader.h|render/environment.h|render/optix_renderer.h|render/procedural_sky.h
   src/convert/gsplat_bounds.h,"",""
   src/convert/sdf_baker.cpp,"",convert/sdf_baker.h|convert/tri_box_overlap.h|render/kernels/sdf_bake_params.h|render/optix_check.h|render_config.h
   src/convert/sdf_baker.h,"",convert/sdf_grid.h|io/mesh_asset.h
@@ -27,6 +27,8 @@ files[49]{path,purpose,includes}:
   src/io/mesh_validate.h,"",io/mesh_asset.h
   src/io/mesh_weld.cpp,"",io/mesh_weld.h
   src/io/mesh_weld.h,"",""
+  src/io/nvdb_loader.cpp,"",io/nvdb_loader.h
+  src/io/nvdb_loader.h,"",""
   src/render/environment.cpp,"",render/environment.h
   src/render/environment.h,Equirectangular HDRI environment map with a precomputed piecewise-constant 2D distribution for luminance-weighted importance sampling (PBRT-style).,""
   src/render/gl_ext.h,Manually-resolved OpenGL buffer-object entry points (GL_ARB_vertex_buffer_object) for the CUDA-GL interop PBO; GLFW's default include only exposes the legacy GL 1.1 ABI.,""
@@ -37,7 +39,7 @@ files[49]{path,purpose,includes}:
   src/render/kernels/sdf_bake_params.h,"Own tiny module/pipeline separate from pathtracer_params.h: baking is a one-shot 3D grid launch with a different program shape and gains nothing from sharing the renderer's pipeline/SBT.",""
   src/render/optix_check.h,"Tiny throw-on-error wrappers for OptiX/CUDA calls: a smaller self-contained copy of NVIDIA sutil/Exception.h's OptiX/CUDA half, without the glad dependency.",""
   src/render/optix_renderer.cpp,"",render/optix_renderer.h|convert/gsplat_bounds.h|convert/voxel_grid.h|io/gsplat_asset.h|render/gl_ext.h|render/kernels/pathtracer_params.h|render/optix_check.h|render_config.h
-  src/render/optix_renderer.h,"The RHI seam: app/ and core/ talk only to italy::OptixRenderer; nothing outside src/render/ includes optix.h or cuda_runtime.h.",convert/sdf_grid.h|convert/voxel_grid.h|core/orbit_camera.h|io/gsplat_asset.h|io/mesh_asset.h|render/environment.h
+  src/render/optix_renderer.h,"The RHI seam: app/ and core/ talk only to italy::OptixRenderer; nothing outside src/render/ includes optix.h or cuda_runtime.h.",convert/sdf_grid.h|convert/voxel_grid.h|core/orbit_camera.h|io/gsplat_asset.h|io/mesh_asset.h|io/nvdb_loader.h|render/environment.h
   src/render/procedural_sky.cpp,"",render/procedural_sky.h
   src/render/procedural_sky.h,"Synthesizes an equirectangular sky (Preetham/Perez analytic daylight model) into the same EnvironmentMap struct a loaded .hdr populates, so it flows through the identical GPU upload and sampling path.",render/environment.h
   tests/environment_cdf_test.cpp,"Standalone sanity check for the HDRI importance-sampling CDF build (render/environment.cpp): no framework, just asserts.",render/environment.h
